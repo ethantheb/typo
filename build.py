@@ -4,27 +4,55 @@
     python build.py            debug build
     python build.py --release  optimized build (no console window on Windows)
     python build.py --run      build, then launch the editor
-    python build.py --test     run the unit tests (buffer, syntax, toml)
+    python build.py --test     run the unit tests, then the performance suite
+    python build.py --perf     run only the performance suite
+    python build.py --install  release build, installed to INSTALL_DIR (see below)
 
 Steps:
   1. Compile the tree-sitter runtime + grammars (C) with clang into a static
      library, only when a C source is newer than the library. Always optimized,
      so parsing speed doesn't depend on the build mode.
-  2. odin build src. A freshly linked executable is sometimes briefly locked
+  2. Build libghostty-vt (terminal emulation) from a pinned ghostty commit with
+     a pinned Zig, both downloaded into build/ on first use. Rebuilt only when
+     GHOSTTY_COMMIT changes.
+  3. odin build src. A freshly linked executable is sometimes briefly locked
      (e.g. by antivirus scanning) and the next link fails; that is retried.
-  3. Copy runtime files next to the executable: SDL3 DLLs on Windows (they
-     ship with Odin's vendor packages) and the fonts.
+  4. On Windows, fetch Microsoft's ConPTY package (conpty.dll + OpenConsole.exe,
+     the pseudo console host Windows Terminal ships). It is newer and faster
+     than the one built into Windows; the terminal falls back to the built-in
+     one if these files are missing.
+  5. Copy runtime files next to the executable: SDL3 DLLs on Windows (they
+     ship with Odin's vendor packages), the libghostty-vt shared library, the
+     ConPTY files, and the fonts.
 
-Requires: odin, clang, and on Windows llvm-lib (part of LLVM) / elsewhere ar.
+--test runs `odin test` on each package, then the performance suite: an
+optimized build (build/typo-perf) run as `typo-perf --perf`, which opens a
+window, drives the editor and terminal through scripted scenarios and fails if
+any timing, CPU or GPU measurement is over its limit (see src/perf.odin).
+
+--install puts a release build with its runtime files in its own folder, so the
+installed copy can stay open while you keep developing in build/:
+  Windows:      %LOCALAPPDATA%\\Programs\\typo   (add it to PATH to run `typo`)
+  Linux, macOS: ~/.local/share/typo, linked as ~/.local/bin/typo
+--install-dir DIR installs somewhere else. Installing again updates it, even
+while the installed typo is running.
+
+Requires: odin, clang, git, and on Windows llvm-lib (part of LLVM) / elsewhere ar.
 """
 
 import argparse
+import hashlib
+import io
+import json
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +61,8 @@ OBJ = OUT / "obj"
 
 IS_WINDOWS = platform.system() == "Windows"
 EXE = OUT / ("typo.exe" if IS_WINDOWS else "typo")
+PERF_EXE = OUT / ("typo-perf.exe" if IS_WINDOWS else "typo-perf")
+TEST_PACKAGES = ["src/buffer", "src/syntax", "src/toml", "src/term", "src"]
 TS_LIB = OBJ / ("tree_sitter.lib" if IS_WINDOWS else "libtree_sitter.a")
 
 TS_SOURCES = [
@@ -41,6 +71,27 @@ TS_SOURCES = [
     "vendor/tree-sitter-odin/src/scanner.c",
 ]
 TS_INPUT_DIRS = ["vendor/tree-sitter", "vendor/tree-sitter-odin/src"]
+
+ZIG_VERSION = "0.16.0"
+GHOSTTY_REPO = "https://github.com/ghostty-org/ghostty.git"
+GHOSTTY_COMMIT = "6301810a48aaa3426887a4316668f18833a40138"
+GHOSTTY_SRC = OUT / "deps" / "ghostty"
+GHOSTTY_OUT = OBJ / "ghostty-vt"
+
+if IS_WINDOWS:
+    GHOSTTY_SHARED = GHOSTTY_OUT / "bin" / "ghostty-vt.dll"
+elif platform.system() == "Darwin":
+    GHOSTTY_SHARED = GHOSTTY_OUT / "lib" / "libghostty-vt.dylib"
+else:
+    GHOSTTY_SHARED = GHOSTTY_OUT / "lib" / "libghostty-vt.so"
+
+CONPTY_VERSION = "1.24.260710001"
+CONPTY_SHA256 = "175640566a3b59c4b132070ee96c2c77e5ab7edd2e92732a5eb3610bbf63d90e"
+CONPTY_DIR = OUT / "deps" / f"conpty-{CONPTY_VERSION}"
+CONPTY_FILES = {  # file in the package -> name next to the executable
+    "runtimes/win-x64/native/conpty.dll": "conpty.dll",
+    "build/native/runtimes/x64/OpenConsole.exe": "OpenConsole.exe",
+}
 
 LINK_LOCK_ERRORS = ("LNK1104", "LNK1201")
 
@@ -88,11 +139,74 @@ def build_tree_sitter():
         check(["ar", "rcs", TS_LIB, *objs])
 
 
-def build_odin(release):
+def zig_exe():
+    """A Zig matching ZIG_VERSION: from PATH if it matches, else downloaded into build/tools."""
+    on_path = shutil.which("zig")
+    if on_path:
+        version = subprocess.run([on_path, "version"], capture_output=True, text=True).stdout.strip()
+        if version == ZIG_VERSION:
+            return on_path
+    arch = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}[platform.machine().lower()]
+    os_name = {"Windows": "windows", "Darwin": "macos", "Linux": "linux"}[platform.system()]
+    name = f"zig-{arch}-{os_name}-{ZIG_VERSION}"
+    exe = OUT / "tools" / name / ("zig.exe" if IS_WINDOWS else "zig")
+    if exe.exists():
+        return str(exe)
+
+    print(f"Downloading Zig {ZIG_VERSION}...", flush=True)
+    with urllib.request.urlopen("https://ziglang.org/download/index.json") as r:
+        entry = json.load(r)[ZIG_VERSION][f"{arch}-{os_name}"]
+    with urllib.request.urlopen(entry["tarball"]) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != entry["shasum"]:
+        sys.exit(f"Zig download checksum mismatch: {entry['tarball']}")
+    (OUT / "tools").mkdir(parents=True, exist_ok=True)
+    if entry["tarball"].endswith(".zip"):
+        zipfile.ZipFile(io.BytesIO(data)).extractall(OUT / "tools")
+    else:
+        tarfile.open(fileobj=io.BytesIO(data)).extractall(OUT / "tools", filter="data")
+    return str(exe)
+
+
+def build_ghostty():
+    stamp = GHOSTTY_OUT / "commit.txt"
+    if GHOSTTY_SHARED.exists() and stamp.exists() and stamp.read_text().strip() == GHOSTTY_COMMIT:
+        return
+    print("Building libghostty-vt...", flush=True)
+    if not (GHOSTTY_SRC / ".git").exists():
+        GHOSTTY_SRC.mkdir(parents=True, exist_ok=True)
+        check(["git", "-C", GHOSTTY_SRC, "init", "-q"])
+        check(["git", "-C", GHOSTTY_SRC, "remote", "add", "origin", GHOSTTY_REPO])
+    check(["git", "-C", GHOSTTY_SRC, "fetch", "-q", "--depth", "1", "origin", GHOSTTY_COMMIT])
+    check(["git", "-C", GHOSTTY_SRC, "checkout", "-q", "--force", "FETCH_HEAD"])
+    zig = zig_exe()
+    cmd = [zig, "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "--prefix", GHOSTTY_OUT]
+    print("+", " ".join(str(c) for c in cmd), flush=True)
+    if subprocess.run(cmd, cwd=GHOSTTY_SRC).returncode != 0:
+        sys.exit(1)
+    stamp.write_text(GHOSTTY_COMMIT)
+
+
+def fetch_conpty():
+    if not IS_WINDOWS or all((CONPTY_DIR / f).exists() for f in CONPTY_FILES):
+        return
+    print(f"Downloading ConPTY {CONPTY_VERSION}...", flush=True)
+    url = ("https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/"
+           f"{CONPTY_VERSION}/microsoft.windows.console.conpty.{CONPTY_VERSION}.nupkg")
+    with urllib.request.urlopen(url) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != CONPTY_SHA256:
+        sys.exit(f"ConPTY download checksum mismatch: {url}")
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        for name in CONPTY_FILES:
+            z.extract(name, CONPTY_DIR)
+
+
+def build_odin(release, exe=EXE, console=False):
     flags = ["-o:speed"] if release else ["-debug"]
-    if release and IS_WINDOWS:
+    if release and IS_WINDOWS and not console:
         flags.append("-subsystem:windows")
-    cmd = ["odin", "build", "src", f"-out:{EXE}", *flags]
+    cmd = ["odin", "build", "src", f"-out:{exe}", *flags]
     for attempt in range(1, 5):
         result = run(cmd, capture_output=True, text=True)
         output = result.stdout + result.stderr
@@ -117,39 +231,124 @@ def copy_if_changed(src, dst):
     shutil.copy2(src, dst)
 
 
-def copy_runtime_files():
+def copy_runtime_files(dest=OUT, copy=copy_if_changed):
     if IS_WINDOWS:
         odin_root = Path(subprocess.run(["odin", "root"], capture_output=True, text=True, check=True).stdout.strip())
         for dll in ["vendor/sdl3/SDL3.dll", "vendor/sdl3/ttf/SDL3_ttf.dll"]:
-            copy_if_changed(odin_root / dll, OUT / Path(dll).name)
+            copy(odin_root / dll, dest / Path(dll).name)
+    copy(GHOSTTY_SHARED, dest / GHOSTTY_SHARED.name)
+    if IS_WINDOWS:
+        for src, name in CONPTY_FILES.items():
+            copy(CONPTY_DIR / src, dest / name)
     # Fonts are loaded relative to the executable.
     for src in (ROOT / "assets").rglob("*"):
         if src.is_file():
-            dst = OUT / "assets" / src.relative_to(ROOT / "assets")
+            dst = dest / "assets" / src.relative_to(ROOT / "assets")
             dst.parent.mkdir(parents=True, exist_ok=True)
-            copy_if_changed(src, dst)
+            copy(src, dst)
 
 
-def run_tests():
-    failed = False
-    for package in ["buffer", "syntax", "toml"]:
-        out = OUT / f"{package}_test{'.exe' if IS_WINDOWS else ''}"
-        result = run(["odin", "test", f"src/{package}", f"-out:{out}", "-define:ODIN_TEST_FANCY=false"])
-        failed |= result.returncode != 0
-    sys.exit(1 if failed else 0)
+def default_install_dir():
+    if IS_WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "Programs" / "typo"
+    return Path.home() / ".local" / "share" / "typo"
+
+
+def install_file(src, dst):
+    """Copies src over dst. Windows won't overwrite a file that a running typo has
+    loaded, but it will rename it, so a locked file is moved aside first."""
+    try:
+        copy_if_changed(src, dst)
+    except PermissionError:
+        aside = dst.with_name(dst.name + ".old")
+        n = 1
+        while aside.exists():
+            try:
+                aside.unlink()
+            except OSError:
+                aside = dst.with_name(f"{dst.name}.{n}.old")
+                n += 1
+        dst.rename(aside)
+        shutil.copy2(src, dst)
+
+
+def install(dest):
+    dest = dest.resolve()
+    exe = OUT / "release" / EXE.name
+    exe.parent.mkdir(exist_ok=True)
+    build_odin(True, exe)
+    dest.mkdir(parents=True, exist_ok=True)
+    # Files moved aside by an earlier install; still locked if that typo is open.
+    for old in dest.rglob("*.old"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    copy_runtime_files(dest, install_file)
+    install_file(exe, dest / EXE.name)
+    print(f"Installed to {dest}")
+
+    if IS_WINDOWS:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            try:
+                user_path = winreg.QueryValueEx(key, "Path")[0]
+            except FileNotFoundError:
+                user_path = ""
+        entries = [Path(os.path.expandvars(e)).resolve() for e in user_path.split(";") if e]
+        if dest.resolve() not in entries:
+            print("To run it as `typo` from any terminal, add the folder to your PATH (then open a new terminal):")
+            print(f'  [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path", "User") + ";{dest}", "User")')
+    else:
+        link = Path.home() / ".local" / "bin" / "typo"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(dest / EXE.name)
+        print(f"Linked {link}")
+
+
+def run_unit_tests():
+    """Returns True if every package's tests pass."""
+    # Test executables load libghostty-vt (and SDL) from next to themselves.
+    copy_runtime_files()
+    ok = True
+    for package in TEST_PACKAGES:
+        name = Path(package).name if package != "src" else "typo"
+        out = OUT / f"{name}_test{'.exe' if IS_WINDOWS else ''}"
+        ok &= run(["odin", "test", package, f"-out:{out}", "-define:ODIN_TEST_FANCY=false"]).returncode == 0
+    return ok
+
+
+def run_perf():
+    """Builds an optimized, console-attached binary and runs the performance suite."""
+    build_odin(True, PERF_EXE, console=True)
+    copy_runtime_files()
+    return run([PERF_EXE, "--perf"]).returncode == 0
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--release", action="store_true", help="optimized build")
     parser.add_argument("--run", action="store_true", help="launch the editor after building")
-    parser.add_argument("--test", action="store_true", help="run unit tests")
+    parser.add_argument("--test", action="store_true", help="run unit tests and the performance suite")
+    parser.add_argument("--perf", action="store_true", help="run only the performance suite")
+    parser.add_argument("--install", action="store_true", help="install a release build")
+    parser.add_argument("--install-dir", type=Path, help="where --install puts it")
     args = parser.parse_args()
 
     OUT.mkdir(exist_ok=True)
     build_tree_sitter()
-    if args.test:
-        run_tests()
+    build_ghostty()
+    fetch_conpty()
+    if args.test or args.perf:
+        ok = run_unit_tests() if args.test else True
+        ok &= run_perf()
+        print("\nAll tests passed." if ok else "\nTests FAILED.")
+        sys.exit(0 if ok else 1)
+    if args.install or args.install_dir:
+        install(args.install_dir or default_install_dir())
+        return
     build_odin(args.release)
     copy_runtime_files()
     if args.run:

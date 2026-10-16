@@ -34,6 +34,15 @@ folder_name :: proc(path: string) -> string {
 	return name == "" || name == "." || strings.has_suffix(name, ":") ? path : name
 }
 
+// `path` relative to the workspace root, or unchanged if outside it.
+relative_to_root :: proc(path: string) -> string {
+	root := g.workspace.root
+	if len(path) <= len(root) || !strings.has_prefix(path, root) do return path
+	if is_separator(root[len(root) - 1]) do return path[len(root):] // a drive root like "C:\"
+	if is_separator(path[len(root)]) do return path[len(root) + 1:]
+	return path
+}
+
 workspace_open :: proc(ws: ^Workspace, root: string) {
 	workspace_destroy(ws)
 	ws.root = strings.clone(root)
@@ -82,9 +91,13 @@ workspace_reveal :: proc(ws: ^Workspace, path: string) {
 
 @(private = "file")
 is_path_prefix :: proc(dir, path: string) -> bool {
-	return len(path) > len(dir) && strings.has_prefix(path, dir) && (path[len(dir)] == '\\' || path[len(dir)] == '/')
+	return len(path) > len(dir) && strings.has_prefix(path, dir) && is_separator(path[len(dir)])
 }
 
+@(private = "file")
+is_separator :: proc(c: u8) -> bool {
+	return c == '/' || c == '\\'
+}
 
 @(private = "file")
 load_children :: proc(ws: ^Workspace, index: int) {
@@ -145,9 +158,11 @@ show_open_folder_dialog :: proc() {
 folder_dialog_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: i32) {
 	context = g.ctx
 	if filelist == nil || filelist[0] == nil do return // error or cancelled
-	sync.guard(&picked.mutex)
+	sync.lock(&picked.mutex)
 	delete(picked.path)
 	picked.path = strings.clone_from_cstring(filelist[0])
+	sync.unlock(&picked.mutex)
+	wake_main_loop(nil)
 }
 
 // Returns a folder chosen in the dialog since the last call, if any. Caller owns the string.

@@ -86,7 +86,8 @@ lexer_highlight :: proc(lx: ^Lexer_State, b: ^buffer.Buffer, start: int, out: []
 }
 
 // Lexes lines [first, last) starting in `state` and returns the state after
-// them. Highlights for bytes at document offset >= out_start are written to out.
+// them. Highlights for document bytes [out_start, out_start+len(out)) are
+// written to out; when there is an `out`, lexing stops at its end.
 @(private = "file")
 lex_lines :: proc(rules: ^Lang_Rules, state: Lex_State, b: ^buffer.Buffer, first, last: int, out_start: int, out: []Highlight) -> Lex_State {
 	n := buffer.line_count(b)
@@ -94,6 +95,7 @@ lex_lines :: proc(rules: ^Lang_Rules, state: Lex_State, b: ^buffer.Buffer, first
 	if first >= last do return state
 	lo := buffer.line_start(b, first)
 	hi := last >= n ? buffer.length(b) : buffer.line_start(b, last)
+	if out != nil do hi = min(hi, out_start + len(out))
 	text := buffer.read_alloc(b, lo, hi)
 
 	state := state
@@ -104,17 +106,18 @@ lex_lines :: proc(rules: ^Lang_Rules, state: Lex_State, b: ^buffer.Buffer, first
 		line := text[i:j]
 		line_lo := lo + i
 
-		// Only produce highlights for lines overlapping the output range.
-		overlaps := len(out) > 0 && line_lo + len(line) >= out_start && line_lo < out_start + len(out)
-		if overlaps {
+		// Only produce highlights for lines overlapping the output range,
+		// straight into `out` unless the line starts before it.
+		out_end := out_start + len(out)
+		switch {
+		case len(out) == 0 || line_lo + len(line) < out_start || line_lo >= out_end:
+			state = lex_line(rules, state, line, nil)
+		case line_lo >= out_start:
+			state = lex_line(rules, state, line, out[line_lo - out_start:][:len(line)])
+		case:
 			hl := make([]Highlight, len(line), context.temp_allocator)
 			state = lex_line(rules, state, line, hl)
-			for x, idx in hl {
-				pos := line_lo + idx - out_start
-				if pos >= 0 && pos < len(out) do out[pos] = x
-			}
-		} else {
-			state = lex_line(rules, state, line, nil)
+			copy(out, hl[out_start - line_lo:])
 		}
 		i = j + 1
 	}

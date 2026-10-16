@@ -1,29 +1,11 @@
 package editor
 
-import "core:math"
-
 import clay "../vendor/clay-odin"
-import ttf "vendor:sdl3/ttf"
 
 import "syntax"
 
-// Font ids index into FONT_FILES; Clay passes these back to us in measure/render.
-Font_Id :: enum u16 {
-	Body,
-	SemiBold,
-	Bold,
-	Icons,
-}
-
-FONT_FILES := [Font_Id]string {
-	.Body     = "assets/fonts/IBMPlexMono-Medium.ttf",
-	.SemiBold = "assets/fonts/IBMPlexMono-SemiBold.ttf",
-	.Bold     = "assets/fonts/IBMPlexMono-Bold.ttf",
-	.Icons    = "assets/fonts/lucide.ttf",
-}
-
-// Colors used by the UI and the text view. The active set is `theme`, switched
-// at runtime by the settings (apply_settings). Clay colors are 0..255 floats.
+// Colors used by the UI, the text view and the terminal. Clay colors are
+// 0..255 floats. The active set is `theme`, chosen by name in the settings.
 Theme :: struct {
 	bg:           clay.Color, // editor background
 	panel:        clay.Color, // sidebar, popups
@@ -37,16 +19,17 @@ Theme :: struct {
 	text_bright:  clay.Color,
 	gutter:       clay.Color,
 	accent:       clay.Color,
+	error:        clay.Color,
 	selection:    clay.Color, // text selection
 	current_line: clay.Color,
 	caret:        clay.Color,
 	backdrop:     clay.Color, // dims the window behind modal popups
 	syntax:       [syntax.Highlight]clay.Color,
+	ansi:         [16]clay.Color, // terminal colors 0-15: black red green yellow blue magenta cyan white, then bright
 }
 
-// Based on GitHub's dark theme, softened: near-black blue-greys for surfaces,
-// and muted, almost pastel reds and blues for syntax (GitHub Dark's roles:
-// red keywords, blue strings/constants, lavender functions).
+// GitHub Dark, softened: near-black blue-greys for surfaces, and muted, almost
+// pastel reds and blues for syntax.
 DARK_THEME :: Theme {
 	bg           = {13, 17, 23, 255},
 	panel        = {17, 21, 28, 255},
@@ -60,6 +43,7 @@ DARK_THEME :: Theme {
 	text_bright  = {230, 237, 243, 255},
 	gutter       = {13, 17, 23, 255},
 	accent       = {121, 168, 232, 255},
+	error        = {232, 138, 136, 255},
 	selection    = {35, 55, 85, 255},
 	current_line = {20, 25, 33, 255},
 	caret        = {201, 209, 217, 255},
@@ -83,10 +67,16 @@ DARK_THEME :: Theme {
 		.Attribute        = {146, 186, 230, 255}, // light blue
 		.Label            = {201, 209, 217, 255},
 	},
+	ansi         = {
+		{72, 79, 88, 255},    {232, 138, 136, 255}, {126, 196, 142, 255}, {222, 190, 120, 255},
+		{127, 177, 230, 255}, {196, 176, 236, 255}, {120, 200, 208, 255}, {177, 186, 196, 255},
+		{110, 118, 129, 255}, {244, 168, 162, 255}, {150, 216, 162, 255}, {236, 206, 140, 255},
+		{164, 198, 236, 255}, {214, 196, 244, 255}, {148, 216, 222, 255}, {230, 237, 243, 255},
+	},
 }
 
 // GitHub Light, with the same roles. Syntax colors are deeper than the dark
-// theme's (pastels wash out on white) but still muted rather than saturated.
+// theme's but still muted.
 LIGHT_THEME :: Theme {
 	bg           = {255, 255, 255, 255},
 	panel        = {246, 248, 250, 255},
@@ -100,6 +90,7 @@ LIGHT_THEME :: Theme {
 	text_bright  = {15, 20, 25, 255},
 	gutter       = {255, 255, 255, 255},
 	accent       = {9, 105, 218, 255},
+	error        = {196, 64, 72, 255},
 	selection    = {196, 222, 250, 255},
 	current_line = {246, 248, 250, 255},
 	caret        = {36, 41, 47, 255},
@@ -123,31 +114,22 @@ LIGHT_THEME :: Theme {
 		.Attribute        = {40, 100, 170, 255},
 		.Label            = {36, 41, 47, 255},
 	},
+	ansi         = {
+		{36, 41, 47, 255},   {196, 64, 72, 255},  {26, 127, 55, 255},  {154, 103, 0, 255},
+		{28, 72, 140, 255},  {116, 80, 190, 255}, {27, 124, 131, 255}, {110, 119, 129, 255},
+		{87, 96, 106, 255},  {164, 14, 38, 255},  {17, 99, 41, 255},   {125, 78, 0, 255},
+		{9, 105, 218, 255},  {130, 80, 223, 255}, {49, 146, 170, 255}, {140, 149, 159, 255},
+	},
 }
+
+// Built-in themes; THEME_NAMES[i] names THEMES[i] in the settings.
+THEMES := [?]Theme{DARK_THEME, LIGHT_THEME}
+THEME_NAMES := [?]string{"dark", "light"}
+#assert(len(THEMES) == len(THEME_NAMES))
 
 theme := DARK_THEME
 
-// Light hinting snaps glyphs only vertically, keeping their designed shapes;
-// LIGHT_SUBPIXEL also positions glyphs at fractional pixels for even spacing.
-FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
-
-FONT_SIZE_UI      :: 14
-FONT_SIZE_SIDEBAR :: 13
-UI_LINE_HEIGHT    :: 20
-
-STATUSBAR_HEIGHT :: 24
-SIDEBAR_WIDTH    :: 240
-
-// Editor text size comes from the settings; the line height follows it.
-editor_font_size :: proc() -> u16 {
-	return u16(g.settings.font_size)
-}
-
-// Line numbers are a little smaller than the text they label.
-gutter_font_size :: proc() -> u16 {
-	return max(editor_font_size(), 10) - 2
-}
-
-editor_line_height :: proc() -> int {
-	return int(math.round(f32(g.settings.font_size) * 1.35))
+theme_by_name :: proc(name: string) -> Theme {
+	for n, i in THEME_NAMES do if n == name do return THEMES[i]
+	return DARK_THEME
 }

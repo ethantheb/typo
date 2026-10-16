@@ -14,6 +14,7 @@ Buffer :: struct {
 	rng:     u32,
 	history: History,
 	changes: [dynamic]Change, // edits not yet consumed by take_changes
+	version: u64,  // incremented by every change
 	crlf:    bool, // the file's line endings, used for newly inserted lines
 }
 
@@ -160,6 +161,7 @@ end_change :: proc(b: ^Buffer, c: Change, new_len: int) {
 	c.new_len = new_len
 	c.new_end = point_at(b, c.offset + new_len)
 	append(&b.changes, c)
+	b.version += 1
 }
 
 // --- Reading ------------------------------------------------------------------
@@ -279,8 +281,7 @@ remove_range :: proc(b: ^Buffer, offset, count: int, removed: ^[dynamic]Piece) {
 	b.root = merge(b, l, r)
 }
 
-// Wraps an allocated slice as a dynamic array that owns it (no copy).
-// (core:slice.into_dynamic yields len 0 and a nil allocator, so it doesn't fit.)
+// Wraps an allocated slice as a full dynamic array that owns it (no copy).
 @(private)
 adopt :: proc(data: []u8, allocator := context.allocator) -> [dynamic]u8 {
 	raw := runtime.Raw_Dynamic_Array {

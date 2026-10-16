@@ -1,6 +1,5 @@
 package editor
 
-import "core:math"
 import "core:os"
 import "core:slice"
 import "core:strings"
@@ -24,12 +23,8 @@ Editor :: struct {
 	buf:      buffer.Buffer,
 	hl:       syntax.Highlighter,
 	path:     string, // full path; "" when nothing is open
-	status:   enum {
-		None,
-		Text,
-		Binary,
-		Error,
-	},
+	new_file: bool,   // path doesn't exist yet; the first save creates it
+	status:   File_Status,
 	sels:     [dynamic]Selection, // sorted, non-overlapping
 	primary:  int,                // index into sels of the main caret
 
@@ -40,7 +35,7 @@ Editor :: struct {
 	target_y: f64,
 	target_x: f32,
 	scrollbar_drag: Maybe(f32), // grab offset within the thumb while dragging it
-	view:     clay_box, // text area bounds from the last layout
+	view:     Rect,     // text area bounds from the last layout
 	char_w:   f32,      // monospace advance of the editor font
 	gutter_w: f32,
 
@@ -53,10 +48,19 @@ Editor :: struct {
 	},
 	drag_origin: Selection, // selection made by the initial click, for word/line drag
 	blink_t0: u64,          // caret blink phase start (reset on activity)
+	// The primary caret's line and visual column, cached: on a long line the
+	// column takes a scan from the line start.
+	caret_pos: struct {
+		head, line, col: int,
+		version:         u64,
+	},
 }
 
-clay_box :: struct {
-	x, y, w, h: f32,
+File_Status :: enum {
+	None,
+	Text,
+	Binary,
+	Error,
 }
 
 // --- Open / save ----------------------------------------------------------------
@@ -65,16 +69,23 @@ editor_open :: proc(e: ^Editor, path: string) {
 	editor_close(e)
 	e.path = strings.clone(path)
 
-	data, err := os.read_entire_file(path, context.allocator)
-	if err != nil {
-		e.status = .Error
-		return
-	}
-	// Treat anything containing a NUL byte in its first 8KB as binary.
-	if slice.contains(data[:min(len(data), 8192)], 0) {
-		delete(data)
-		e.status = .Binary
-		return
+	data: []u8
+	if os.exists(path) {
+		err: os.Error
+		data, err = os.read_entire_file(path, context.allocator)
+		if err != nil {
+			e.status = .Error
+			return
+		}
+		// Anything with a NUL byte in its first 8KB is binary.
+		if slice.contains(data[:min(len(data), 8192)], 0) {
+			delete(data)
+			e.status = .Binary
+			return
+		}
+	} else {
+		// A path that doesn't exist opens as an empty, unsaved file.
+		e.new_file = true
 	}
 	buffer.buffer_init(&e.buf, data)
 	syntax.highlighter_open(&e.hl, &e.buf, path)
@@ -107,6 +118,7 @@ editor_is_modified :: proc(e: ^Editor) -> bool {
 // save never leaves a half-written file.
 editor_save :: proc(e: ^Editor) -> bool {
 	if e.status != .Text do return false
+	if e.new_file do _ = os.make_directory_all(os.dir(e.path))
 	tmp := strings.concatenate({e.path, ".typo.tmp"}, context.temp_allocator)
 	f, err := os.create(tmp)
 	if err != nil {
@@ -128,36 +140,17 @@ editor_save :: proc(e: ^Editor) -> bool {
 		return false
 	}
 	buffer.mark_saved(&e.buf)
+	e.new_file = false
 	return true
 }
 
 // Asks what to do with unsaved changes. Returns false if the user cancelled.
 editor_confirm_discard :: proc(e: ^Editor) -> bool {
 	if !editor_is_modified(e) do return true
-	buttons := [?]sdl.MessageBoxButtonData {
-		{flags = {.RETURNKEY_DEFAULT}, buttonID = 0, text = "Save"},
-		{buttonID = 1, text = "Don't Save"},
-		{flags = {.ESCAPEKEY_DEFAULT}, buttonID = 2, text = "Cancel"},
-	}
-	msg := strings.clone_to_cstring(
-		strings.concatenate({"Save changes to ", relative_to_root(e.path), "?"}, context.temp_allocator),
-		context.temp_allocator,
-	)
-	data := sdl.MessageBoxData {
-		flags      = {.WARNING},
-		window     = g.window,
-		title      = "Unsaved changes",
-		message    = msg,
-		numbuttons = len(buttons),
-		buttons    = &buttons[0],
-	}
-	choice: i32 = 2
-	if !sdl.ShowMessageBox(data, &choice) do return false
-	switch choice {
-	case 0:
-		return editor_save(e)
-	case 1:
-		return true
+	message := strings.concatenate({"Save changes to ", relative_to_root(e.path), "?"}, context.temp_allocator)
+	switch ask("Unsaved changes", message, {"Save", "Don't Save", "Cancel"}, default = 0, cancel = 2) {
+	case 0: return editor_save(e)
+	case 1: return true
 	}
 	return false
 }
@@ -218,12 +211,45 @@ line_text :: proc(e: ^Editor, line: int) -> (text: string, start: int) {
 	return string(buffer.read_alloc(&e.buf, start, end)), start
 }
 
+// Line and visual column of the primary caret.
+caret_line_col :: proc(e: ^Editor) -> (line, col: int) {
+	head := e.sels[e.primary].head
+	c := &e.caret_pos
+	// The zero value is right for a new file: head 0 is line 0, column 0.
+	if c.head != head || c.version != e.buf.version {
+		line = buffer.offset_to_line(&e.buf, head)
+		text, start := line_text(e, line)
+		c^ = {head, line, visual_col(text, head - start), e.buf.version}
+	}
+	return c.line, c.col
+}
+
+// [lo, hi) of a whole line including its line break.
+line_span :: proc(e: ^Editor, line: int) -> (lo, hi: int) {
+	lo = buffer.line_start(&e.buf, line)
+	hi = line + 1 < buffer.line_count(&e.buf) ? buffer.line_start(&e.buf, line + 1) : buffer.length(&e.buf)
+	return
+}
+
+// Length of a line's leading spaces and tabs.
+@(private = "file")
+indent_len :: proc(text: string) -> int {
+	n := 0
+	for n < len(text) && (text[n] == ' ' || text[n] == '\t') do n += 1
+	return n
+}
+
+// The visual column after character `r` at column `col` (tabs jump to the next stop).
+next_col :: proc(col: int, r: rune) -> int {
+	return r == '\t' ? (col / TAB_WIDTH + 1) * TAB_WIDTH : col + 1
+}
+
 // Visual column of byte index i in a line, with tabs expanded.
 visual_col :: proc(text: string, i: int) -> int {
 	col := 0
 	for r, j in text {
 		if j >= i do break
-		col = r == '\t' ? (col / TAB_WIDTH + 1) * TAB_WIDTH : col + 1
+		col = next_col(col, r)
 	}
 	return col
 }
@@ -232,7 +258,7 @@ visual_col :: proc(text: string, i: int) -> int {
 byte_at_col :: proc(text: string, col: int) -> int {
 	c := 0
 	for r, j in text {
-		next := r == '\t' ? (c / TAB_WIDTH + 1) * TAB_WIDTH : c + 1
+		next := next_col(c, r)
 		if col < next {
 			// Inside a wide character (tab): snap to the nearer edge.
 			return col - c <= next - col ? j : j + utf8.rune_size(r)
@@ -386,10 +412,8 @@ vertical :: proc(e: ^Editor, s: Selection, lines: int) -> (head, col: int) {
 
 // Home goes to the first non-blank character, or to column 0 if already there.
 smart_home :: proc(e: ^Editor, offset: int) -> int {
-	line := buffer.offset_to_line(&e.buf, offset)
-	text, start := line_text(e, line)
-	indent := 0
-	for indent < len(text) && (text[indent] == ' ' || text[indent] == '\t') do indent += 1
+	text, start := line_text(e, buffer.offset_to_line(&e.buf, offset))
+	indent := indent_len(text)
 	return offset == start + indent ? start : start + indent
 }
 
@@ -468,9 +492,7 @@ editor_newline :: proc(e: ^Editor) {
 	texts := make([]string, len(e.sels), context.temp_allocator)
 	for s, i in e.sels {
 		text, _ := line_text(e, buffer.offset_to_line(&e.buf, sel_lo(s)))
-		indent := 0
-		for indent < len(text) && (text[indent] == ' ' || text[indent] == '\t') do indent += 1
-		texts[i] = strings.concatenate({buffer.newline(&e.buf), text[:indent]}, context.temp_allocator)
+		texts[i] = strings.concatenate({buffer.newline(&e.buf), text[:indent_len(text)]}, context.temp_allocator)
 	}
 	apply(e, .Other, selection_ranges(e), texts)
 }
@@ -518,12 +540,7 @@ editor_copy :: proc(e: ^Editor, cut: bool) {
 	ranges := make([][2]int, len(e.sels), context.temp_allocator)
 	for s, i in e.sels {
 		lo, hi := sel_lo(s), sel_hi(s)
-		if whole_lines {
-			line := buffer.offset_to_line(&e.buf, lo)
-			lo = buffer.line_start(&e.buf, line)
-			hi = buffer.line_start(&e.buf, line + 1)
-			if line + 1 >= buffer.line_count(&e.buf) do hi = buffer.length(&e.buf)
-		}
+		if whole_lines do lo, hi = line_span(e, buffer.offset_to_line(&e.buf, lo))
 		ranges[i] = {lo, hi}
 		if i > 0 && !whole_lines do strings.write_string(&sb, buffer.newline(&e.buf))
 		strings.write_bytes(&sb, buffer.read_alloc(&e.buf, lo, hi))
@@ -614,216 +631,4 @@ editor_text_input :: proc(e: ^Editor, text: string) {
 	if e.status != .Text do return
 	e.blink_t0 = sdl.GetTicksNS()
 	editor_insert(e, text)
-}
-
-// --- Mouse & scrolling --------------------------------------------------------------
-
-// Document offset under a point (logical window coordinates).
-offset_at_point :: proc(e: ^Editor, x, y: f32) -> int {
-	line := int(f64(y - e.view.y) + e.scroll_y) / editor_line_height()
-	line = clamp(line, 0, buffer.line_count(&e.buf) - 1)
-	if f64(y - e.view.y) + e.scroll_y < 0 do return 0
-	text, start := line_text(e, line)
-	col := int((x - e.view.x - e.gutter_w - TEXT_MARGIN + e.scroll_x) / e.char_w + 0.5)
-	return start + byte_at_col(text, max(col, 0))
-}
-
-editor_mouse :: proc(e: ^Editor) {
-	if e.status != .Text do return
-	v := e.view
-	inside := g.mouse_pos.x >= v.x && g.mouse_pos.x < v.x + v.w && g.mouse_pos.y >= v.y && g.mouse_pos.y < v.y + v.h
-
-	// Wheel scrolling (Shift or a horizontal wheel scrolls sideways). Eases
-	// toward the new position rather than jumping.
-	if inside && g.wheel != {} {
-		shift := sdl.GetModState() & sdl.KMOD_SHIFT != {}
-		dx, dy := g.wheel.x, g.wheel.y
-		if shift do dx, dy = dy, 0
-		e.target_y -= f64(dy * 3 * f32(editor_line_height()))
-		e.target_x -= dx * 6 * e.char_w
-	}
-
-	if scrollbar_mouse(e) {
-		clamp_scroll(e)
-		return
-	}
-	on_scrollbar := scrollbar_hit(e, g.mouse_pos)
-
-	if g.mouse_pressed && inside && !on_scrollbar {
-		mods := sdl.GetModState()
-		offset := offset_at_point(e, g.mouse_pos.x, g.mouse_pos.y)
-		e.blink_t0 = sdl.GetTicksNS()
-		e.dragging = true
-		e.drag_mode = .Char
-
-		switch {
-		case mods & sdl.KMOD_ALT != {}:
-			append(&e.sels, Selection{offset, offset, -1})
-			e.primary = len(e.sels) - 1
-		case mods & sdl.KMOD_SHIFT != {}:
-			p := e.sels[e.primary]
-			set_single_selection(e, {p.anchor, offset, -1})
-		case g.mouse_clicks == 2:
-			lo, hi := word_at(e, offset)
-			set_single_selection(e, {lo, hi, -1})
-			e.drag_mode = .Word
-		case g.mouse_clicks >= 3:
-			line := buffer.offset_to_line(&e.buf, offset)
-			set_single_selection(e, {buffer.line_start(&e.buf, line), buffer.line_start(&e.buf, line + 1), -1})
-			if line + 1 >= buffer.line_count(&e.buf) do e.sels[0].head = buffer.length(&e.buf)
-			e.drag_mode = .Line
-		case:
-			set_single_selection(e, {offset, offset, -1})
-		}
-		e.drag_origin = e.sels[e.primary]
-		normalize(e)
-	} else if e.dragging && g.mouse_down {
-		// Extend the primary selection; scroll when dragging past the edges.
-		lh := f64(editor_line_height())
-		if g.mouse_pos.y < v.y do scroll_to(e, e.scroll_y - lh * 0.5)
-		if g.mouse_pos.y > v.y + v.h do scroll_to(e, e.scroll_y + lh * 0.5)
-		offset := offset_at_point(e, g.mouse_pos.x, g.mouse_pos.y)
-		o := e.drag_origin
-		s := &e.sels[e.primary]
-		switch e.drag_mode {
-		case .Char:
-			s^ = {o.anchor, offset, -1}
-		case .Word, .Line:
-			lo, hi: int
-			if e.drag_mode == .Word {
-				lo, hi = word_at(e, offset)
-			} else {
-				line := buffer.offset_to_line(&e.buf, offset)
-				lo, hi = buffer.line_start(&e.buf, line), buffer.line_start(&e.buf, line + 1)
-				if line + 1 >= buffer.line_count(&e.buf) do hi = buffer.length(&e.buf)
-			}
-			if lo < sel_lo(o) {
-				s^ = {sel_hi(o), lo, -1}
-			} else {
-				s^ = {sel_lo(o), max(hi, sel_hi(o)), -1}
-			}
-		}
-		normalize(e)
-	} else if !g.mouse_down {
-		e.dragging = false
-	}
-
-	clamp_scroll(e)
-}
-
-// Scrolls so the primary caret is visible (after keyboard edits/moves). Works
-// on the scroll target: if the target already shows the caret (e.g. Page Down
-// is easing there) nothing changes; otherwise the view jumps, so typing and
-// arrow keys never wait on an animation.
-editor_reveal :: proc(e: ^Editor) {
-	if !e.reveal || e.status != .Text || e.view.h <= 0 do return
-	e.reveal = false
-	head := e.sels[e.primary].head
-	line := buffer.offset_to_line(&e.buf, head)
-	lh := f64(editor_line_height())
-	top := f64(line) * lh
-	ty, tx := e.target_y, e.target_x
-	if top < ty do ty = top
-	if top + lh > ty + f64(e.view.h) do ty = top + lh - f64(e.view.h)
-
-	text, start := line_text(e, line)
-	x := f32(visual_col(text, head - start)) * e.char_w
-	text_w := e.view.w - e.gutter_w - TEXT_MARGIN - e.char_w * 2
-	if x < tx do tx = max(x - e.char_w * 4, 0)
-	if x > tx + text_w do tx = x - text_w
-
-	if ty != e.target_y do scroll_to(e, ty)
-	if tx != e.target_x do e.scroll_x, e.target_x = tx, tx
-	clamp_scroll(e)
-}
-
-// Jumps straight to a vertical position (no easing).
-scroll_to :: proc(e: ^Editor, y: f64) {
-	e.scroll_y, e.target_y = y, y
-}
-
-max_scroll_y :: proc(e: ^Editor) -> f64 {
-	return max(f64((buffer.line_count(&e.buf) - 1) * editor_line_height()), 0)
-}
-
-clamp_scroll :: proc(e: ^Editor) {
-	max_y := max_scroll_y(e)
-	e.target_y = clamp(e.target_y, 0, max_y)
-	e.scroll_y = clamp(e.scroll_y, 0, max_y)
-	e.target_x = max(e.target_x, 0)
-	e.scroll_x = max(e.scroll_x, 0)
-}
-
-SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
-
-// Moves the view toward the scroll target: eased (frame-rate independent) with
-// smooth scrolling on, in one step with it off.
-editor_animate :: proc(e: ^Editor) {
-	if !g.settings.smooth_scroll {
-		e.scroll_y, e.scroll_x = e.target_y, e.target_x
-		return
-	}
-	t := 1 - math.exp(-f64(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
-	e.scroll_y += (e.target_y - e.scroll_y) * t
-	e.scroll_x += f32(f64(e.target_x - e.scroll_x) * t)
-	if abs(e.target_y - e.scroll_y) < 0.25 do e.scroll_y = e.target_y
-	if abs(e.target_x - e.scroll_x) < 0.25 do e.scroll_x = e.target_x
-}
-
-editor_scrolling :: proc(e: ^Editor) -> bool {
-	return e.status == .Text && (e.scroll_y != e.target_y || e.scroll_x != e.target_x)
-}
-
-// --- Scroll bar ---------------------------------------------------------------------
-
-SCROLLBAR_WIDTH :: 12
-SCROLLBAR_MIN_THUMB :: 28
-
-// Track and thumb rectangles (logical pixels) along the text area's right edge.
-// ok = false when everything fits and there is nothing to scroll.
-scrollbar_geometry :: proc(e: ^Editor) -> (track, thumb: clay_box, ok: bool) {
-	max_y := max_scroll_y(e)
-	v := e.view
-	if max_y <= 0 || v.h <= 0 do return
-	track = {v.x + v.w - SCROLLBAR_WIDTH, v.y, SCROLLBAR_WIDTH, v.h}
-	// Content is the document plus one screen (the last line can scroll to the top).
-	h := max(v.h * v.h / f32(max_y + f64(v.h)), min(SCROLLBAR_MIN_THUMB, v.h))
-	y := v.y + f32(e.scroll_y / max_y) * (v.h - h)
-	thumb = {track.x, y, track.w, h}
-	return track, thumb, true
-}
-
-scrollbar_hit :: proc(e: ^Editor, p: [2]f32) -> bool {
-	track, _, ok := scrollbar_geometry(e)
-	return ok && p.x >= track.x && p.x < track.x + track.w && p.y >= track.y && p.y < track.y + track.h
-}
-
-// Handles pressing and dragging the scroll bar. Returns true while it owns the mouse.
-@(private = "file")
-scrollbar_mouse :: proc(e: ^Editor) -> bool {
-	track, thumb, ok := scrollbar_geometry(e)
-	if !ok {
-		e.scrollbar_drag = nil
-		return false
-	}
-	if g.mouse_pressed && scrollbar_hit(e, g.mouse_pos) {
-		my := g.mouse_pos.y
-		if my >= thumb.y && my < thumb.y + thumb.h {
-			e.scrollbar_drag = my - thumb.y
-		} else {
-			e.scrollbar_drag = thumb.h / 2 // clicking the track centres the thumb there
-		}
-	}
-	grab, dragging := e.scrollbar_drag.?
-	if !dragging do return false
-	if !g.mouse_down {
-		e.scrollbar_drag = nil
-		return false
-	}
-	span := track.h - thumb.h
-	if span > 0 {
-		frac := clamp((g.mouse_pos.y - grab - track.y) / span, 0, 1)
-		scroll_to(e, f64(frac) * max_scroll_y(e))
-	}
-	return true
 }

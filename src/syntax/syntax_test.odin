@@ -117,7 +117,7 @@ test_tree_sitter_incremental :: proc(t: ^testing.T) {
 		buffer.replace(&b, offset, min(rand.int_max(4), n - offset), rand.choice(snippets))
 		buffer.end(&b, {})
 		if rand.int_max(5) == 0 do buffer.undo(&b)
-		highlighter_edit(&h, &b)
+		highlighter_update(&h, &b, buffer.take_changes(&b))
 
 		incremental := highlight_all(&h, &b)
 		text := string(buffer.read_alloc(&b, 0, buffer.length(&b)))
@@ -140,7 +140,7 @@ test_tree_sitter_incremental :: proc(t: ^testing.T) {
 test_lexer_checkpoints :: proc(t: ^testing.T) {
 	sb := strings.builder_make()
 	defer strings.builder_destroy(&sb)
-	for i in 0 ..< 3000 do strings.write_string(&sb, "x := 1 // line\n")
+	for _ in 0 ..< 3000 do strings.write_string(&sb, "x := 1 // line\n")
 	b := make_buffer(strings.to_string(sb))
 	defer buffer.buffer_destroy(&b)
 	h: Highlighter
@@ -153,7 +153,7 @@ test_lexer_checkpoints :: proc(t: ^testing.T) {
 		out: [1]Highlight
 		// Pretend the view is there, and give the catch-up enough frames.
 		highlight_range(h, b, buffer.line_start(b, line), out[:])
-		for _ in 0 ..< 100 do highlighter_edit(h, b)
+		for _ in 0 ..< 100 do highlighter_update(h, b, buffer.take_changes(b))
 		highlight_range(h, b, buffer.line_start(b, line), out[:])
 		return out[0]
 	}
@@ -164,11 +164,11 @@ test_lexer_checkpoints :: proc(t: ^testing.T) {
 	buffer.begin(&b, .Other, 0, {})
 	buffer.replace(&b, 0, 0, "/*")
 	buffer.end(&b, {})
-	highlighter_edit(&h, &b)
+	highlighter_update(&h, &b, buffer.take_changes(&b))
 	testing.expect_value(t, line_hl(&h, &b, 2500), Highlight.Comment)
 
 	buffer.undo(&b)
-	highlighter_edit(&h, &b)
+	highlighter_update(&h, &b, buffer.take_changes(&b))
 	testing.expect_value(t, line_hl(&h, &b, 2500), Highlight.None)
 }
 

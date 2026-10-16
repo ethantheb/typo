@@ -1,9 +1,8 @@
 package syntax
 
-// Minimal bindings to the tree-sitter C API (vendor/tree-sitter, v0.25.9) and
-// the grammars compiled into the same library by build.py.
+// Bindings to the tree-sitter C API (vendor/tree-sitter, v0.25.9) and the
+// grammars compiled into the same library by build.py.
 
-// Built by build.py.
 when ODIN_OS == .Windows {
 	foreign import ts "../../build/obj/tree_sitter.lib"
 } else {
@@ -101,7 +100,6 @@ foreign ts {
 	ts_node_parent :: proc(self: TSNode) -> TSNode ---
 
 	ts_query_new :: proc(language: ^TSLanguage, source: [^]u8, source_len: u32, error_offset: ^u32, error_type: ^TSQueryError) -> ^TSQuery ---
-	ts_query_delete :: proc(self: ^TSQuery) ---
 	ts_query_pattern_count :: proc(self: ^TSQuery) -> u32 ---
 	ts_query_capture_count :: proc(self: ^TSQuery) -> u32 ---
 	ts_query_capture_name_for_id :: proc(self: ^TSQuery, index: u32, length: ^u32) -> [^]u8 ---
@@ -113,8 +111,6 @@ foreign ts {
 	ts_query_cursor_exec :: proc(self: ^TSQueryCursor, query: ^TSQuery, node: TSNode) ---
 	ts_query_cursor_set_byte_range :: proc(self: ^TSQueryCursor, start_byte, end_byte: u32) -> bool ---
 	ts_query_cursor_next_capture :: proc(self: ^TSQueryCursor, match: ^TSQueryMatch, capture_index: ^u32) -> bool ---
-
-	ts_language_abi_version :: proc(self: ^TSLanguage) -> u32 ---
 
 	// Grammars
 	tree_sitter_odin :: proc() -> ^TSLanguage ---

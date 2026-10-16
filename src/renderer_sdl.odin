@@ -11,7 +11,36 @@ import ttf "vendor:sdl3/ttf"
 
 CORNER_SEGMENTS :: 8
 
+// Clip rectangles nest (a clipped text field inside a scrolling list): each one
+// is intersected with the one around it, and ending it restores the outer one.
+@(private = "file")
+clip_stack: [32]sdl.Rect
+@(private = "file")
+clip_depth: int
+
+push_clip :: proc(renderer: ^sdl.Renderer, r: sdl.Rect) {
+	r := r
+	if clip_depth > 0 && !sdl.GetRectIntersection(r, clip_stack[clip_depth - 1], &r) {
+		r = {} // no overlap: clip everything
+	}
+	if clip_depth < len(clip_stack) {
+		clip_stack[clip_depth] = r
+	}
+	clip_depth += 1
+	_ = sdl.SetRenderClipRect(renderer, &r)
+}
+
+pop_clip :: proc(renderer: ^sdl.Renderer) {
+	clip_depth = max(clip_depth - 1, 0)
+	if clip_depth == 0 {
+		_ = sdl.SetRenderClipRect(renderer, nil)
+	} else {
+		_ = sdl.SetRenderClipRect(renderer, &clip_stack[min(clip_depth, len(clip_stack)) - 1])
+	}
+}
+
 render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(clay.RenderCommand), scale: f32) {
+	clip_depth = 0
 	for i in 0 ..< commands.length {
 		cmd := clay.RenderCommandArray_Get(commands, i)
 		b := scale_box(cmd.boundingBox, scale)
@@ -26,27 +55,17 @@ render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(
 			s := string(data.stringContents.chars[:data.stringContents.length])
 			font := text_get_font(&g.text, Font_Id(data.fontId), data.fontSize)
 			if font == nil do continue
-			text := text_get(&g.text, font, s)
-			if text == nil do continue
-			c := data.textColor
-			_ = ttf.SetTextColor(text, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
-			_ = ttf.DrawRendererText(text, math.round(b.x), math.round(b.y))
+			draw_text(text_get(&g.text, font, s), math.round(b.x), math.round(b.y), data.textColor)
 
 		case .Border:
 			data := cmd.renderData.border
 			draw_border(renderer, b, scale_radius(data.cornerRadius, scale), data.width, data.color, scale)
 
 		case .ScissorStart:
-			r := sdl.Rect {
-				i32(math.round(b.x)),
-				i32(math.round(b.y)),
-				i32(math.round(b.width)),
-				i32(math.round(b.height)),
-			}
-			_ = sdl.SetRenderClipRect(renderer, &r)
+			push_clip(renderer, {i32(math.round(b.x)), i32(math.round(b.y)), i32(math.round(b.width)), i32(math.round(b.height))})
 
 		case .ScissorEnd:
-			_ = sdl.SetRenderClipRect(renderer, nil)
+			pop_clip(renderer)
 
 		case .Custom:
 			data := cmd.renderData.custom
@@ -56,6 +75,8 @@ render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(
 				draw_icon(renderer, c, b)
 			case ^Editor:
 				draw_editor(renderer, c, b, scale)
+			case ^Terminal:
+				draw_terminal(renderer, c, b, scale)
 			}
 
 		case .Image:
@@ -87,7 +108,17 @@ set_color :: proc(renderer: ^sdl.Renderer, c: clay.Color) {
 	_ = sdl.SetRenderDrawColor(renderer, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
 }
 
-@(private = "file")
+// Clips to a custom element's bounds (pixels), rounded outward.
+push_clip_box :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox) {
+	push_clip(renderer, {i32(b.x), i32(b.y), i32(math.ceil(b.width)), i32(math.ceil(b.height))})
+}
+
+draw_text :: proc(text: ^ttf.Text, x, y: f32, c: clay.Color) {
+	if text == nil do return
+	_ = ttf.SetTextColor(text, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
+	_ = ttf.DrawRendererText(text, x, y)
+}
+
 fill_rect :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32, c: clay.Color) {
 	if w <= 0 || h <= 0 do return
 	set_color(renderer, c)
@@ -184,12 +215,10 @@ draw_icon :: proc(renderer: ^sdl.Renderer, data: Icon_Data, b: clay.BoundingBox)
 	if font == nil do return
 	text := text_get(&g.text, font, ICON_GLYPHS[data.kind])
 	if text == nil do return
-	// Lucide draws each icon in the em square, which spans baseline to ascent;
-	// the text height also counts line gap, so centre on the ascent instead.
+	// Lucide draws each icon in the em square (baseline to ascent), so centre
+	// on the ascent rather than the text height, which includes the line gap.
 	w, h: i32
 	_ = ttf.GetTextSize(text, &w, &h)
 	em := f32(ttf.GetFontAscent(font))
-	c := data.color
-	_ = ttf.SetTextColor(text, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
-	_ = ttf.DrawRendererText(text, math.round(b.x + (b.width - f32(w)) / 2), math.round(b.y + (b.height - em) / 2))
+	draw_text(text, math.round(b.x + (b.width - f32(w)) / 2), math.round(b.y + (b.height - em) / 2), data.color)
 }

@@ -8,9 +8,9 @@ Currently supported:
 - Open folders, search files
 - Text editing
 - Syntax highlighting (tree-sitter/custom lexer)
+- Integrated terminal (libghostty-vt)
 
 Might try soon:
-- Integrated terminal
 - LSP
 - Markdown rendering
 - Tabular data rendering (CSV)

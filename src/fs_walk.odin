@@ -2,20 +2,16 @@ package editor
 
 import "core:os"
 import "core:slice"
-import "core:strings"
 import "core:sync"
 
-// Recursive file listing for the file finder.
-//
-// core:os's walker opens every file it visits to fill in File_Info (on Windows
-// it calls CreateFile + GetFileInformationByHandleEx per entry), which makes
-// big trees take minutes and triggers antivirus scans. On Windows we use
-// FindFirstFileW/FindNextFileW directly: names and attributes only, no opens.
-//
+// Recursive file listing for the file finder. Calls visit(path, user) for each
+// file, with `path` valid only during the call; visit returns false to stop.
 // Directories named in `ignore` are skipped, as are directory symlinks and
-// junctions (which can loop or duplicate trees). Calls visit(path, user) for
-// each file, with `path` valid only during the call; visit returns false to
-// stop. `cancel` is polled once per directory.
+// junctions (which can loop or duplicate trees). `cancel` is polled once per
+// directory.
+//
+// On Windows this lists with FindFirstFileW (fs_walk_windows.odin), which
+// reads names and attributes without opening each file as core:os's walker does.
 
 Walk_Visit :: proc(path: string, user: rawptr) -> bool
 

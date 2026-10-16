@@ -11,7 +11,7 @@ import "../buffer"
 //  - Lexer: a line-based tokenizer that only looks at what is on screen (plus
 //    sparse state checkpoints), so it works at any file size.
 // Both produce one Highlight per byte of a requested range, so the renderer
-// doesn't care which one ran (and LSP semantic tokens can later overlay either).
+// doesn't care which one ran (and LSP semantic tokens could overlay either).
 
 Highlight :: enum u8 {
 	None,
@@ -47,10 +47,8 @@ Language :: enum u8 {
 	Python,
 }
 
-// Tree-sitter re-parses synchronously after each edit. With the Odin grammar
-// that costs roughly 0.7% of a full parse (measured: 0.8 ms at 100 KB, 7 ms at
-// 1 MB, 18 ms at 2 MB), so larger files use the lexer to keep frames short.
-// Parsing on a background thread would lift this limit.
+// Tree-sitter re-parses synchronously after each edit, which grows with file
+// size; larger files use the lexer to keep frames short.
 TREE_SITTER_MAX_BYTES :: 512 << 10
 
 Backend :: enum u8 {
@@ -104,7 +102,6 @@ highlighter_open :: proc(h: ^Highlighter, b: ^buffer.Buffer, path: string) {
 		lexer_open(&h.lx, h.lang)
 		h.backend = .Lexer
 	}
-	_ = buffer.take_changes(b) // changes before this point are already reflected
 }
 
 highlighter_close :: proc(h: ^Highlighter) {
@@ -116,9 +113,9 @@ highlighter_close :: proc(h: ^Highlighter) {
 	h^ = {}
 }
 
-// Applies the buffer's pending edits. Call once per frame before drawing.
-highlighter_edit :: proc(h: ^Highlighter, b: ^buffer.Buffer) {
-	changes := buffer.take_changes(b)
+// Applies the buffer's edits since the last call (buffer.take_changes) and
+// continues background work. Call once per frame before drawing.
+highlighter_update :: proc(h: ^Highlighter, b: ^buffer.Buffer, changes: []buffer.Change) {
 	switch h.backend {
 	case .Tree_Sitter:
 		if len(changes) > 0 do ts_edit(&h.ts, b, changes)
