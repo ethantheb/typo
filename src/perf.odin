@@ -528,7 +528,9 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 	case 6 ..= 30:
 		w.focus, w.reveal = (frame - 6) % max(len(w.items), 1), true
 	case:
-		check(p, "lists every setting and command", len(w.items) == len(Command) + len(Setting) - 1) // the renderer is file-only
+		file_only := 0
+		for info in SETTINGS do if info.name == "" do file_only += 1
+		check(p, "lists every setting and command", len(w.items) == len(Command) + len(Setting) - file_only)
 		settings_window_toggle()
 		return true
 	}

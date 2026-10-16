@@ -8,7 +8,7 @@ import "core:sync"
 import "core:time"
 
 import "toml"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // User settings, stored as TOML in the per-user config directory
 // (%APPDATA%\typo\settings.toml on Windows, or TYPO_SETTINGS if set). The file
@@ -23,6 +23,7 @@ Settings :: struct {
 	font_size:      int,
 	smooth_scroll:  bool,
 	terminal_shell: string, // "" = platform default
+	bundled_conpty: bool,   // Windows only
 	renderer:       string, // SDL render backend; applies on restart
 	show_fps:       bool,
 	bindings:       Bindings,
@@ -42,6 +43,7 @@ Setting :: enum {
 	Font_Size,
 	Smooth_Scroll,
 	Terminal_Shell,
+	Bundled_Conpty,
 	Renderer,
 	Show_Fps,
 }
@@ -96,6 +98,12 @@ SETTINGS := [Setting]Setting_Info {
 		keywords = "pwsh powershell cmd bash command line",
 		default = "",
 	},
+	.Bundled_Conpty = {
+		section = .Terminal, key = "bundled_conpty", name = ODIN_OS == .Windows ? "Bundled console host" : "",
+		description = "Use the faster console host from Windows Terminal, saved once to %LOCALAPPDATA%\\typo. Off uses the built-in one and deletes the saved copy. Applies on restart.",
+		keywords = "conpty openconsole windows terminal",
+		default = true,
+	},
 	.Renderer = {
 		section = .Advanced, key = "renderer",
 		description = "Graphics backend; \"auto\" lets SDL choose. Applies on restart.",
@@ -122,6 +130,7 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Font_Size:      return &s.font_size
 	case .Smooth_Scroll:  return &s.smooth_scroll
 	case .Terminal_Shell: return &s.terminal_shell
+	case .Bundled_Conpty: return &s.bundled_conpty
 	case .Renderer:       return &s.renderer
 	case .Show_Fps:       return &s.show_fps
 	}
@@ -292,41 +301,40 @@ contains :: proc(list: []string, s: string) -> bool {
 	return false
 }
 
-// Writes all settings, with comments, replacing the file atomically.
+// Writes all settings, replacing the file atomically.
 settings_save :: proc(s: ^Settings) {
 	if s.path == "" do return
 	sb := strings.builder_make(context.temp_allocator)
-	fmt.sbprintf(&sb, "# typo settings. Edit here or in the settings window (%s).\n", first_chord_label(.Open_Settings))
-	fmt.sbprint(&sb, "# Changes made in this file apply as soon as it is saved.\n")
 	for key, section in SECTION_KEYS {
-		fmt.sbprintf(&sb, "\n[%s]\n", key)
+		// Each section's values line up in one column.
+		Line :: struct {
+			key, value: string,
+		}
+		lines := make([dynamic]Line, context.temp_allocator)
 		if section == .Keybindings {
-			fmt.sbprint(&sb, "# Modifiers: Ctrl, Shift, Alt. Use a list for several keys, e.g. [\"Ctrl+Y\", \"Ctrl+Shift+Z\"].\n")
-			fmt.sbprint(&sb, "# An empty list [] leaves a command unbound.\n")
 			for info, cmd in COMMANDS {
 				chords := make([dynamic]string, context.temp_allocator)
 				for c in s.bindings[cmd] do if c.key != 0 do append(&chords, toml.quote(format_chord(c)))
-				if len(chords) == 1 {
-					fmt.sbprintf(&sb, "%s = %s\n", info.key, chords[0])
-				} else {
-					fmt.sbprintf(&sb, "%s = [%s]\n", info.key, strings.join(chords[:], ", ", context.temp_allocator))
+				value := len(chords) == 1 ? chords[0] : fmt.tprintf("[%s]", strings.join(chords[:], ", ", context.temp_allocator))
+				append(&lines, Line{info.key, value})
+			}
+		} else {
+			for info, x in SETTINGS {
+				if info.section != section do continue
+				value: string
+				switch v in setting_value(s, x) {
+				case ^bool:   value = fmt.tprintf("%v", v^)
+				case ^int:    value = fmt.tprintf("%d", v^)
+				case ^string: value = toml.quote(v^)
 				}
-			}
-			continue
-		}
-		for info, x in SETTINGS {
-			if info.section != section do continue
-			fmt.sbprintf(&sb, "# %s\n", info.description)
-			switch v in setting_value(s, x) {
-			case ^bool:
-				fmt.sbprintf(&sb, "%s = %v\n", info.key, v^)
-			case ^int:
-				fmt.sbprintf(&sb, "# %d to %d\n%s = %d\n", info.min, info.max, info.key, v^)
-			case ^string:
-				if info.choices != nil do fmt.sbprintf(&sb, "# One of: %s\n", strings.join(info.choices, ", ", context.temp_allocator))
-				fmt.sbprintf(&sb, "%s = %s\n", info.key, toml.quote(v^))
+				append(&lines, Line{info.key, value})
 			}
 		}
+		width := 0
+		for line in lines do width = max(width, len(line.key))
+		if section != min(Section) do strings.write_byte(&sb, '\n')
+		fmt.sbprintf(&sb, "[%s]\n", key)
+		for line in lines do fmt.sbprintf(&sb, "%-*s = %s\n", width, line.key, line.value)
 	}
 
 	_ = os.make_directory_all(os.dir(s.path))

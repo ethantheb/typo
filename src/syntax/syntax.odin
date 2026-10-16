@@ -45,6 +45,7 @@ Language :: enum u8 {
 	Java,
 	CSharp,
 	Python,
+	Toml,
 }
 
 // Tree-sitter re-parses synchronously after each edit, which grows with file
@@ -87,6 +88,8 @@ language_for_path :: proc(path: string) -> Language {
 		return .CSharp
 	case ".py", ".pyw", ".pyi":
 		return .Python
+	case ".toml":
+		return .Toml
 	}
 	return .None
 }

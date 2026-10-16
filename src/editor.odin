@@ -7,7 +7,7 @@ import "core:unicode/utf8"
 
 import "buffer"
 import "syntax"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // Editing state for one open file. All edits go through `apply`, which works on
 // every selection at once, so multi-cursor is the general case and a single

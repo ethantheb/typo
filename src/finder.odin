@@ -8,7 +8,7 @@ import "core:thread"
 import "core:time"
 
 import clay "../vendor/clay-odin"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // Ctrl+E file finder: fuzzy-matches a query against every file under the
 // workspace root.

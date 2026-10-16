@@ -178,7 +178,7 @@ rules_for :: proc(lang: Language) -> ^Lang_Rules {
 	case .Go:                      return &go_rules
 	case .Java, .CSharp:           return &java_cs_rules
 	case .Python:                  return &python_rules
-	case .None:
+	case .None, .Toml:
 	}
 	return &plain_rules
 }

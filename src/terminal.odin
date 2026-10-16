@@ -7,8 +7,8 @@ import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import "term"
-import sdl "vendor:sdl3"
-import ttf "vendor:sdl3/ttf"
+import sdl "../vendor/sdl3"
+import ttf "../vendor/sdl3/ttf"
 
 // One terminal: a term.Session (libghostty-vt plus a shell on a pty) and the
 // view of it.
@@ -88,7 +88,7 @@ terminal_destroy :: proc(t: ^Terminal) {
 terminal_start_shell :: proc(t: ^Terminal) {
 	shell := g.settings.terminal_shell != "" ? g.settings.terminal_shell : term.default_shell()
 	t.shell_len = copy(t.shell_name[:], shell_display_name(shell))
-	if !term.session_spawn(&t.session, shell, g.workspace.root) {
+	if !term.session_spawn(&t.session, shell, g.workspace.root, g.settings.bundled_conpty) {
 		term.session_print_notice(&t.session, "Could not start the shell. Press Enter to try again.")
 	}
 	t.spawned = true

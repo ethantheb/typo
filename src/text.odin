@@ -5,14 +5,14 @@ import "core:os"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
-import sdl "vendor:sdl3"
-import ttf "vendor:sdl3/ttf"
+import sdl "../vendor/sdl3"
+import ttf "../vendor/sdl3/ttf"
 
 // Fonts, glyph fallback and cached text objects. Clay works in logical
 // (DPI-independent) units; fonts are rasterized at size * scale so text stays
 // crisp on high-DPI displays, and measurements are divided back by scale.
 
-// Font ids index into FONT_FILES; Clay passes these back in measure/render.
+// Font ids index into FONT_DATA; Clay passes these back in measure/render.
 Font_Id :: enum u16 {
 	Body,
 	SemiBold,
@@ -20,11 +20,12 @@ Font_Id :: enum u16 {
 	Icons,
 }
 
-FONT_FILES := [Font_Id]string {
-	.Body     = "assets/fonts/IBMPlexMono-Medium.ttf",
-	.SemiBold = "assets/fonts/IBMPlexMono-SemiBold.ttf",
-	.Bold     = "assets/fonts/IBMPlexMono-Bold.ttf",
-	.Icons    = "assets/fonts/lucide.ttf",
+// The bundled fonts are compiled into the executable.
+FONT_DATA := [Font_Id][]u8 {
+	.Body     = #load("../assets/fonts/IBMPlexMono-Medium.ttf"),
+	.SemiBold = #load("../assets/fonts/IBMPlexMono-SemiBold.ttf"),
+	.Bold     = #load("../assets/fonts/IBMPlexMono-Bold.ttf"),
+	.Icons    = #load("../assets/fonts/lucide.ttf"),
 }
 
 // Snaps glyphs only vertically and positions them at fractional pixels.
@@ -97,7 +98,6 @@ Text_Entry :: struct {
 
 Text_System :: struct {
 	engine:         ^ttf.TextEngine,
-	base_path:      string,
 	scale:          f32,             // pixels per logical unit
 	fallback_paths: [dynamic]string, // FALLBACK_FONTS that exist on this system
 	found_paths:    bool,            // fallback_paths has been filled in
@@ -122,7 +122,6 @@ text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool
 		return false
 	}
 	ts.scale = scale
-	ts.base_path = strings.clone_from_cstring(sdl.GetBasePath())
 	return true
 }
 
@@ -135,7 +134,6 @@ text_destroy :: proc(ts: ^Text_System) {
 	delete(ts.fallback_paths)
 	delete(ts.texts)
 	delete(ts.char_widths)
-	delete(ts.base_path)
 	ttf.DestroyRendererTextEngine(ts.engine)
 	ttf.Quit()
 }
@@ -163,8 +161,16 @@ text_clear_caches :: proc(ts: ^Text_System) {
 }
 
 @(private = "file")
-open_font :: proc(ts: ^Text_System, path: string, size: f32) -> ^ttf.Font {
+open_font :: proc(path: string, size: f32) -> ^ttf.Font {
 	font := ttf.OpenFont(strings.clone_to_cstring(path, context.temp_allocator), size)
+	if font != nil do ttf.SetFontHinting(font, FONT_HINTING)
+	return font
+}
+
+@(private = "file")
+open_bundled_font :: proc(id: Font_Id, size: f32) -> ^ttf.Font {
+	data := FONT_DATA[id]
+	font := ttf.OpenFontIO(sdl.IOFromConstMem(raw_data(data), uint(len(data))), true, size)
 	if font != nil do ttf.SetFontHinting(font, FONT_HINTING)
 	return font
 }
@@ -172,11 +178,9 @@ open_font :: proc(ts: ^Text_System, path: string, size: f32) -> ^ttf.Font {
 text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 	key := Font_Key{id, size}
 	if font, ok := ts.fonts[key]; ok do return font
-	px := f32(size) * ts.scale
-	path := strings.concatenate({ts.base_path, FONT_FILES[id]}, context.temp_allocator)
-	font := open_font(ts, path, px)
+	font := open_bundled_font(id, f32(size) * ts.scale)
 	if font == nil {
-		sdl.Log("TTF_OpenFont(%s) failed: %s", strings.clone_to_cstring(path, context.temp_allocator), sdl.GetError())
+		sdl.Log("TTF_OpenFontIO(%d) failed: %s", i32(id), sdl.GetError())
 		return nil
 	}
 	ts.fonts[key] = font
@@ -194,7 +198,7 @@ ensure_fallbacks :: proc(ts: ^Text_System, font: ^ttf.Font, s: string) {
 		list := make([dynamic]^ttf.Font, 0, len(ts.fallback_paths))
 		size := ttf.GetFontSize(font)
 		for path in ts.fallback_paths {
-			fallback := open_font(ts, path, size)
+			fallback := open_font(path, size)
 			if fallback == nil do continue
 			if ttf.AddFallbackFont(font, fallback) do append(&list, fallback)
 			else do ttf.CloseFont(fallback)
@@ -226,7 +230,7 @@ find_fallback_paths :: proc(ts: ^Text_System) {
 font_has_own_glyph :: proc(ts: ^Text_System, id: Font_Id, r: rune) -> bool {
 	if r < 0x80 do return true
 	if ts.bare[id] == nil {
-		ts.bare[id] = open_font(ts, strings.concatenate({ts.base_path, FONT_FILES[id]}, context.temp_allocator), 12)
+		ts.bare[id] = open_bundled_font(id, 12)
 		if ts.bare[id] == nil do return true
 	}
 	return ttf.FontHasGlyph(ts.bare[id], u32(r))

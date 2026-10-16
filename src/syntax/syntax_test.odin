@@ -203,3 +203,55 @@ test_lexer_python :: proc(t: ^testing.T) {
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "trailing"), Highlight.Comment)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "return"), Highlight.Keyword) // after the """ closed
 }
+
+TOML_SAMPLE :: `# settings
+[appearance]
+theme = "dark" # trailing
+font_size = 15
+"quoted key".inner = 'C:\path'
+date = 1979-05-27T07:32:00-08:00
+neg = -inf
+redo = [
+	"Ctrl+Y",
+	{ key = "x" },
+]
+after = true
+text = """
+multi \t line
+"""
+last = 0x1F
+
+[[servers.alpha]]
+`
+
+@(test)
+test_tree_sitter_toml :: proc(t: ^testing.T) {
+	b := make_buffer(TOML_SAMPLE)
+	defer buffer.buffer_destroy(&b)
+	h: Highlighter
+	highlighter_open(&h, &b, "settings.toml")
+	defer highlighter_close(&h)
+	testing.expect_value(t, h.backend, Backend.Tree_Sitter)
+	hl := highlight_all(&h, &b)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "settings"), Highlight.Comment)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "appearance"), Highlight.Type) // table names
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "theme"), Highlight.Property)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "dark"), Highlight.String)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "trailing"), Highlight.Comment)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "15"), Highlight.Number)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, `"quoted key"`), Highlight.String)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "inner"), Highlight.Property)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, `\path`), Highlight.String)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "1979"), Highlight.String) // dates are @string.special
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "-inf"), Highlight.Number)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "Ctrl+Y"), Highlight.String)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "key", nth = 1), Highlight.Property) // in the inline table
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "after"), Highlight.Property)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "true"), Highlight.Constant)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "multi"), Highlight.String)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "last"), Highlight.Property)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "0x1F"), Highlight.Number)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "[["), Highlight.Punctuation)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "servers"), Highlight.Type)
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "alpha"), Highlight.Type)
+}

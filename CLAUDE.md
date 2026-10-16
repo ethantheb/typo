@@ -14,9 +14,11 @@ python build.py --test     unit tests for every package, then the performance su
 python build.py --perf     performance suite only
 ```
 
-`build.py` also builds the C dependencies (tree-sitter, libghostty-vt via a pinned Zig)
-and copies runtime files (SDL DLLs, fonts, ConPTY) next to the executable. Run it once
-before using `odin` directly. Quick type check: `odin check src -vet-unused -vet-unused-imports`.
+`build.py` also builds the dependencies as static libraries (tree-sitter with clang,
+libghostty-vt with a pinned Zig, SDL3 and SDL3_ttf with CMake) and on Windows fetches the
+ConPTY files that `src/term/pty_windows.odin` embeds. The fonts are embedded too, so the
+executable is the only runtime file. Run it once before using `odin` directly. Quick type
+check: `odin check src -vet-unused -vet-unused-imports`.
 
 The performance suite (`src/perf.odin`) is an optimized build run as `typo-perf --perf`.
 It opens a real window, runs scripted phases (startup, buffer, syntax, fuzzy search, VT
@@ -52,10 +54,12 @@ src/                 package editor: the app
   perf*.odin         Performance suite and its CPU/GPU counters
   editor_test.odin   Unit tests for the main package
 src/buffer/          Piece table in a treap, newline index, undo history, change log
-src/syntax/          Highlighter: tree-sitter backend (Odin) and line lexer (others)
+src/syntax/          Highlighter: tree-sitter backend (Odin, TOML) and line lexer (others)
 src/term/            libghostty-vt bindings, Session (vt + pty + reader thread), ptys
 src/toml/            Minimal TOML reader for settings
-vendor/              clay-odin, tree-sitter, tree-sitter-odin (do not edit)
+vendor/              clay-odin, tree-sitter, tree-sitter-odin, tree-sitter-toml (do not edit);
+                     sdl3, Odin's SDL3 bindings with foreign imports pointed at the static
+                     libraries
 ```
 
 ## How a frame works

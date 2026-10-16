@@ -46,7 +46,8 @@ default_shell :: proc() -> string {
 	return shell != "" ? shell : "/bin/sh"
 }
 
-pty_spawn :: proc(p: ^Pty, command, cwd: string, cols, rows: u16, on_exit: Notify_Proc, userdata: rawptr) -> bool {
+// `bundled_conpty` only applies on Windows.
+pty_spawn :: proc(p: ^Pty, command, cwd: string, cols, rows: u16, on_exit: Notify_Proc, userdata: rawptr, bundled_conpty: bool) -> bool {
 	p^ = {on_exit = on_exit, userdata = userdata}
 	p.master = posix.posix_openpt({.RDWR, .NOCTTY})
 	if p.master < 0 do return false

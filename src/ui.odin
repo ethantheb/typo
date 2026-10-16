@@ -4,14 +4,15 @@ import "core:strings"
 import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // Small component layer on top of Clay: labels, buttons, icons, text fields,
 // tooltips, modal popups and message boxes.
 
-FONT_SIZE_UI      :: 14
-FONT_SIZE_SMALL   :: 12
-UI_LINE_HEIGHT    :: 20
+FONT_SIZE_UI          :: 14
+FONT_SIZE_SMALL       :: 12
+UI_LINE_HEIGHT        :: 20
+PARAGRAPH_LINE_HEIGHT :: 17
 
 // A rectangle in logical pixels.
 Rect :: struct {
@@ -54,6 +55,14 @@ text_config :: proc(color := theme.text, size: u16 = FONT_SIZE_UI, font := Font_
 
 label :: proc(s: string, color := theme.text, size: u16 = FONT_SIZE_UI, font := Font_Id.Body) {
 	clay.TextDynamic(s, text_config(color, size, font))
+}
+
+// Small text that wraps at word boundaries to fit its container.
+paragraph :: proc(s: string, color := theme.text) {
+	config := text_config(color, FONT_SIZE_SMALL)
+	config.lineHeight = PARAGRAPH_LINE_HEIGHT
+	config.wrapMode = .Words
+	clay.TextDynamic(s, config)
 }
 
 spacer_x :: proc(width: f32) {

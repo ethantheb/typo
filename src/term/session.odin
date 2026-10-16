@@ -106,10 +106,11 @@ session_destroy :: proc(s: ^Session) {
 	s^ = {}
 }
 
-// Starts `command` (a full command line) in `cwd`.
-session_spawn :: proc(s: ^Session, command, cwd: string) -> bool {
+// Starts `command` (a full command line) in `cwd`. On Windows, `bundled_conpty`
+// runs it through the bundled ConPTY when possible (see pty_spawn).
+session_spawn :: proc(s: ^Session, command, cwd: string, bundled_conpty := true) -> bool {
 	if s.running do return true
-	if !pty_spawn(&s.pty, command, cwd, s.cols, s.rows, s.wake, s.wake_data) do return false
+	if !pty_spawn(&s.pty, command, cwd, s.cols, s.rows, s.wake, s.wake_data, bundled_conpty) do return false
 	s.running = true
 	sync.atomic_store(&s.closing, false)
 	s.reader = thread.create_and_start_with_poly_data(s, reader_proc)

@@ -3,8 +3,8 @@ package editor
 import "core:math"
 
 import clay "../vendor/clay-odin"
-import sdl "vendor:sdl3"
-import ttf "vendor:sdl3/ttf"
+import sdl "../vendor/sdl3"
+import ttf "../vendor/sdl3/ttf"
 
 // Translates Clay render commands into SDL_Renderer / SDL_ttf calls.
 // Clay coordinates are logical; everything is multiplied by `scale` to get pixels.

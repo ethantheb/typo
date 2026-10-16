@@ -42,6 +42,7 @@ Predicate :: struct {
 }
 
 ODIN_HIGHLIGHTS :: #load("../../vendor/tree-sitter-odin/queries/highlights.scm", string)
+TOML_HIGHLIGHTS :: #load("../../vendor/tree-sitter-toml/queries/highlights.scm", string)
 
 @(private = "file")
 queries: [Language]^Lang_Query
@@ -51,6 +52,8 @@ ts_language :: proc(lang: Language) -> (^TSLanguage, string) {
 	#partial switch lang {
 	case .Odin:
 		return tree_sitter_odin(), ODIN_HIGHLIGHTS
+	case .Toml:
+		return tree_sitter_toml(), TOML_HIGHLIGHTS
 	}
 	return nil, ""
 }

@@ -5,7 +5,7 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "buffer"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // The window layout: sidebar, editor pane, terminal panel and status bar, plus
 // which pane has focus and the mouse cursor shape.

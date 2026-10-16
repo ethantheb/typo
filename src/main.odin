@@ -8,7 +8,7 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "syntax"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 App :: struct {
 	ctx:             runtime.Context,

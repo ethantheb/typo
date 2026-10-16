@@ -15,29 +15,36 @@ Steps:
   2. Build libghostty-vt (terminal emulation) from a pinned ghostty commit with
      a pinned Zig, both downloaded into build/ on first use. Rebuilt only when
      GHOSTTY_COMMIT changes.
-  3. odin build src. A freshly linked executable is sometimes briefly locked
-     (e.g. by antivirus scanning) and the next link fails; that is retried.
+  3. Build SDL3 and SDL3_ttf (with FreeType, HarfBuzz and plutosvg) with CMake
+     from pinned releases, downloaded into build/ on first use. Rebuilt only
+     when SDL_VERSION or SDL_TTF_VERSION changes; these must match the bindings
+     in vendor/sdl3.
   4. On Windows, fetch Microsoft's ConPTY package (conpty.dll + OpenConsole.exe,
      the pseudo console host Windows Terminal ships). It is newer and faster
-     than the one built into Windows; the terminal falls back to the built-in
-     one if these files are missing.
-  5. Copy runtime files next to the executable: SDL3 DLLs on Windows (they
-     ship with Odin's vendor packages), the libghostty-vt shared library, the
-     ConPTY files, and the fonts.
+     than the one built into Windows. The executable embeds both files and
+     writes them out the first time the terminal starts.
+  5. odin build src. A freshly linked executable is sometimes briefly locked
+     (e.g. by antivirus scanning) and the next link fails; that is retried.
+
+All libraries are linked statically and the fonts are embedded, so the
+executable is the only file typo needs. It still links the system C library
+dynamically on Linux and macOS, and SDL loads X11/Wayland there at runtime.
 
 --test runs `odin test` on each package, then the performance suite: an
 optimized build (build/typo-perf) run as `typo-perf --perf`, which opens a
 window, drives the editor and terminal through scripted scenarios and fails if
 any timing, CPU or GPU measurement is over its limit (see src/perf.odin).
 
---install puts a release build with its runtime files in its own folder, so the
+--install puts a release build in its own folder, so the
 installed copy can stay open while you keep developing in build/:
   Windows:      %LOCALAPPDATA%\\Programs\\typo   (add it to PATH to run `typo`)
   Linux, macOS: ~/.local/share/typo, linked as ~/.local/bin/typo
 --install-dir DIR installs somewhere else. Installing again updates it, even
 while the installed typo is running.
 
-Requires: odin, clang, git, and on Windows llvm-lib (part of LLVM) / elsewhere ar.
+Requires: odin, clang, git, cmake with a C/C++ compiler (Visual Studio on
+Windows), and on Windows llvm-lib (part of LLVM) / elsewhere ar. Building SDL
+on Linux also needs the X11 and Wayland development packages.
 """
 
 import argparse
@@ -69,26 +76,35 @@ TS_SOURCES = [
     "vendor/tree-sitter/lib/src/lib.c",
     "vendor/tree-sitter-odin/src/parser.c",
     "vendor/tree-sitter-odin/src/scanner.c",
+    "vendor/tree-sitter-toml/src/parser.c",
+    "vendor/tree-sitter-toml/src/scanner.c",
 ]
-TS_INPUT_DIRS = ["vendor/tree-sitter", "vendor/tree-sitter-odin/src"]
+TS_INPUT_DIRS = ["vendor/tree-sitter", "vendor/tree-sitter-odin/src", "vendor/tree-sitter-toml/src"]
 
 ZIG_VERSION = "0.16.0"
 GHOSTTY_REPO = "https://github.com/ghostty-org/ghostty.git"
 GHOSTTY_COMMIT = "6301810a48aaa3426887a4316668f18833a40138"
 GHOSTTY_SRC = OUT / "deps" / "ghostty"
 GHOSTTY_OUT = OBJ / "ghostty-vt"
+GHOSTTY_LIB = GHOSTTY_OUT / "lib" / ("ghostty-vt-static.lib" if IS_WINDOWS else "libghostty-vt.a")
 
+SDL_VERSION = "3.4.2"
+SDL_TTF_VERSION = "3.2.2"
+SDL_REPO = "https://github.com/libsdl-org/SDL.git"
+SDL_TTF_REPO = "https://github.com/libsdl-org/SDL_ttf.git"
+SDL_TTF_SUBMODULES = ["external/freetype", "external/harfbuzz", "external/plutosvg", "external/plutovg"]
+SDL_SRC = OUT / "deps" / "SDL"
+SDL_TTF_SRC = OUT / "deps" / "SDL_ttf"
+SDL_OUT = OBJ / "sdl"  # install prefix; vendor/sdl3 links the libraries in lib/
 if IS_WINDOWS:
-    GHOSTTY_SHARED = GHOSTTY_OUT / "bin" / "ghostty-vt.dll"
-elif platform.system() == "Darwin":
-    GHOSTTY_SHARED = GHOSTTY_OUT / "lib" / "libghostty-vt.dylib"
+    SDL_LIBS = [SDL_OUT / "lib" / "SDL3-static.lib", SDL_OUT / "lib" / "SDL3_ttf-static.lib"]
 else:
-    GHOSTTY_SHARED = GHOSTTY_OUT / "lib" / "libghostty-vt.so"
+    SDL_LIBS = [SDL_OUT / "lib" / "libSDL3.a", SDL_OUT / "lib" / "libSDL3_ttf.a"]
 
 CONPTY_VERSION = "1.24.260710001"
 CONPTY_SHA256 = "175640566a3b59c4b132070ee96c2c77e5ab7edd2e92732a5eb3610bbf63d90e"
-CONPTY_DIR = OUT / "deps" / f"conpty-{CONPTY_VERSION}"
-CONPTY_FILES = {  # file in the package -> name next to the executable
+CONPTY_OUT = OBJ / "conpty"  # embedded by src/term/pty_windows.odin
+CONPTY_FILES = {  # file in the package -> name in CONPTY_OUT
     "runtimes/win-x64/native/conpty.dll": "conpty.dll",
     "build/native/runtimes/x64/OpenConsole.exe": "OpenConsole.exe",
 }
@@ -168,17 +184,24 @@ def zig_exe():
     return str(exe)
 
 
+def git_checkout(src, repo, ref, submodules=()):
+    """Shallow-fetches `ref` (a commit or refs/tags/...) of `repo` into `src`."""
+    if not (src / ".git").exists():
+        src.mkdir(parents=True, exist_ok=True)
+        check(["git", "-C", src, "init", "-q"])
+        check(["git", "-C", src, "remote", "add", "origin", repo])
+    check(["git", "-C", src, "fetch", "-q", "--depth", "1", "origin", ref])
+    check(["git", "-C", src, "checkout", "-q", "--force", "FETCH_HEAD"])
+    if submodules:
+        check(["git", "-C", src, "submodule", "update", "-q", "--init", "--depth", "1", *submodules])
+
+
 def build_ghostty():
     stamp = GHOSTTY_OUT / "commit.txt"
-    if GHOSTTY_SHARED.exists() and stamp.exists() and stamp.read_text().strip() == GHOSTTY_COMMIT:
+    if GHOSTTY_LIB.exists() and stamp.exists() and stamp.read_text().strip() == GHOSTTY_COMMIT:
         return
     print("Building libghostty-vt...", flush=True)
-    if not (GHOSTTY_SRC / ".git").exists():
-        GHOSTTY_SRC.mkdir(parents=True, exist_ok=True)
-        check(["git", "-C", GHOSTTY_SRC, "init", "-q"])
-        check(["git", "-C", GHOSTTY_SRC, "remote", "add", "origin", GHOSTTY_REPO])
-    check(["git", "-C", GHOSTTY_SRC, "fetch", "-q", "--depth", "1", "origin", GHOSTTY_COMMIT])
-    check(["git", "-C", GHOSTTY_SRC, "checkout", "-q", "--force", "FETCH_HEAD"])
+    git_checkout(GHOSTTY_SRC, GHOSTTY_REPO, GHOSTTY_COMMIT)
     zig = zig_exe()
     cmd = [zig, "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "--prefix", GHOSTTY_OUT]
     print("+", " ".join(str(c) for c in cmd), flush=True)
@@ -187,8 +210,39 @@ def build_ghostty():
     stamp.write_text(GHOSTTY_COMMIT)
 
 
+def cmake_build(src, build_dir, options):
+    """Configures, builds and installs a CMake project into SDL_OUT as static
+    release libraries, with the static C runtime on Windows like Odin uses."""
+    prefix = SDL_OUT.as_posix()
+    check(["cmake", "-S", src, "-B", build_dir, f"-DCMAKE_INSTALL_PREFIX={prefix}", f"-DCMAKE_PREFIX_PATH={prefix}",
+           "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+           "-DCMAKE_POSITION_INDEPENDENT_CODE=ON", *options])
+    check(["cmake", "--build", build_dir, "--config", "Release", "--parallel"])
+    check(["cmake", "--install", build_dir, "--config", "Release"])
+
+
+def build_sdl():
+    stamp = SDL_OUT / "versions.txt"
+    versions = f"{SDL_VERSION} {SDL_TTF_VERSION}"
+    if all(lib.exists() for lib in SDL_LIBS) and stamp.exists() and stamp.read_text().strip() == versions:
+        return
+    print("Building SDL3 and SDL3_ttf...", flush=True)
+    shutil.rmtree(SDL_OUT, ignore_errors=True)
+    git_checkout(SDL_SRC, SDL_REPO, f"refs/tags/release-{SDL_VERSION}")
+    git_checkout(SDL_TTF_SRC, SDL_TTF_REPO, f"refs/tags/release-{SDL_TTF_VERSION}", SDL_TTF_SUBMODULES)
+    build_dir = OBJ / "sdl-build"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    cmake_build(SDL_SRC, build_dir / "SDL", [
+        "-DSDL_SHARED=OFF", "-DSDL_STATIC=ON", "-DSDL_TEST_LIBRARY=OFF", "-DSDL_EXAMPLES=OFF", "-DSDL_TESTS=OFF"])
+    cmake_build(SDL_TTF_SRC, build_dir / "SDL_ttf", [
+        "-DBUILD_SHARED_LIBS=OFF", "-DSDLTTF_VENDORED=ON", "-DSDLTTF_HARFBUZZ=ON", "-DSDLTTF_PLUTOSVG=ON",
+        "-DSDLTTF_SAMPLES=OFF", "-DSDLTTF_STRICT=ON"])
+    stamp.write_text(versions)
+
+
 def fetch_conpty():
-    if not IS_WINDOWS or all((CONPTY_DIR / f).exists() for f in CONPTY_FILES):
+    stamp = CONPTY_OUT / "version.txt"
+    if not IS_WINDOWS or stamp.exists() and stamp.read_text().strip() == CONPTY_VERSION:
         return
     print(f"Downloading ConPTY {CONPTY_VERSION}...", flush=True)
     url = ("https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/"
@@ -197,9 +251,11 @@ def fetch_conpty():
         data = r.read()
     if hashlib.sha256(data).hexdigest() != CONPTY_SHA256:
         sys.exit(f"ConPTY download checksum mismatch: {url}")
+    CONPTY_OUT.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(data)) as z:
-        for name in CONPTY_FILES:
-            z.extract(name, CONPTY_DIR)
+        for src, name in CONPTY_FILES.items():
+            (CONPTY_OUT / name).write_bytes(z.read(src))
+    stamp.write_text(CONPTY_VERSION)
 
 
 def build_odin(release, exe=EXE, console=False):
@@ -223,29 +279,12 @@ def build_odin(release, exe=EXE, console=False):
 
 
 def copy_if_changed(src, dst):
-    # Skipping unchanged files also avoids failing while a running editor holds them open.
+    # Skipping an unchanged file also avoids failing while a running typo holds it open.
     if dst.exists():
         a, b = src.stat(), dst.stat()
         if a.st_size == b.st_size and int(a.st_mtime) == int(b.st_mtime):
             return
     shutil.copy2(src, dst)
-
-
-def copy_runtime_files(dest=OUT, copy=copy_if_changed):
-    if IS_WINDOWS:
-        odin_root = Path(subprocess.run(["odin", "root"], capture_output=True, text=True, check=True).stdout.strip())
-        for dll in ["vendor/sdl3/SDL3.dll", "vendor/sdl3/ttf/SDL3_ttf.dll"]:
-            copy(odin_root / dll, dest / Path(dll).name)
-    copy(GHOSTTY_SHARED, dest / GHOSTTY_SHARED.name)
-    if IS_WINDOWS:
-        for src, name in CONPTY_FILES.items():
-            copy(CONPTY_DIR / src, dest / name)
-    # Fonts are loaded relative to the executable.
-    for src in (ROOT / "assets").rglob("*"):
-        if src.is_file():
-            dst = dest / "assets" / src.relative_to(ROOT / "assets")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            copy(src, dst)
 
 
 def default_install_dir():
@@ -284,7 +323,6 @@ def install(dest):
             old.unlink()
         except OSError:
             pass
-    copy_runtime_files(dest, install_file)
     install_file(exe, dest / EXE.name)
     print(f"Installed to {dest}")
 
@@ -310,8 +348,6 @@ def install(dest):
 
 def run_unit_tests():
     """Returns True if every package's tests pass."""
-    # Test executables load libghostty-vt (and SDL) from next to themselves.
-    copy_runtime_files()
     ok = True
     for package in TEST_PACKAGES:
         name = Path(package).name if package != "src" else "typo"
@@ -323,7 +359,6 @@ def run_unit_tests():
 def run_perf():
     """Builds an optimized, console-attached binary and runs the performance suite."""
     build_odin(True, PERF_EXE, console=True)
-    copy_runtime_files()
     return run([PERF_EXE, "--perf"]).returncode == 0
 
 
@@ -340,6 +375,7 @@ def main():
     OUT.mkdir(exist_ok=True)
     build_tree_sitter()
     build_ghostty()
+    build_sdl()
     fetch_conpty()
     if args.test or args.perf:
         ok = run_unit_tests() if args.test else True
@@ -350,7 +386,6 @@ def main():
         install(args.install_dir or default_install_dir())
         return
     build_odin(args.release)
-    copy_runtime_files()
     if args.run:
         subprocess.run([EXE], cwd=ROOT)
 

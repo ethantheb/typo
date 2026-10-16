@@ -5,7 +5,7 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "term"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // The settings window: a modal with a search field, then the settings grouped
 // into sections. Every change is applied immediately and written to
@@ -297,7 +297,7 @@ error_banner :: proc(msg: string) {
 		cornerRadius = clay.CornerRadiusAll(6),
 		border = {color = theme.error, width = {left = 3}},
 	}) {
-		clay.TextDynamic(msg, {textColor = theme.text, fontId = u16(Font_Id.Body), fontSize = FONT_SIZE_SMALL, lineHeight = 17, wrapMode = .Words})
+		paragraph(msg)
 	}
 }
 
@@ -386,7 +386,7 @@ setting_row :: proc(item: Setting_Item, name, description: string, list: clay.El
 	})
 	if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, layoutDirection = .TopToBottom, childGap = 2}}) {
 		label(name, theme.text)
-		if description != "" do label(description, theme.text_dim, FONT_SIZE_SMALL)
+		if description != "" do paragraph(description, theme.text_dim)
 	}
 	return true
 }

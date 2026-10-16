@@ -7,8 +7,8 @@ import "core:strings"
 import clay "../vendor/clay-odin"
 import "buffer"
 import "syntax"
-import sdl "vendor:sdl3"
-import ttf "vendor:sdl3/ttf"
+import sdl "../vendor/sdl3"
+import ttf "../vendor/sdl3/ttf"
 
 // The text view: one Clay custom element. Per frame, editor_frame updates view
 // state from the last layout and handles the mouse and scrolling; draw_editor

@@ -2,7 +2,7 @@ package editor
 
 import "core:strings"
 
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // Commands that can be bound to keys, and the chords that trigger them. Text
 // navigation (arrows, Home/End, Backspace, ...) is fixed (editor_handle_key).

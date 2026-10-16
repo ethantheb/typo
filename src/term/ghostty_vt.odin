@@ -7,13 +7,11 @@ package term
 
 import "core:c"
 
-// Built by build.py; the shared library is copied next to the executable.
+// The static library build.py builds.
 when ODIN_OS == .Windows {
-	foreign import vt "../../build/obj/ghostty-vt/lib/ghostty-vt.lib"
-} else when ODIN_OS == .Darwin {
-	foreign import vt "../../build/obj/ghostty-vt/lib/libghostty-vt.dylib"
+	foreign import vt "../../build/obj/ghostty-vt/lib/ghostty-vt-static.lib"
 } else {
-	foreign import vt "../../build/obj/ghostty-vt/lib/libghostty-vt.so"
+	foreign import vt "../../build/obj/ghostty-vt/lib/libghostty-vt.a"
 }
 
 Result :: enum c.int {

@@ -5,7 +5,7 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "term"
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // Keyboard and mouse input for a terminal: SDL events mapped to what
 // libghostty-vt encodes for the running program.

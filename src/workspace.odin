@@ -6,7 +6,7 @@ import "core:slice"
 import "core:strings"
 import "core:sync"
 
-import sdl "vendor:sdl3"
+import sdl "../vendor/sdl3"
 
 // A lazily loaded directory tree. Directory contents are read the first time a
 // directory is expanded, so opening a large folder (or a drive root) is cheap.

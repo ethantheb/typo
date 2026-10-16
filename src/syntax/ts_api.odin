@@ -114,4 +114,5 @@ foreign ts {
 
 	// Grammars
 	tree_sitter_odin :: proc() -> ^TSLanguage ---
+	tree_sitter_toml :: proc() -> ^TSLanguage ---
 }
