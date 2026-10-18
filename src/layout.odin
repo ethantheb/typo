@@ -55,6 +55,7 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 		finder_ui()
 		settings_window_ui()
 	}
+	g.animating = false // set again by any transition still running (see transition)
 	return clay.EndLayout(g.dt)
 }
 
@@ -328,7 +329,7 @@ update_mouse_cursor :: proc() {
 	switch {
 	case g.finder.open:
 		if pointer_in(clay.ID("FinderInput")) do want = .TEXT
-	case g.settings_window.open:
+	case g.settings_window.open && !ui_interactive():
 		if settings_window_over_text() do want = .TEXT
 	case g.terminal_panel.split_drag || splitter_hit(g.mouse_pos):
 		want = .NS_RESIZE

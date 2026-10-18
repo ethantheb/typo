@@ -2,6 +2,7 @@ package editor
 
 import "base:runtime"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:strings"
 import "core:sync"
@@ -20,7 +21,11 @@ import sdl "../vendor/sdl3"
 
 Settings :: struct {
 	theme:          string,
+	font_family:    string,
 	font_size:      int,
+	font_weight:    int,
+	line_height:    f64, // times the font size
+	letter_spacing: f64, // logical pixels
 	smooth_scroll:  bool,
 	terminal_shell: string, // "" = platform default
 	bundled_conpty: bool,   // Windows only
@@ -40,8 +45,12 @@ Settings :: struct {
 
 Setting :: enum {
 	Theme,
-	Font_Size,
 	Smooth_Scroll,
+	Font_Family,
+	Font_Size,
+	Font_Weight,
+	Line_Height,
+	Letter_Spacing,
 	Terminal_Shell,
 	Bundled_Conpty,
 	Renderer,
@@ -51,6 +60,7 @@ Setting :: enum {
 // Sections of settings.toml and the settings window, in order.
 Section :: enum {
 	Appearance,
+	Font,
 	Keybindings,
 	Terminal,
 	Advanced,
@@ -58,6 +68,7 @@ Section :: enum {
 
 SECTION_KEYS := [Section]string {
 	.Appearance  = "appearance",
+	.Font        = "font",
 	.Keybindings = "keybindings",
 	.Terminal    = "terminal",
 	.Advanced    = "advanced",
@@ -69,9 +80,11 @@ Setting_Info :: struct {
 	name:        string,   // in the settings window; "" = only in settings.toml
 	description: string,
 	keywords:    string,   // extra search terms
-	default:     union {bool, int, string},
+	default:     union {bool, int, f64, string},
 	choices:     []string, // allowed values of a string setting; nil = any text
-	min, max:    int,      // range of an int setting
+	picker:      bool,     // a string setting chosen from a list (see settings_ui.odin)
+	min, max:    f64,      // range of a number setting
+	step:        f64,      // of a number setting in the settings window; 0 = 1
 }
 
 RENDERERS := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
@@ -79,18 +92,40 @@ RENDERERS := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "ope
 SETTINGS := [Setting]Setting_Info {
 	.Theme = {
 		section = .Appearance, key = "theme", name = "Theme",
-		description = "Color scheme for the whole window.", keywords = "dark light mode colors",
-		default = "dark", choices = THEME_NAMES[:],
-	},
-	.Font_Size = {
-		section = .Appearance, key = "font_size", name = "Font size",
-		description = "Editor and terminal text size.", keywords = "text zoom",
-		default = 15, min = 8, max = 40,
+		description = "Color scheme for the whole window.", keywords = "dark light mode colors color scheme",
+		default = DEFAULT_THEME, choices = THEME_NAMES[:], picker = true,
 	},
 	.Smooth_Scroll = {
 		section = .Appearance, key = "smooth_scroll", name = "Smooth scrolling",
 		description = "Ease the view when scrolling, instead of moving in notches.", keywords = "scroll animation wheel",
 		default = true,
+	},
+	.Font_Family = {
+		section = .Font, key = "family", name = "Font",
+		description = "Editor and terminal font: the bundled IBM Plex Mono or an installed monospace font.",
+		keywords = "font family typeface monospace",
+		default = BUNDLED_FAMILY, picker = true,
+	},
+	.Font_Size = {
+		section = .Font, key = "size", name = "Font size",
+		description = "Editor and terminal text size.", keywords = "font text zoom",
+		default = int(15), min = 8, max = 40,
+	},
+	.Font_Weight = {
+		section = .Font, key = "weight", name = "Font weight",
+		description = "Stroke thickness, from 100 (thin) to 900 (black). The font's nearest weight is used.",
+		keywords = "font thickness bold light thin heavy",
+		default = int(500), min = 100, max = 900, step = 100,
+	},
+	.Line_Height = {
+		section = .Font, key = "line_height", name = "Line height",
+		description = "Space from one line to the next, as a multiple of the font size.", keywords = "font spacing leading",
+		default = f64(1.35), min = 1, max = 2.5, step = 0.05,
+	},
+	.Letter_Spacing = {
+		section = .Font, key = "letter_spacing", name = "Letter spacing",
+		description = "Extra space between characters, in pixels.", keywords = "font spacing tracking width",
+		default = f64(0), min = -2, max = 5, step = 0.25,
 	},
 	.Terminal_Shell = {
 		section = .Terminal, key = "shell", name = "Shell",
@@ -121,13 +156,18 @@ SETTINGS_POLL_MS :: 500
 Setting_Value :: union {
 	^bool,
 	^int,
+	^f64,
 	^string,
 }
 
 setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	switch x {
 	case .Theme:          return &s.theme
+	case .Font_Family:    return &s.font_family
 	case .Font_Size:      return &s.font_size
+	case .Font_Weight:    return &s.font_weight
+	case .Line_Height:    return &s.line_height
+	case .Letter_Spacing: return &s.letter_spacing
 	case .Smooth_Scroll:  return &s.smooth_scroll
 	case .Terminal_Shell: return &s.terminal_shell
 	case .Bundled_Conpty: return &s.bundled_conpty
@@ -152,6 +192,7 @@ setting_reset :: proc(s: ^Settings, x: Setting) {
 	switch v in setting_value(s, x) {
 	case ^bool:   v^ = SETTINGS[x].default.(bool)
 	case ^int:    v^ = SETTINGS[x].default.(int)
+	case ^f64:    v^ = SETTINGS[x].default.(f64)
 	case ^string: set_string(v, SETTINGS[x].default.(string))
 	}
 }
@@ -164,11 +205,14 @@ settings_reset_all :: proc(s: ^Settings) {
 // Steps a choice, bool or number setting by `dir` (-1 or +1), clamped.
 setting_step :: proc(s: ^Settings, x: Setting, dir: int) {
 	info := SETTINGS[x]
+	step := info.step != 0 ? info.step : 1
 	switch v in setting_value(s, x) {
 	case ^bool:
 		v^ = dir > 0
 	case ^int:
-		v^ = clamp(v^ + dir, info.min, info.max)
+		v^ = clamp(v^ + dir * int(step), int(info.min), int(info.max))
+	case ^f64:
+		v^ = clamp(math.round(v^ / step + f64(dir)) * step, info.min, info.max)
 	case ^string:
 		if len(info.choices) == 0 do return
 		i := 0
@@ -270,8 +314,17 @@ set_from_toml :: proc(s: ^Settings, x: Setting, v: toml.Value) -> bool {
 		dst^ = b
 	case ^int:
 		n := v.(i64) or_return
-		if n < i64(info.min) || n > i64(info.max) do return false
+		if f64(n) < info.min || f64(n) > info.max do return false
 		dst^ = int(n)
+	case ^f64:
+		n: f64
+		#partial switch x in v {
+		case f64: n = x
+		case i64: n = f64(x)
+		case:     return false
+		}
+		if n < info.min || n > info.max do return false
+		dst^ = n
 	case ^string:
 		str := strings.trim_space(v.(string) or_return)
 		if info.choices != nil && !contains(info.choices, str) do return false
@@ -288,11 +341,20 @@ setting_problem :: proc(s: ^Settings, x: Setting) -> string {
 	case ^bool:
 		return fmt.tprintf("%s must be true or false", path)
 	case ^int:
-		return fmt.tprintf("%s must be a whole number from %d to %d", path, info.min, info.max)
+		return fmt.tprintf("%s must be a whole number from %d to %d", path, int(info.min), int(info.max))
+	case ^f64:
+		return fmt.tprintf("%s must be a number from %s to %s", path, format_decimal(info.min), format_decimal(info.max))
 	case ^string:
 		if info.choices != nil do return fmt.tprintf("%s must be one of: %s", path, strings.join(info.choices, ", ", context.temp_allocator))
 	}
 	return fmt.tprintf("%s must be a string", path)
+}
+
+// A number with up to two decimals and at least one: "1.35", "2.0", "-0.25".
+format_decimal :: proc(v: f64) -> string {
+	s := strings.trim_right(fmt.tprintf("%.2f", v), "0")
+	if strings.has_suffix(s, ".") do s = fmt.tprintf("%s0", s)
+	return s == "-0.0" ? "0.0" : s
 }
 
 @(private = "file")
@@ -301,7 +363,8 @@ contains :: proc(list: []string, s: string) -> bool {
 	return false
 }
 
-// Writes all settings, replacing the file atomically.
+// Writes all settings, replacing the file atomically. The file then holds
+// valid settings, so a problem reported by the last load no longer applies.
 settings_save :: proc(s: ^Settings) {
 	if s.path == "" do return
 	sb := strings.builder_make(context.temp_allocator)
@@ -325,6 +388,7 @@ settings_save :: proc(s: ^Settings) {
 				switch v in setting_value(s, x) {
 				case ^bool:   value = fmt.tprintf("%v", v^)
 				case ^int:    value = fmt.tprintf("%d", v^)
+				case ^f64:    value = format_decimal(v^)
 				case ^string: value = toml.quote(v^)
 				}
 				append(&lines, Line{info.key, value})
@@ -344,6 +408,7 @@ settings_save :: proc(s: ^Settings) {
 		return
 	}
 	s.mtime, _ = os.last_write_time_by_name(s.path)
+	set_string(&s.error, "")
 }
 
 // Checks settings.toml on SDL's timer thread and wakes the main loop only when
@@ -384,4 +449,16 @@ settings_changed :: proc() {
 apply_settings :: proc() {
 	theme = theme_by_name(g.settings.theme)
 	terminal_apply_theme(&g.terminal_panel.terminal)
+	apply_editor_font()
+}
+
+// Points the editor and terminal at the configured family. One that isn't
+// bundled needs the installed fonts scanned; this runs again once that is done
+// (see app_iterate).
+apply_editor_font :: proc() {
+	if g.text.engine == nil do return
+	regular, bold, found := font_family_sources(&g.fonts, g.settings.font_family, g.settings.font_weight)
+	if !found do fonts_scan(&g.fonts)
+	text_set_source(&g.text, .Editor, regular)
+	text_set_source(&g.text, .Editor_Bold, bold)
 }

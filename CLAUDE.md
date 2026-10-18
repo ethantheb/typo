@@ -22,10 +22,13 @@ check: `odin check src -vet-unused -vet-unused-imports`.
 
 The performance suite (`src/perf.odin`) is an optimized build run as `typo-perf --perf`.
 It opens a real window, runs scripted phases (startup, buffer, syntax, fuzzy search, VT
-parsing, typing, scrolling, huge files, the finder, the settings window, terminal
-redraws and shell output, idle CPU/GPU), prints a table and exits non-zero if any result
-exceeds its limit. When adding a feature with a per-frame or per-keystroke cost, add a
-phase or result for it.
+parsing, typing, scrolling, huge files, the finder, the settings window and its theme
+and font lists, terminal redraws and shell output, idle CPU/GPU), prints a table and
+exits non-zero if any result exceeds its limit. It ignores real keyboard and mouse
+input. Its CPU and GPU figures are for its own process only, but they are affected by
+load from other programs (e.g. other typo instances), so an idle result just over its
+limit is worth one rerun before investigating. When adding a feature with a per-frame
+or per-keystroke cost, add a phase or result for it.
 
 ## Layout
 
@@ -35,12 +38,22 @@ src/                 package editor: the app
                      deferred actions (open file/folder)
   keymap.odin        Command enum, default bindings, chord parsing, run_command
   settings.odin      Settings model: SETTINGS table, TOML load/save, file watcher
-  settings_ui.odin   Settings window, generated from the SETTINGS table
-  theme.odin         Theme colors (dark, light)
-  text.odin          Fonts, fallback fonts, cached ttf.Text, measurement
-  renderer_sdl.odin  Clay render commands -> SDL draw calls; draw_text, fill_rect, clips
+  settings_ui.odin   Settings window, generated from the SETTINGS table; the option list
+                     (picker) for the theme (dark/light) and font (with size/spacing
+                     controls), which the panel animates into, docked at the side with
+                     the rest of the window still usable
+  theme.odin         Built-in themes (THEMES, as hex Theme_Spec values)
+  fonts.odin         Bundled IBM Plex Mono weights, installed monospace font scan
+                     (background thread), family + weight -> Font_Source
+  text.odin          Font ids and their sources, fallback fonts, cached ttf.Text,
+                     measurement
+  renderer_sdl.odin  Clay render commands -> SDL draw calls; draw_text, fill_rect, clips,
+                     overlay colors
   ui.odin            Widgets: label, button, icon, input_box, text_field_event, tooltip,
-                     modal, ask (message box), clicked/pointer_in hit tests
+                     modal/modal_at, ask (message box), clicked/pointer_in hit tests,
+                     transition (Clay transitions), element_at
+  scrollbar.odin     Scroll bars: geometry, dragging, look; list_scrollbar for any Clay
+                     scroll container (the editor draws its own from the same parts)
   layout.odin        Window layout: sidebar, editor pane, terminal panel and splitter,
                      status bar, focus, mouse cursor
   editor.odin        Editor: open/save, multi-selection, movement, editing, clipboard, keys
@@ -60,7 +73,30 @@ src/toml/            Minimal TOML reader for settings
 vendor/              clay-odin, tree-sitter, tree-sitter-odin, tree-sitter-toml (do not edit);
                      sdl3, Odin's SDL3 bindings with foreign imports pointed at the static
                      libraries
+ref/clay_docs.md     Clay's README: the reference for its API (layout, scrolling,
+                     floating elements, transitions, overlay colors, ...)
 ```
+
+## Clay
+
+The UI is built on Clay; use what it provides before writing our own. Read
+`ref/clay_docs.md` (and the bindings in `vendor/clay-odin/clay.odin`) when building UI:
+layout, scroll containers, floating elements, hover/pointer queries and transitions are
+all there. In particular:
+
+- **Animation** uses Clay transitions, through `transition()` (ui.odin). An element
+  with one eases to its new position, size or colors when its layout changes; children
+  are laid out within its animated bounds; `Enter` makes it appear by fading or sliding
+  in. Elements with a transition need a fixed id. The handler sets `g.animating`, which
+  keeps the frame loop drawing until it finishes.
+- **No exit transitions.** Clay keeps drawing an exiting subtree from the frame it was
+  last declared in, and that frame's strings and custom data were in the temp allocator.
+  To animate something closing (a sidebar, a terminal pane), keep declaring it at its
+  closed size until `element_at` says it got there, then drop it.
+- **Fades** use Clay overlay colors (`overlayColor`), which the renderer applies to
+  everything drawn inside the element, editor and terminal included.
+- A clipping element (`clip`) is a Clay scroll container and takes the mouse wheel from
+  scroll containers inside it; clip a moving panel only while it moves.
 
 ## How a frame works
 
@@ -90,10 +126,20 @@ and why per-frame strings use the temp allocator.
 - Reuse the shared helpers instead of re-implementing them: `clicked`, `pointer_in`,
   `element_rect`/`rect_contains`, `draw_text`, `fill_rect`, `push_clip_box`,
   `input_box` + `text_field_event`, `modal` + `clicked_outside`, `ask`, `line_span`,
-  `next_col`, `set_string`.
+  `next_col`, `set_string`, `list_scrollbar` (give a scrolling list one, with
+  `SCROLLBAR_GUTTER` of right padding).
 - A new setting is an enum value in `Setting`, a field in `Settings`, a `SETTINGS`
   entry and a `setting_value` case. Loading, saving, reset and the settings window
-  follow from those.
+  follow from those. A string setting chosen from a long list sets `picker = true`
+  and lists its options in `picker_options` (settings_ui.odin); number settings that
+  should be adjustable alongside it go in `picker_extras`.
+- Pointer input goes through `ui_interactive` (via `clicked`, the pane frame procs,
+  tooltips), which knows which popups block the window. A new popup that covers the
+  window, or leaves parts of it usable, belongs there.
+- The UI draws with the bundled fonts (`Font_Id.Body`, ...); the editor and terminal
+  with `.Editor`/`.Editor_Bold`, which `apply_editor_font` points at the configured
+  family and weight. Column width comes from `editor_char_width` (includes letter
+  spacing), row height from `editor_line_height`.
 - A new command is a `Command` value, a `COMMANDS` entry and a case in `run_command`
   (or `editor_run_command`).
 - Editing goes through `apply` (editor.odin), which handles every selection and records
@@ -107,9 +153,13 @@ and why per-frame strings use the temp allocator.
 
 The architecture should allow these without rewrites:
 
-- **Theming**: themes are `Theme` values selected by name (`THEMES`/`THEME_NAMES`,
-  `theme_by_name`); loading user themes from TOML would add to that list. UI code takes
-  colors only from `theme`.
+- **Animated panes**: the sidebar and terminal panel opening/closing, and later split
+  panes and terminal tabs, animate with Clay transitions as described under Clay: give
+  the pane a fixed id and a width/height transition, and keep a closing pane declared
+  at zero size until `element_at` reports it there.
+- **Theming**: themes are `Theme_Spec` entries in `THEMES`, selected by key
+  (`theme_by_name`); loading user themes from TOML would add to that list (and to
+  `THEME_NAMES`). UI code takes colors only from `theme`.
 - **LSP**: `buffer.take_changes` yields byte offsets plus row/column points for each
   edit, and `buffer.version` gives document versions; feed both to the server in
   `editor_frame`. `syntax.Highlight` is per byte, so semantic tokens can overlay it.

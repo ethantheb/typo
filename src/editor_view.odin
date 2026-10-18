@@ -18,8 +18,6 @@ import ttf "../vendor/sdl3/ttf"
 CARET_BLINK_NS :: 530_000_000
 TEXT_MARGIN :: 8 // logical pixels between the gutter and the text
 SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
-SCROLLBAR_WIDTH :: 12
-SCROLLBAR_MIN_THUMB :: 28
 
 editor_font_size :: proc() -> u16 {
 	return u16(g.settings.font_size)
@@ -31,7 +29,12 @@ gutter_font_size :: proc() -> u16 {
 }
 
 editor_line_height :: proc() -> int {
-	return int(math.round(f32(g.settings.font_size) * 1.35))
+	return max(int(math.round(f64(g.settings.font_size) * g.settings.line_height)), 1)
+}
+
+// The advance of one column: the font's, plus the letter spacing.
+editor_char_width :: proc() -> f32 {
+	return max(text_char_width(&g.text, .Editor, editor_font_size()) + f32(g.settings.letter_spacing), 1)
 }
 
 // Per-frame update before layout: syntax, view metrics, mouse, scrolling.
@@ -39,7 +42,7 @@ editor_frame :: proc(e: ^Editor, interactive: bool) {
 	if e.status != .Text do return
 	syntax.highlighter_update(&e.hl, &e.buf, buffer.take_changes(&e.buf))
 	if r, ok := element_rect(clay.ID("EditorText")); ok do e.view = r
-	e.char_w = text_char_width(&g.text, .Body, editor_font_size())
+	e.char_w = editor_char_width()
 	digits := len(fmt.tprintf("%d", buffer.line_count(&e.buf)))
 	e.gutter_w = f32(max(digits, 3)) * e.char_w + 28
 
@@ -84,7 +87,7 @@ editor_mouse :: proc(e: ^Editor) {
 		e.target_x -= dx * 6 * e.char_w
 	}
 
-	if scrollbar_mouse(e) {
+	if editor_scrollbar_mouse(e) {
 		clamp_scroll(e)
 		return
 	}
@@ -217,60 +220,37 @@ editor_scrolling :: proc(e: ^Editor) -> bool {
 
 // --- Scroll bar ----------------------------------------------------------------
 
-// Track and thumb along the text area's right edge; ok = false when everything
-// fits and there is nothing to scroll.
+// Track and thumb along the text area's right edge (see scrollbar.odin). The
+// last line can scroll to the top, so the content is the document plus one screen.
 @(private = "file")
-scrollbar_geometry :: proc(e: ^Editor) -> (track, thumb: Rect, ok: bool) {
-	max_y := max_scroll_y(e)
-	v := e.view
-	if max_y <= 0 || v.h <= 0 do return
-	track = {v.x + v.w - SCROLLBAR_WIDTH, v.y, SCROLLBAR_WIDTH, v.h}
-	// Content is the document plus one screen (the last line can scroll to the top).
-	h := max(v.h * v.h / f32(max_y + f64(v.h)), min(SCROLLBAR_MIN_THUMB, v.h))
-	y := v.y + f32(e.scroll_y / max_y) * (v.h - h)
-	thumb = {track.x, y, track.w, h}
-	return track, thumb, true
+editor_scrollbar :: proc(e: ^Editor) -> (track, thumb: Rect, ok: bool) {
+	return scrollbar_geometry(e.view, e.scroll_y, max_scroll_y(e))
 }
 
 @(private = "file")
 scrollbar_hit :: proc(e: ^Editor, p: [2]f32) -> bool {
-	track, _, ok := scrollbar_geometry(e)
+	track, _, ok := editor_scrollbar(e)
 	return ok && rect_contains(track, p)
 }
 
 // Handles pressing and dragging the scroll bar. Returns true while it owns the mouse.
 @(private = "file")
-scrollbar_mouse :: proc(e: ^Editor) -> bool {
-	track, thumb, ok := scrollbar_geometry(e)
+editor_scrollbar_mouse :: proc(e: ^Editor) -> bool {
+	track, thumb, ok := editor_scrollbar(e)
 	if !ok {
 		e.scrollbar_drag = nil
 		return false
 	}
-	if g.mouse_pressed && rect_contains(track, g.mouse_pos) {
-		if rect_contains(thumb, g.mouse_pos) {
-			e.scrollbar_drag = g.mouse_pos.y - thumb.y
-		} else {
-			e.scrollbar_drag = thumb.h / 2 // clicking the track centres the thumb there
-		}
-	}
-	grab, dragging := e.scrollbar_drag.?
-	if !dragging do return false
-	if !g.mouse_down {
-		e.scrollbar_drag = nil
-		return false
-	}
-	if span := track.h - thumb.h; span > 0 {
-		frac := clamp((g.mouse_pos.y - grab - track.y) / span, 0, 1)
-		scroll_to(e, f64(frac) * max_scroll_y(e))
-	}
-	return true
+	scroll, active := scrollbar_mouse(&e.scrollbar_drag, track, thumb, max_scroll_y(e))
+	if active do scroll_to(e, scroll)
+	return active
 }
 
 // --- Drawing -------------------------------------------------------------------
 
 draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, scale: f32) {
 	if e.status != .Text || e.char_w <= 0 do return
-	font := text_get_font(&g.text, .Body, editor_font_size())
+	font := text_get_font(&g.text, .Editor, editor_font_size())
 	if font == nil do return
 	push_clip_box(renderer, b)
 	defer pop_clip(renderer)
@@ -347,7 +327,7 @@ draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, sc
 	// Gutter, drawn last so horizontally scrolled text slides under it. Line
 	// numbers use a smaller font, baseline-aligned with the text.
 	fill_rect(renderer, b.x, b.y, gutter, b.height, theme.gutter)
-	num_font := text_get_font(&g.text, .Body, gutter_font_size())
+	num_font := text_get_font(&g.text, .Editor, gutter_font_size())
 	if num_font == nil do return
 	num_dy := text_dy + f32(ttf.GetFontAscent(font) - ttf.GetFontAscent(num_font))
 	num_right := b.x + gutter - math.round(16 * scale)
@@ -363,15 +343,12 @@ draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, sc
 
 @(private = "file")
 draw_scrollbar :: proc(renderer: ^sdl.Renderer, e: ^Editor, scale: f32) {
-	_, thumb, ok := scrollbar_geometry(e)
+	_, thumb, ok := editor_scrollbar(e)
 	if !ok do return
-	active := e.scrollbar_drag != nil || scrollbar_hit(e, g.mouse_pos)
-	c := theme.text_dim
-	c.a = active ? 150 : 70
-	inset: f32 = active ? 2 : 3
-	b := clay.BoundingBox{(thumb.x + inset) * scale, (thumb.y + 2) * scale, (thumb.w - inset * 2) * scale, (thumb.h - 4) * scale}
-	r := b.width / 2
-	fill_rounded_rect(renderer, b, {r, r, r, r}, c)
+	r, c := scrollbar_thumb_look(thumb, e.scrollbar_drag != nil || scrollbar_hit(e, g.mouse_pos))
+	b := clay.BoundingBox{r.x * scale, r.y * scale, r.w * scale, r.h * scale}
+	radius := b.width / 2
+	fill_rounded_rect(renderer, b, {radius, radius, radius, radius}, c)
 }
 
 Visible_Line :: struct {
@@ -433,7 +410,8 @@ Run :: struct {
 // current run (it draws nothing), so runs break only where the color changes.
 // line_hl may be shorter than text (highlight cap); the rest is uncolored. A
 // character the font lacks is drawn by a fallback font with its own advance, so
-// it gets a run of its own, keeping later columns on the grid.
+// it gets a run of its own, keeping later columns on the grid. With letter
+// spacing every character is a run of its own.
 @(private = "file")
 visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count: int) -> []Run {
 	Span :: struct {
@@ -444,6 +422,7 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count
 	spans := make([dynamic]Span, context.temp_allocator)
 	sb := strings.builder_make(context.temp_allocator)
 	open := false // the last span may be extended
+	spaced := g.settings.letter_spacing != 0
 	col := 0
 	for r, i in text {
 		if col >= first_col + count do break
@@ -452,7 +431,7 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count
 		if next <= first_col do continue
 
 		h := i < len(line_hl) ? line_hl[i] : .None
-		own := font_has_own_glyph(&g.text, .Body, r)
+		own := !spaced && font_has_own_glyph(&g.text, .Editor, r)
 		space := r == ' ' || r == '\t'
 		if !open || !own || (!space && h != spans[len(spans) - 1].hl) {
 			append(&spans, Span{len(sb.buf), len(sb.buf), col, h})

@@ -37,10 +37,18 @@ pointer_in :: proc(id: clay.ElementId) -> bool {
 	return ok && rect_contains(r, g.mouse_pos)
 }
 
-// Whether ordinary UI under a popup may react to clicks: only while no popup is
-// open, or for the popup's own controls (g.in_modal is set while they are built).
+// Whether UI may react to the pointer: a popup's own controls always may
+// (g.in_modal is set while they are built), the rest only while no popup covers
+// the window. The settings window's option list sits at the side and leaves the
+// window usable outside it.
 ui_interactive :: proc() -> bool {
-	return g.in_modal || !(g.finder.open || g.settings_window.open)
+	switch {
+	case g.in_modal:               return true
+	case g.finder.open:            return false
+	case settings_window_docked(): return !pointer_in(clay.ID("Settings"))
+	case g.settings_window.open:   return false
+	}
+	return true
 }
 
 // The element was clicked this frame. `within` is the scroll area it sits in,
@@ -105,6 +113,7 @@ icon_button :: proc(id: clay.ElementId, kind: Icon, size: f32 = 24, icon_size: u
 // --- Icons -----------------------------------------------------------------------
 
 Icon :: enum u8 {
+	Chevron_Left,
 	Chevron_Right,
 	Chevron_Down,
 	Sidebar,
@@ -118,6 +127,7 @@ Icon :: enum u8 {
 
 // Codepoints in assets/fonts/lucide.ttf (see lucide-static's font/codepoints.json).
 ICON_GLYPHS := [Icon]string {
+	.Chevron_Left  = "",
 	.Chevron_Right = "",
 	.Chevron_Down  = "",
 	.Sidebar       = "", // panel-left
@@ -252,6 +262,38 @@ modal :: proc(id: clay.ElementId, width: f32, height: clay.SizingAxis, top: u16,
 	return true
 }
 
+// A panel at `r` over a backdrop of the given color. Moving or resizing the
+// panel, or changing the backdrop color, animates (see transition). Its children
+// are laid out left to right. Pass `clip` while they may overflow it, e.g. while
+// it moves; not otherwise, since a clipping element is a Clay scroll container
+// and would take the mouse wheel from lists inside it. A `modal` backdrop takes
+// the pointer from the window behind it; otherwise the pointer passes through
+// and ui_interactive decides what may react.
+@(deferred_none = end_modal)
+modal_at :: proc(id: clay.ElementId, r: Rect, backdrop: clay.Color, clip, modal: bool) -> bool {
+	g.in_modal = true
+	clay._OpenElementWithId(clay.ID("Backdrop", id.id))
+	clay.ConfigureOpenElement({
+		layout = {
+			sizing = {clay.SizingFixed(f32(g.window_w)), clay.SizingFixed(f32(g.window_h))},
+			padding = {left = u16(max(r.x, 0)), top = u16(max(r.y, 0))},
+		},
+		backgroundColor = backdrop,
+		floating = {attachTo = .Root, zIndex = 100, pointerCaptureMode = modal ? .Capture : .Passthrough},
+		transition = transition({.BackgroundColor}),
+	})
+	clay._OpenElementWithId(id)
+	clay.ConfigureOpenElement({
+		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
+		backgroundColor = theme.panel,
+		cornerRadius = clay.CornerRadiusAll(8),
+		border = {color = theme.border, width = clay.BorderOutside(1)},
+		clip = {horizontal = clip, vertical = clip},
+		transition = transition(clay.TransitionPropertyBoundingBox),
+	})
+	return true
+}
+
 @(private = "file")
 end_modal :: proc() {
 	clay._CloseElement()
@@ -351,4 +393,83 @@ tooltip_end_frame :: proc() {
 tooltip_pending :: proc() -> bool {
 	t := &g.tooltip
 	return t.id != 0 && !t.suppressed && sdl.GetTicksNS() - t.since < TOOLTIP_DELAY + 50_000_000
+}
+
+// --- Animation -----------------------------------------------------------------
+// Clay transitions animate an element when its layout changes between frames:
+// position, size, colors. Children are laid out within its animated bounds.
+// Elements with a transition need a fixed id (not an automatic or loop one).
+//
+// Exit transitions (exit.setFinalState) aren't used: Clay keeps drawing an
+// exiting subtree from the frame it was last declared in, and that frame's
+// strings and custom data live in the temp allocator, which is reset. To
+// animate something closing, keep declaring it at its closed size until
+// element_at says it got there.
+
+TRANSITION_SECONDS :: 0.2
+
+// How an element appears (an enter transition):
+//   Fade: from its background color. Needs .OverlayColor in the properties, a
+//         background, and overlayColor = clear_overlay(background).
+//   From_Left/From_Right: offset by its own width to that side. Positions are
+//         on screen, so this suits elements whose parent stays put.
+Enter :: enum {
+	None,
+	Fade,
+	From_Left,
+	From_Right,
+}
+
+transition :: proc(properties: clay.TransitionPropertyFlags, enter := Enter.None, duration: f32 = TRANSITION_SECONDS) -> clay.TransitionElementConfig {
+	config := clay.TransitionElementConfig{handler = ease_out, duration = duration, properties = properties}
+	switch enter {
+	case .None:
+	case .Fade:       config.enter.setInitialState = enter_fade
+	case .From_Left:  config.enter.setInitialState = enter_from_left
+	case .From_Right: config.enter.setInitialState = enter_from_right
+	}
+	return config
+}
+
+// The resting overlay of an element that fades in (Enter.Fade): its background
+// color, fully transparent, so only the alpha changes as it fades.
+clear_overlay :: proc(background: clay.Color) -> clay.Color {
+	return {background.r, background.g, background.b, 0}
+}
+
+// Whether an element's last layout put it at `r`: an animation toward r is done.
+element_at :: proc(id: clay.ElementId, r: Rect) -> bool {
+	e, ok := element_rect(id)
+	return ok && abs(e.x - r.x) < 0.5 && abs(e.y - r.y) < 0.5 && abs(e.w - r.w) < 0.5 && abs(e.h - r.h) < 0.5
+}
+
+// Clay's ease-out, noting that a transition is still running so the frame loop
+// keeps drawing (g.animating, cleared before each clay.EndLayout).
+@(private = "file")
+ease_out :: proc "c" (args: clay.TransitionCallbackArguments) -> bool {
+	done := clay.EaseOut(args)
+	if !done do g.animating = true
+	return done
+}
+
+@(private = "file")
+enter_fade :: proc "c" (target: clay.TransitionData, properties: clay.TransitionPropertyFlags) -> clay.TransitionData {
+	start := target
+	start.overlayColor = target.backgroundColor
+	start.overlayColor.a = 255
+	return start
+}
+
+@(private = "file")
+enter_from_left :: proc "c" (target: clay.TransitionData, properties: clay.TransitionPropertyFlags) -> clay.TransitionData {
+	start := target
+	start.boundingBox.x -= target.boundingBox.width
+	return start
+}
+
+@(private = "file")
+enter_from_right :: proc "c" (target: clay.TransitionData, properties: clay.TransitionPropertyFlags) -> clay.TransitionData {
+	start := target
+	start.boundingBox.x += target.boundingBox.width
+	return start
 }

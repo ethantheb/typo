@@ -10,6 +10,7 @@ import "core:time"
 import "buffer"
 import "syntax"
 import "term"
+import sdl "../vendor/sdl3"
 
 // The performance suite: `typo --perf` (run by `python build.py --test` on an
 // optimized build). It drives the real app, with a real window and renderer,
@@ -80,6 +81,9 @@ PHASES := [?]Phase {
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
+	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
+	{name = "font list", step = phase_font_picker, frame_limit = 25},
+	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},
 	{name = "open 64 MB file (lexer)", step = phase_open_large, frame_limit = 8},
 	{name = "jumping through 64 MB file", step = phase_jump_large, frame_limit = 12},
 	{name = "typing in 64 MB file", step = phase_type, frame_limit = 8},
@@ -533,6 +537,117 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "lists every setting and command", len(w.items) == len(Command) + len(Setting) - file_only)
 		settings_window_toggle()
 		return true
+	}
+	return false
+}
+
+// A key press, as if typed.
+@(private = "file")
+press :: proc(key: sdl.Keycode) {
+	event: sdl.Event
+	event.type = .KEY_DOWN
+	event.key.key = key
+	handle_key_event(&event)
+}
+
+// Opens the settings window and focuses a setting's row (a frame later, once
+// the rows exist). Returns true once focused.
+@(private = "file")
+open_settings_at :: proc(x: Setting, frame: int) -> bool {
+	w := &g.settings_window
+	if frame == 0 {
+		settings_window_toggle()
+		return false
+	}
+	for item, i in w.items do if s, ok := item.(Setting); ok && s == x do w.focus = i
+	return true
+}
+
+// Opens the theme list, switches to the light themes and moves down through
+// them, switches back and moves up through the dark ones (each theme applied as
+// it is selected), then cancels back to the settings and closes them.
+@(private = "file")
+phase_theme_picker :: proc(p: ^Perf, frame: int) -> bool {
+	w := &g.settings_window
+	darks, lights: int
+	first_dark, last_light: string
+	for spec in THEMES {
+		if spec.dark {
+			if darks == 0 do first_dark = spec.key
+			darks += 1
+		} else {
+			last_light = spec.key
+			lights += 1
+		}
+	}
+	step := frame - 2
+	switch {
+	case frame <= 1:
+		if open_settings_at(.Theme, frame) do press(sdl.K_RETURN)
+	case step == 0:
+		press(sdl.K_RIGHT)
+	case step < lights:
+		press(sdl.K_DOWN)
+	case step == lights:
+		check(p, "steps through the light themes", g.settings.theme == last_light)
+		press(sdl.K_LEFT)
+	case step < lights + darks:
+		press(sdl.K_UP)
+	case step == lights + darks:
+		check(p, "steps through the dark themes", g.settings.theme == first_dark)
+		press(sdl.K_ESCAPE)
+	case g.animating:
+	case:
+		check(p, "Esc restores the theme", g.settings.theme == DEFAULT_THEME && theme == theme_by_name(DEFAULT_THEME))
+		settings_window_toggle()
+		return !w.open
+	}
+	return false
+}
+
+// Opens the font list, waits for the installed fonts, moves through up to 12
+// of them (each loaded as it is selected), then cancels.
+@(private = "file")
+phase_font_picker :: proc(p: ^Perf, frame: int) -> bool {
+	STEPS :: 12
+	switch {
+	case frame <= 1:
+		p.mark_frame = 0
+		if open_settings_at(.Font_Family, frame) do press(sdl.K_RETURN)
+	case fonts_scanning(&g.fonts):
+		if time.tick_since(p.phase_t0) < 30 * time.Second do return false
+		check(p, "finds installed fonts", false)
+		return true
+	case p.mark_frame <= 0:
+		result(p, "find installed fonts", g.fonts.scan_ms, "ms", 3000)
+		result(p, "installed monospace families", f64(len(g.fonts.families)), "")
+		p.mark_frame = frame
+		clear(&p.frames)
+	case frame < p.mark_frame + min(STEPS, len(g.fonts.families)):
+		press(sdl.K_DOWN)
+	case frame == p.mark_frame + min(STEPS, len(g.fonts.families)):
+		press(sdl.K_ESCAPE)
+	case g.animating:
+	case:
+		check(p, "Esc restores the font", g.settings.font_family == BUNDLED_FAMILY)
+		settings_window_toggle()
+		return true
+	}
+	return false
+}
+
+// Each character is drawn on its own with letter spacing.
+@(private = "file")
+phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
+	switch frame {
+	case 0:
+		g.settings.letter_spacing = 1
+		editor_move(&g.editor, .Doc_Start, false)
+	case 120:
+		g.settings.letter_spacing = 0
+		return true
+	case:
+		editor_move(&g.editor, .Page_Down, false)
 	}
 	return false
 }

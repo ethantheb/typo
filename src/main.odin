@@ -49,8 +49,10 @@ App :: struct {
 	sidebar_visible: bool,
 	finder:          Finder,
 	settings:        Settings,
+	fonts:           System_Fonts,
 	settings_window: Settings_Window,
 	in_modal:        bool, // building a popup's UI (see ui_interactive)
+	animating:       bool, // a Clay transition was unfinished at the end of the last layout
 	tooltip:         Tooltip_State,
 	pending:         Action,
 	perf:            ^Perf, // set by --perf
@@ -108,10 +110,10 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	}
 	// The renderer backend is a setting.
 	settings_init(&g.settings)
-	apply_settings()
 	if !create_renderer(g.settings.renderer) do return .FAILURE
 	update_window_metrics()
 	if !text_init(&g.text, g.renderer, g.ui_scale) do return .FAILURE
+	apply_settings()
 
 	min_memory := uint(clay.MinMemorySize())
 	g.clay_memory = make([]u8, min_memory)
@@ -195,6 +197,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	clay.UpdateScrollContainers(false, g.wheel * 3, g.dt)
 
 	settings_poll(&g.settings)
+	if fonts_poll(&g.fonts) do apply_editor_font()
 	apply_pending_action()
 	update_focus()
 	finder_frame()
@@ -237,6 +240,7 @@ needs_continuous_frames :: proc() -> bool {
 	     editor_scrolling(e) || e.scrollbar_drag != nil,
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
+	     g.animating,
 	     terminal_panel_busy(),
 	     g.perf != nil && perf_running():
 		return true
@@ -287,6 +291,14 @@ wake_main_loop :: proc "contextless" (userdata: rawptr) {
 
 app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 	context = g.ctx
+	// The performance suite drives the app itself; real input would disturb it
+	// and wake the idle phases.
+	if g.perf != nil {
+		#partial switch event.type {
+		case .KEY_DOWN, .KEY_UP, .TEXT_INPUT, .MOUSE_MOTION, .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP, .MOUSE_WHEEL:
+			return .CONTINUE
+		}
+	}
 	// Input wakes the loop for a few frames; a wake event asks for just one.
 	if event.type == .USER {
 		g.wake_frames = max(g.wake_frames, 1)
@@ -350,6 +362,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	terminal_destroy(&g.terminal_panel.terminal)
 	settings_window_destroy()
 	settings_destroy(&g.settings)
+	fonts_destroy(&g.fonts)
 	destroy_mouse_cursors()
 	editor_destroy(&g.editor)
 	workspace_destroy(&g.workspace)

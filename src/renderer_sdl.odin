@@ -39,8 +39,26 @@ pop_clip :: proc(renderer: ^sdl.Renderer) {
 	}
 }
 
+// Clay overlay colors (used to fade elements in): everything drawn inside one
+// is mixed toward the overlay's color by its alpha. They nest.
+@(private = "file")
+overlay_stack: [16]clay.Color
+@(private = "file")
+overlay_depth: int
+
+@(private = "file")
+apply_overlays :: proc(c: clay.Color) -> clay.Color {
+	c := c
+	for o in overlay_stack[:min(overlay_depth, len(overlay_stack))] {
+		t := o.a / 255
+		c.rgb += (o.rgb - c.rgb) * t
+	}
+	return c
+}
+
 render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(clay.RenderCommand), scale: f32) {
 	clip_depth = 0
+	overlay_depth = 0
 	for i in 0 ..< commands.length {
 		cmd := clay.RenderCommandArray_Get(commands, i)
 		b := scale_box(cmd.boundingBox, scale)
@@ -66,6 +84,13 @@ render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(
 
 		case .ScissorEnd:
 			pop_clip(renderer)
+
+		case .OverlayColorStart:
+			if overlay_depth < len(overlay_stack) do overlay_stack[overlay_depth] = cmd.renderData.overlayColor.color
+			overlay_depth += 1
+
+		case .OverlayColorEnd:
+			overlay_depth = max(overlay_depth - 1, 0)
 
 		case .Custom:
 			data := cmd.renderData.custom
@@ -100,11 +125,13 @@ scale_radius :: proc(r: clay.CornerRadius, s: f32) -> clay.CornerRadius {
 
 @(private = "file")
 to_fcolor :: proc(c: clay.Color) -> sdl.FColor {
+	c := apply_overlays(c)
 	return {c.r / 255, c.g / 255, c.b / 255, c.a / 255}
 }
 
 @(private = "file")
 set_color :: proc(renderer: ^sdl.Renderer, c: clay.Color) {
+	c := apply_overlays(c)
 	_ = sdl.SetRenderDrawColor(renderer, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
 }
 
@@ -115,6 +142,7 @@ push_clip_box :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox) {
 
 draw_text :: proc(text: ^ttf.Text, x, y: f32, c: clay.Color) {
 	if text == nil do return
+	c := apply_overlays(c)
 	_ = ttf.SetTextColor(text, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
 	_ = ttf.DrawRendererText(text, x, y)
 }

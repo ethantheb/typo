@@ -165,7 +165,7 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 	if exited do term.session_print_notice(s, "Process exited. Press Enter to restart.")
 	if !visible do return
 
-	t.cell_w = text_char_width(&g.text, .Body, editor_font_size())
+	t.cell_w = editor_char_width()
 	t.cell_h = f32(editor_line_height())
 	if r, ok := element_rect(element); ok {
 		t.view = {r.x + TERMINAL_PADDING, r.y + TERMINAL_PADDING / 2, r.w - TERMINAL_PADDING * 2, r.h - TERMINAL_PADDING}
@@ -224,7 +224,8 @@ row_destroy :: proc(row: ^Term_Row) {
 // Reads one row from the render state into its cache: background runs, and
 // text runs that each share a color and font. Blank cells extend the current
 // run as spaces; a wide (2-cell) character, or one drawn by a fallback font,
-// gets a run of its own so its advance can't shift the cells after it.
+// gets a run of its own so its advance can't shift the cells after it. With
+// letter spacing every character does.
 @(private = "file")
 build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 	s := &t.session
@@ -298,7 +299,7 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		append(&row.cells, rune(cps[0]))
 
 		bold, underline, strike := style.bold, style.underline != 0, style.strikethrough
-		solo := cells == 2 || !font_has_own_glyph(&g.text, .Body, rune(cps[0]))
+		solo := cells == 2 || g.settings.letter_spacing != 0 || !font_has_own_glyph(&g.text, .Editor, rune(cps[0]))
 		if open {
 			r := &row.runs[len(row.runs) - 1]
 			open = r.end_col == col && r.fg == fg && r.bold == bold && r.underline == underline && r.strike == strike && !solo
@@ -321,9 +322,9 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 
 draw_terminal :: proc(renderer: ^sdl.Renderer, t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	if t.cell_w <= 0 do return
-	font := text_get_font(&g.text, .Body, editor_font_size())
+	font := text_get_font(&g.text, .Editor, editor_font_size())
 	if font == nil do return
-	bold_font := text_get_font(&g.text, .Bold, editor_font_size())
+	bold_font := text_get_font(&g.text, .Editor_Bold, editor_font_size())
 	if bold_font == nil do bold_font = font
 	push_clip_box(renderer, b)
 	defer pop_clip(renderer)

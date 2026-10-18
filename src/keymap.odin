@@ -9,6 +9,7 @@ import sdl "../vendor/sdl3"
 
 Command :: enum {
 	Find_File,
+	Find,
 	Toggle_Sidebar,
 	Toggle_Terminal,
 	Maximize_Terminal,
@@ -32,6 +33,7 @@ Command_Info :: struct {
 
 COMMANDS := [Command]Command_Info {
 	.Find_File         = {"find_file", "Find file", {"Ctrl+E"}},
+	.Find              = {"find", "Find", {"Ctrl+F"}},
 	.Toggle_Sidebar    = {"toggle_sidebar", "Toggle sidebar", {"Ctrl+B"}},
 	.Toggle_Terminal   = {"toggle_terminal", "Toggle terminal", {"Ctrl+`"}},
 	.Maximize_Terminal = {"maximize_terminal", "Maximize terminal", {"Ctrl+Shift+`"}},
