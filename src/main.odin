@@ -103,7 +103,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		sdl.Log("SDL_Init failed: %s", sdl.GetError())
 		return .FAILURE
 	}
-	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY})
+	// Shown once the first frame is drawn (see app_iterate), so it never appears empty.
+	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN})
 	if g.window == nil {
 		sdl.Log("SDL_CreateWindow failed: %s", sdl.GetError())
 		return .FAILURE
@@ -218,6 +219,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	render_clay_commands(g.renderer, &commands, g.ui_scale)
 	if g.perf != nil do perf_mark(.Render)
 	_ = sdl.RenderPresent(g.renderer)
+	if g.frame == 0 do _ = sdl.ShowWindow(g.window)
 	if g.perf != nil do perf_mark(.Present)
 
 	g.wheel = {}

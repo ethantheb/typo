@@ -119,6 +119,30 @@ test_relative_to_root :: proc(t: ^testing.T) {
 	testing.expect_value(t, relative_to_root(`C:\a.odin`), `a.odin`)
 }
 
+// Directories come first, then files, each sorted case-insensitively.
+@(test)
+test_workspace_open :: proc(t: ^testing.T) {
+	root := fmt.tprintf("%s/typo-workspace-test-%d", os.temp_directory(context.temp_allocator) or_else ".", os.get_pid())
+	root = os.get_absolute_path(root, context.temp_allocator) or_else root
+	_ = os.make_directory_all(fmt.tprintf("%s/sub", root))
+	_ = os.write_entire_file(fmt.tprintf("%s/b.txt", root), "")
+	_ = os.write_entire_file(fmt.tprintf("%s/A.txt", root), "")
+	defer os.remove_all(root)
+
+	ws: Workspace
+	workspace_open(&ws, root)
+	defer workspace_destroy(&ws)
+	names := [?]string{"sub", "A.txt", "b.txt"}
+	testing.expect_value(t, len(ws.visible), len(names))
+	if len(ws.visible) != len(names) do return
+	for name, i in names {
+		node := ws.nodes[ws.visible[i]]
+		testing.expect_value(t, node.name, name)
+		testing.expect_value(t, node.is_dir, i == 0)
+		testing.expect_value(t, node.path, fmt.tprintf("%s%c%s", root, os.Path_Separator, name))
+	}
+}
+
 // Valid values load, invalid ones fall back to their defaults and are
 // reported, and saving then loading gives the same settings.
 @(test)

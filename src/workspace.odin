@@ -105,21 +105,23 @@ load_children :: proc(ws: ^Workspace, index: int) {
 	dir_path := ws.nodes[index].path
 	depth := ws.nodes[index].depth + (index == 0 ? 0 : 1)
 
-	infos, err := os.read_all_directory_by_path(dir_path, context.temp_allocator)
-	if err != nil do return
+	entries, ok := list_directory(dir_path)
+	if !ok do return
+	// As in core:os, directory symlinks and junctions show as files.
+	for &e in entries do e.is_dir = e.is_dir && !e.is_link
 
-	slice.sort_by(infos, proc(a, b: os.File_Info) -> bool {
-		a_dir, b_dir := a.type == .Directory, b.type == .Directory
-		if a_dir != b_dir do return a_dir
+	slice.sort_by(entries, proc(a, b: Dir_Entry) -> bool {
+		if a.is_dir != b.is_dir do return a.is_dir
 		return strings.to_lower(a.name, context.temp_allocator) < strings.to_lower(b.name, context.temp_allocator)
 	})
 
-	for info in infos {
+	sep := is_separator(dir_path[len(dir_path) - 1]) ? "" : os.Path_Separator_String // a drive root like "C:\"
+	for entry in entries {
 		child := len(ws.nodes)
 		append(&ws.nodes, Node {
-			name   = strings.clone(info.name),
-			path   = strings.clone(info.fullpath),
-			is_dir = info.type == .Directory,
+			name   = strings.clone(entry.name),
+			path   = strings.concatenate({dir_path, sep, entry.name}),
+			is_dir = entry.is_dir,
 			depth  = depth,
 		})
 		// ws.nodes may have reallocated, so index rather than holding a pointer.
