@@ -1,11 +1,13 @@
 package editor
 
 import "core:os"
+import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 import "core:unicode/utf8"
 
 import "buffer"
+import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
 
@@ -22,6 +24,8 @@ Selection :: buffer.Selection
 Editor :: struct {
 	buf:      buffer.Buffer,
 	hl:       syntax.Highlighter,
+	md:       ^markdown.Doc, // block structure of a Markdown file, else nil
+	mdv:      Md_View,       // its rendered view
 	path:     string, // full path; "" when nothing is open
 	new_file: bool,   // path doesn't exist yet; the first save creates it
 	status:   File_Status,
@@ -47,6 +51,7 @@ Editor :: struct {
 		Line,
 	},
 	drag_origin: Selection, // selection made by the initial click, for word/line drag
+	drag_from:   [2]f32,    // where the press was; the drag starts once the pointer leaves it
 	blink_t0: u64,          // caret blink phase start (reset on activity)
 	// The primary caret's line and visual column, cached: on a long line the
 	// column takes a scan from the line start.
@@ -89,8 +94,24 @@ editor_open :: proc(e: ^Editor, path: string) {
 	}
 	buffer.buffer_init(&e.buf, data)
 	syntax.highlighter_open(&e.hl, &e.buf, path)
+	if is_markdown_path(path) {
+		e.md = new(markdown.Doc)
+		markdown.doc_open(e.md, &e.buf)
+		e.mdv.mode = md_default_mode(e)
+		e.mdv.caretless = e.mdv.mode == .Rendered
+	}
 	e.status = .Text
 	append(&e.sels, Selection{0, 0, -1})
+}
+
+// Whether the rendered Markdown view is showing no caret (see Md_View.caretless).
+md_caret_hidden :: proc(e: ^Editor) -> bool {
+	return md_rendered(e) && e.mdv.caretless
+}
+
+is_markdown_path :: proc(path: string) -> bool {
+	ext := filepath.ext(path)
+	return strings.equal_fold(ext, ".md") || strings.equal_fold(ext, ".markdown") || strings.equal_fold(ext, ".mdx")
 }
 
 editor_close :: proc(e: ^Editor) {
@@ -98,6 +119,11 @@ editor_close :: proc(e: ^Editor) {
 		syntax.highlighter_close(&e.hl)
 		buffer.buffer_destroy(&e.buf)
 	}
+	if e.md != nil {
+		markdown.doc_destroy(e.md)
+		free(e.md)
+	}
+	md_view_destroy(&e.mdv)
 	delete(e.path)
 	clear(&e.sels)
 	sels := e.sels
@@ -232,7 +258,6 @@ line_span :: proc(e: ^Editor, line: int) -> (lo, hi: int) {
 }
 
 // Length of a line's leading spaces and tabs.
-@(private = "file")
 indent_len :: proc(text: string) -> int {
 	n := 0
 	for n < len(text) && (text[n] == ' ' || text[n] == '\t') do n += 1
@@ -363,6 +388,7 @@ Move :: enum {
 editor_move :: proc(e: ^Editor, m: Move, extend: bool) {
 	lh := editor_line_height()
 	page := max(int(e.view.h) / lh - 1, 1)
+	rendered := md_rendered(e)
 	for &s in e.sels {
 		// Left/Right on a selection without Shift collapses it to that side.
 		if !extend && s.anchor != s.head && (m == .Left || m == .Right) {
@@ -379,24 +405,32 @@ editor_move :: proc(e: ^Editor, m: Move, extend: bool) {
 		case .Word_Right: head = word_boundary(e, head, +1)
 		case .Up:         head, col = vertical(e, s, -1)
 		case .Down:       head, col = vertical(e, s, +1)
-		case .Page_Up:    head, col = vertical(e, s, -page)
-		case .Page_Down:  head, col = vertical(e, s, +page)
-		case .Home:       head = smart_home(e, head)
-		case .End:        head = buffer.line_end(&e.buf, buffer.offset_to_line(&e.buf, head))
+		case .Page_Up, .Page_Down:
+			dir := m == .Page_Up ? -1 : 1
+			if rendered {
+				head, col = md_page(e, s, dir)
+			} else {
+				head, col = vertical(e, s, dir * page)
+			}
+		case .Home:       head = rendered ? md_home(e, head) : smart_home(e, head)
+		case .End:        head = rendered ? md_end(e, head) : buffer.line_end(&e.buf, buffer.offset_to_line(&e.buf, head))
 		case .Doc_Start:  head = 0
 		case .Doc_End:    head = buffer.length(&e.buf)
 		}
 		s = {extend ? s.anchor : head, head, col}
 	}
 	if m == .Page_Up || m == .Page_Down {
-		e.target_y += f64((m == .Page_Up ? -page : page) * lh)
+		dir: f64 = m == .Page_Up ? -1 : 1
+		e.target_y += dir * (rendered ? md_page_height(e) : f64(page * lh))
 	}
 	normalize(e)
 	e.reveal = true
 }
 
-// Moves `lines` lines up/down keeping the preferred visual column.
+// Moves `lines` lines up/down keeping the preferred visual column (visual rows
+// and x in the rendered Markdown view).
 vertical :: proc(e: ^Editor, s: Selection, lines: int) -> (head, col: int) {
+	if md_rendered(e) do return md_vertical(e, s, lines)
 	line := buffer.offset_to_line(&e.buf, s.head)
 	col = s.col
 	if col < 0 {
@@ -425,7 +459,12 @@ editor_select_all :: proc(e: ^Editor) {
 editor_add_cursor_vertical :: proc(e: ^Editor, dir: int) {
 	edge := dir < 0 ? e.sels[0] : e.sels[len(e.sels) - 1]
 	head, col := vertical(e, edge, dir)
-	if buffer.offset_to_line(&e.buf, head) == buffer.offset_to_line(&e.buf, edge.head) do return
+	if md_rendered(e) {
+		a, b := md_caret(e, head), md_caret(e, edge.head)
+		if a.line == b.line && a.row == b.row do return
+	} else if buffer.offset_to_line(&e.buf, head) == buffer.offset_to_line(&e.buf, edge.head) {
+		return
+	}
 	append(&e.sels, Selection{head, head, col})
 	e.primary = len(e.sels) - 1
 	normalize(e)
@@ -512,6 +551,15 @@ editor_delete :: proc(e: ^Editor, dir: int, word: bool) {
 	apply(e, .Deleting, ranges, {""})
 }
 
+// Replaces [lo, hi) with text of the same length as one undo step, leaving the
+// selections where they are (toggling a task box).
+editor_replace_in_place :: proc(e: ^Editor, lo, hi: int, text: string) {
+	assert(hi - lo == len(text))
+	buffer.begin(&e.buf, .Other, sdl.GetTicksNS(), e.sels[:])
+	buffer.replace(&e.buf, lo, hi - lo, text)
+	buffer.end(&e.buf, e.sels[:])
+}
+
 editor_undo :: proc(e: ^Editor) {
 	if sels, ok := buffer.undo(&e.buf); ok do restore_selections(e, sels)
 }
@@ -574,13 +622,30 @@ editor_paste :: proc(e: ^Editor) {
 
 // --- Keyboard -----------------------------------------------------------------------
 
-// Returns true if the key was handled.
+// Returns true if the key was handled. The rendered Markdown view edits through
+// its own handler (md_handle_key); everything else edits as plain text.
 editor_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 	if e.status != .Text do return false
+	e.blink_t0 = sdl.GetTicksNS()
+	if md_rendered(e) do return md_handle_key(e, key)
+	if navigation_key(e, key) do return true
+	ctrl := key.mod & sdl.KMOD_CTRL != {}
+	switch key.key {
+	case sdl.K_BACKSPACE: editor_delete(e, -1, ctrl)
+	case sdl.K_DELETE:    editor_delete(e, +1, ctrl)
+	case sdl.K_RETURN, sdl.K_KP_ENTER: editor_newline(e)
+	case sdl.K_TAB:
+		if key.mod & sdl.KMOD_SHIFT == {} do editor_insert(e, "\t", .Other)
+	case:
+		return false
+	}
+	return true
+}
+
+// Caret movement and selection keys, the same in every view.
+navigation_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 	ctrl := key.mod & sdl.KMOD_CTRL != {}
 	shift := key.mod & sdl.KMOD_SHIFT != {}
-	e.blink_t0 = sdl.GetTicksNS()
-
 	switch key.key {
 	case sdl.K_LEFT:      editor_move(e, ctrl ? .Word_Left : .Left, shift)
 	case sdl.K_RIGHT:     editor_move(e, ctrl ? .Word_Right : .Right, shift)
@@ -590,11 +655,6 @@ editor_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 	case sdl.K_PAGEDOWN:  editor_move(e, .Page_Down, shift)
 	case sdl.K_HOME:      editor_move(e, ctrl ? .Doc_Start : .Home, shift)
 	case sdl.K_END:       editor_move(e, ctrl ? .Doc_End : .End, shift)
-	case sdl.K_BACKSPACE: editor_delete(e, -1, ctrl)
-	case sdl.K_DELETE:    editor_delete(e, +1, ctrl)
-	case sdl.K_RETURN, sdl.K_KP_ENTER:
-		editor_newline(e)
-	case sdl.K_TAB:       editor_insert(e, "\t", .Other)
 	case sdl.K_ESCAPE:
 		if len(e.sels) > 1 || e.sels[0].anchor != e.sels[0].head {
 			editor_single_cursor(e)
@@ -612,6 +672,13 @@ editor_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 	if e.status != .Text do return false
 	e.blink_t0 = sdl.GetTicksNS()
+	if md_caret_hidden(e) {
+		// Nothing to copy or paste at; commands that select show the caret.
+		#partial switch cmd {
+		case .Copy, .Cut, .Paste:                                        return true
+		case .Select_All, .Undo, .Redo, .Add_Cursor_Above, .Add_Cursor_Below: e.mdv.caretless = false
+		}
+	}
 	#partial switch cmd {
 	case .Save:             editor_save(e)
 	case .Undo:             editor_undo(e)
@@ -622,13 +689,16 @@ editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 	case .Paste:            editor_paste(e)
 	case .Add_Cursor_Above: editor_add_cursor_vertical(e, -1)
 	case .Add_Cursor_Below: editor_add_cursor_vertical(e, +1)
+	case .Toggle_Markdown_View:
+		if e.md == nil do return false
+		md_toggle_view(e)
 	case:                   return false
 	}
 	return true
 }
 
 editor_text_input :: proc(e: ^Editor, text: string) {
-	if e.status != .Text do return
+	if e.status != .Text || md_caret_hidden(e) do return
 	e.blink_t0 = sdl.GetTicksNS()
 	editor_insert(e, text)
 }

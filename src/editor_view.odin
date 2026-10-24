@@ -3,9 +3,11 @@ package editor
 import "core:fmt"
 import "core:math"
 import "core:strings"
+import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import "buffer"
+import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
 import ttf "../vendor/sdl3/ttf"
@@ -40,15 +42,40 @@ editor_char_width :: proc() -> f32 {
 // Per-frame update before layout: syntax, view metrics, mouse, scrolling.
 editor_frame :: proc(e: ^Editor, interactive: bool) {
 	if e.status != .Text do return
-	syntax.highlighter_update(&e.hl, &e.buf, buffer.take_changes(&e.buf))
+	editor_take_changes(e)
 	if r, ok := element_rect(clay.ID("EditorText")); ok do e.view = r
 	e.char_w = editor_char_width()
-	digits := len(fmt.tprintf("%d", buffer.line_count(&e.buf)))
-	e.gutter_w = f32(max(digits, 3)) * e.char_w + 28
+	rendered := md_rendered(e)
+	if rendered {
+		e.gutter_w = 0
+		md_frame_begin(e)
+		md_layout_visible(e)
+	} else {
+		digits := len(fmt.tprintf("%d", buffer.line_count(&e.buf)))
+		e.gutter_w = f32(max(digits, 3)) * e.char_w + 28
+	}
 
 	if interactive do editor_mouse(e)
 	editor_reveal(e)
 	editor_animate(e)
+	if rendered {
+		md_layout_visible(e)
+		md_end_frame(e)
+	} else if e.md != nil {
+		last := int(e.scroll_y + f64(e.view.h)) / editor_line_height() + 1
+		markdown.doc_update(e.md, &e.buf, last + markdown.LOOKAHEAD_LINES, markdown.PARSE_BUDGET)
+	}
+}
+
+// Passes the buffer's edits since the last call to the highlighter and the
+// Markdown structure.
+editor_take_changes :: proc(e: ^Editor) {
+	changes := buffer.take_changes(&e.buf)
+	syntax.highlighter_update(&e.hl, &e.buf, changes)
+	if e.md != nil {
+		markdown.doc_edit(e.md, changes)
+		md_view_edit(e, changes)
+	}
 }
 
 // The Clay element hosting the text view.
@@ -60,6 +87,7 @@ editor_text_element :: proc(e: ^Editor) {
 
 // Document offset under a point (logical window coordinates).
 offset_at_point :: proc(e: ^Editor, x, y: f32) -> int {
+	if md_rendered(e) do return md_offset_at_point(e, x, y)
 	if f64(y - e.view.y) + e.scroll_y < 0 do return 0
 	line := int(f64(y - e.view.y) + e.scroll_y) / editor_line_height()
 	line = clamp(line, 0, buffer.line_count(&e.buf) - 1)
@@ -71,7 +99,8 @@ offset_at_point :: proc(e: ^Editor, x, y: f32) -> int {
 // Whether a point is over the text (not the gutter or the scroll bar).
 editor_text_hit :: proc(e: ^Editor, p: [2]f32) -> bool {
 	v := e.view
-	return rect_contains({v.x + e.gutter_w, v.y, v.w - e.gutter_w, v.h}, p) && !scrollbar_hit(e, p)
+	if !rect_contains({v.x + e.gutter_w, v.y, v.w - e.gutter_w, v.h}, p) || scrollbar_hit(e, p) do return false
+	return !md_rendered(e) || md_column_hit(e, p.x, p.y)
 }
 
 @(private = "file")
@@ -83,17 +112,44 @@ editor_mouse :: proc(e: ^Editor) {
 	if inside && g.wheel != {} {
 		dx, dy := g.wheel.x, g.wheel.y
 		if sdl.GetModState() & sdl.KMOD_SHIFT != {} do dx, dy = dy, 0
-		e.target_y -= f64(dy * 3 * f32(editor_line_height()))
+		step := md_rendered(e) ? md_body_line_height() : f32(editor_line_height())
+		e.target_y -= f64(dy * 3 * step)
+		// Rendered Markdown scrolls sideways only within code blocks.
+		if md_rendered(e) {
+			if dx != 0 do md_scroll_code_at(e, g.mouse_pos.y, -dx * 6 * e.char_w)
+			dx = 0
+		}
 		e.target_x -= dx * 6 * e.char_w
 	}
 
-	if editor_scrollbar_mouse(e) {
+	if editor_scrollbar_mouse(e) || (md_rendered(e) && md_code_bar_mouse(e)) {
 		clamp_scroll(e)
 		return
 	}
 
 	if g.mouse_pressed && inside && !scrollbar_hit(e, g.mouse_pos) {
 		mods := sdl.GetModState()
+		if md_rendered(e) && mods & sdl.KMOD_CTRL != {} && g.mouse_clicks == 1 {
+			if target, wiki, ok := md_link_at(e, g.mouse_pos.x, g.mouse_pos.y); ok {
+				md_open_link(e, target, wiki)
+				return
+			}
+		}
+		if md_rendered(e) && mods & (sdl.KMOD_SHIFT | sdl.KMOD_ALT | sdl.KMOD_CTRL) == {} && g.mouse_clicks == 1 {
+			if lo, hi, ok := md_checkbox_at(e, g.mouse_pos.x, g.mouse_pos.y); ok {
+				box := string(buffer.read_alloc(&e.buf, lo, hi))
+				editor_replace_in_place(e, lo, hi, box == "[ ]" ? "[x]" : "[ ]")
+				return
+			}
+		}
+		// Beside the rendered text, a click hides the caret.
+		if md_rendered(e) {
+			e.mdv.caretless = !md_column_hit(e, g.mouse_pos.x, g.mouse_pos.y)
+			if e.mdv.caretless {
+				e.dragging = false
+				return
+			}
+		}
 		offset := offset_at_point(e, g.mouse_pos.x, g.mouse_pos.y)
 		e.blink_t0 = sdl.GetTicksNS()
 		e.dragging = true
@@ -118,13 +174,27 @@ editor_mouse :: proc(e: ^Editor) {
 			set_single_selection(e, {offset, offset, -1})
 		}
 		e.drag_origin = e.sels[e.primary]
+		e.drag_from = g.mouse_pos
 		normalize(e)
+	} else if e.dragging && g.mouse_down && abs(g.mouse_pos.x - e.drag_from.x) + abs(g.mouse_pos.y - e.drag_from.y) < 3 {
+		// Not dragging yet: the click can reveal syntax, which moves the text
+		// under a pointer that hasn't moved.
 	} else if e.dragging && g.mouse_down {
 		// Extend the primary selection; scroll when dragging past the edges.
 		v := e.view
 		lh := f64(editor_line_height())
 		if g.mouse_pos.y < v.y do scroll_to(e, e.scroll_y - lh * 0.5)
 		if g.mouse_pos.y > v.y + v.h do scroll_to(e, e.scroll_y + lh * 0.5)
+		if md_rendered(e) {
+			md_drag_scroll_code(e)
+		} else {
+			// Sideways, past the text's edges.
+			left := v.x + e.gutter_w
+			dx: f32
+			if g.mouse_pos.x > v.x + v.w do dx = (g.mouse_pos.x - v.x - v.w) * 0.25 + 2
+			if g.mouse_pos.x < left && e.scroll_x > 0 do dx = -((left - g.mouse_pos.x) * 0.25 + 2)
+			if dx != 0 do e.scroll_x, e.target_x = max(e.scroll_x + dx, 0), max(e.scroll_x + dx, 0)
+		}
 		offset := offset_at_point(e, g.mouse_pos.x, g.mouse_pos.y)
 		o := e.drag_origin
 		s := &e.sels[e.primary]
@@ -162,6 +232,10 @@ editor_mouse :: proc(e: ^Editor) {
 editor_reveal :: proc(e: ^Editor) {
 	if !e.reveal || e.view.h <= 0 do return
 	e.reveal = false
+	if md_rendered(e) {
+		md_reveal(e)
+		return
+	}
 	head := e.sels[e.primary].head
 	line := buffer.offset_to_line(&e.buf, head)
 	lh := f64(editor_line_height())
@@ -187,6 +261,7 @@ scroll_to :: proc(e: ^Editor, y: f64) {
 }
 
 max_scroll_y :: proc(e: ^Editor) -> f64 {
+	if md_rendered(e) do return md_max_scroll(e)
 	return max(f64((buffer.line_count(&e.buf) - 1) * editor_line_height()), 0)
 }
 
@@ -250,6 +325,11 @@ editor_scrollbar_mouse :: proc(e: ^Editor) -> bool {
 
 draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, scale: f32) {
 	if e.status != .Text || e.char_w <= 0 do return
+	if md_rendered(e) {
+		draw_markdown(renderer, e, b, scale)
+		draw_scrollbar(renderer, e, scale)
+		return
+	}
 	font := text_get_font(&g.text, .Editor, editor_font_size())
 	if font == nil do return
 	push_clip_box(renderer, b)
@@ -275,7 +355,16 @@ draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, sc
 	hl_start := buffer.line_start(&e.buf, first)
 	hl_end := last < line_count ? buffer.line_start(&e.buf, last) : buffer.length(&e.buf)
 	hl := make([]syntax.Highlight, min(hl_end, hl_start + MAX_LINE_SCAN) - hl_start, context.temp_allocator)
-	syntax.highlight_range(&e.hl, &e.buf, hl_start, hl)
+	styles: []markdown.Text_Styles
+	if e.md != nil {
+		styles = make([]markdown.Text_Styles, len(hl), context.temp_allocator)
+		markdown.highlight_range(e.md, &e.buf, hl_start, hl, styles)
+	} else {
+		syntax.highlight_range(&e.hl, &e.buf, hl_start, hl)
+	}
+	// By style: regular, bold, italic, bold italic (drawn bold).
+	bold := text_get_font(&g.text, .Editor_Bold, editor_font_size())
+	fonts := [4]^ttf.Font{font, bold, text_get_font(&g.text, .Editor_Italic, editor_font_size()), bold}
 
 	primary := e.sels[e.primary]
 	primary_line := buffer.offset_to_line(&e.buf, primary.head)
@@ -306,9 +395,17 @@ draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, sc
 		}
 
 		lo := clamp(l.start - hl_start, 0, len(hl))
-		line_hl := hl[lo:clamp(end - hl_start, lo, len(hl))]
-		for run in visible_runs(l.text, line_hl, first_col, col_count) {
-			draw_text(text_get(&g.text, font, run.text), math.round(text_x + f32(run.col) * adv), y + text_dy, theme.syntax[run.hl])
+		hi := clamp(end - hl_start, lo, len(hl))
+		line_styles := styles != nil ? styles[lo:hi] : nil
+		for run in visible_runs(l.text, hl[lo:hi], line_styles, first_col, col_count) {
+			x := math.round(text_x + f32(run.col) * adv)
+			run_font := fonts[(.Bold in run.style ? 1 : 0) + (.Italic in run.style ? 2 : 0)]
+			if run_font == nil do run_font = font
+			color := theme.syntax[run.hl]
+			draw_text(text_get(&g.text, run_font, run.text), x, y + text_dy, color)
+			if .Strike in run.style {
+				fill_rect(renderer, x, math.round(y + lh / 2), f32(utf8.rune_count(run.text)) * adv, max(math.round(scale), 1), color)
+			}
 		}
 
 		if caret_on {
@@ -385,7 +482,6 @@ col_x :: proc(text: string, i: int, text_x, adv: f32) -> f32 {
 }
 
 // Index of the first selection that ends at or after `offset`.
-@(private = "file")
 first_selection_at :: proc(e: ^Editor, offset: int) -> int {
 	lo, hi := 0, len(e.sels)
 	for lo < hi {
@@ -400,24 +496,26 @@ first_selection_at :: proc(e: ^Editor, offset: int) -> int {
 }
 
 Run :: struct {
-	text: string,
-	col:  int, // visual column where the run starts
-	hl:   syntax.Highlight,
+	text:  string,
+	col:   int, // visual column where the run starts
+	hl:    syntax.Highlight,
+	style: markdown.Text_Styles,
 }
 
 // Splits the part of a line covering visual columns [first_col, first_col+count)
-// into runs of one highlight, with tabs expanded to spaces. Whitespace joins the
-// current run (it draws nothing), so runs break only where the color changes.
-// line_hl may be shorter than text (highlight cap); the rest is uncolored. A
+// into runs of one highlight and style, with tabs expanded to spaces. Whitespace
+// joins the current run (it draws nothing), so runs break only where the color
+// or style changes. line_hl may be shorter than text (highlight cap); the rest
+// is uncolored. line_style may be nil. A
 // character the font lacks is drawn by a fallback font with its own advance, so
 // it gets a run of its own, keeping later columns on the grid. With letter
 // spacing every character is a run of its own.
-@(private = "file")
-visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count: int) -> []Run {
+visible_runs :: proc(text: string, line_hl: []syntax.Highlight, line_style: []markdown.Text_Styles, first_col, count: int) -> []Run {
 	Span :: struct {
 		lo, hi: int, // into sb
 		col:    int,
 		hl:     syntax.Highlight,
+		style:  markdown.Text_Styles,
 	}
 	spans := make([dynamic]Span, context.temp_allocator)
 	sb := strings.builder_make(context.temp_allocator)
@@ -431,10 +529,11 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count
 		if next <= first_col do continue
 
 		h := i < len(line_hl) ? line_hl[i] : .None
+		st := i < len(line_style) ? line_style[i] : {}
 		own := !spaced && font_has_own_glyph(&g.text, .Editor, r)
 		space := r == ' ' || r == '\t'
-		if !open || !own || (!space && h != spans[len(spans) - 1].hl) {
-			append(&spans, Span{len(sb.buf), len(sb.buf), col, h})
+		if !open || !own || (!space && (h != spans[len(spans) - 1].hl || st != spans[len(spans) - 1].style)) {
+			append(&spans, Span{len(sb.buf), len(sb.buf), col, h, st})
 		}
 		if r == '\t' {
 			for _ in col ..< next do strings.write_byte(&sb, ' ')
@@ -448,7 +547,7 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, first_col, count
 	runs := make([dynamic]Run, 0, len(spans), context.temp_allocator)
 	for span in spans {
 		run := string(sb.buf[span.lo:span.hi])
-		if len(strings.trim_space(run)) > 0 do append(&runs, Run{run, span.col, span.hl})
+		if len(strings.trim_space(run)) > 0 do append(&runs, Run{run, span.col, span.hl, span.style})
 	}
 	return runs[:]
 }

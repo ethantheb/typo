@@ -237,7 +237,6 @@ draw_arc :: proc(renderer: ^sdl.Renderer, cx, cy, radius, thickness, start: f32,
 }
 
 // Icons are Lucide glyphs, centred in the element's bounds.
-@(private = "file")
 draw_icon :: proc(renderer: ^sdl.Renderer, data: Icon_Data, b: clay.BoundingBox) {
 	font := text_get_font(&g.text, .Icons, data.size)
 	if font == nil do return

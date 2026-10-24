@@ -11,8 +11,8 @@ import "core:time"
 import sdl "../vendor/sdl3"
 import ttf "../vendor/sdl3/ttf"
 
-// Font families for the editor and terminal: the bundled IBM Plex Mono, and the
-// monospace fonts installed on the system. Installed fonts are found by a
+// Font families: the bundled IBM Plex Mono (editor and terminal) and IBM Plex
+// Sans (rendered Markdown), and the fonts installed on the system. Installed fonts are found by a
 // background thread that opens every file in the system font folders. It runs
 // the first time the list is needed (to load a configured family that isn't
 // bundled, which shows the bundled font until then) and again each time the font
@@ -20,6 +20,7 @@ import ttf "../vendor/sdl3/ttf"
 // until the new one is ready.
 
 BUNDLED_FAMILY :: "IBM Plex Mono"
+BUNDLED_MD_FAMILY :: "IBM Plex Sans"
 
 // Where to load a font from.
 Font_Source :: struct {
@@ -27,25 +28,47 @@ Font_Source :: struct {
 	path: string, // a font file
 	// Face in a collection; for a variable font, plus the named instance << 16.
 	face: i64,
+	synthetic_italic: bool, // slant an upright face (the family has no italic)
 }
 
 Font_Face :: struct {
 	using source: Font_Source,
 	weight:       int, // 100 (thin) to 900 (black)
+	italic:       bool,
 }
 
 Font_Family :: struct {
-	name:  string,
-	faces: [dynamic]Font_Face, // upright styles only
+	name:      string,
+	faces:     [dynamic]Font_Face,
+	monospace: bool,
 }
 
 BUNDLED_FACES := [?]Font_Face {
-	{{data = #load("../assets/fonts/IBMPlexMono-ExtraLight.ttf")}, 200},
-	{{data = #load("../assets/fonts/IBMPlexMono-Light.ttf")}, 300},
-	{{data = #load("../assets/fonts/IBMPlexMono-Regular.ttf")}, 400},
-	{{data = #load("../assets/fonts/IBMPlexMono-Medium.ttf")}, 500},
-	{{data = #load("../assets/fonts/IBMPlexMono-SemiBold.ttf")}, 600},
-	{{data = #load("../assets/fonts/IBMPlexMono-Bold.ttf")}, 700},
+	{{data = #load("../assets/fonts/IBMPlexMono-ExtraLight.ttf")}, 200, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-Light.ttf")}, 300, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-Regular.ttf")}, 400, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-Medium.ttf")}, 500, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-SemiBold.ttf")}, 600, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-Bold.ttf")}, 700, false},
+	{{data = #load("../assets/fonts/IBMPlexMono-Italic.ttf")}, 400, true},
+	{{data = #load("../assets/fonts/IBMPlexMono-MediumItalic.ttf")}, 500, true},
+}
+
+BUNDLED_MD_FACES := [?]Font_Face {
+	{{data = #load("../assets/fonts/IBMPlexSans-Regular.ttf")}, 400, false},
+	{{data = #load("../assets/fonts/IBMPlexSans-SemiBold.ttf")}, 600, false},
+	{{data = #load("../assets/fonts/IBMPlexSans-Bold.ttf")}, 700, false},
+	{{data = #load("../assets/fonts/IBMPlexSans-Italic.ttf")}, 400, true},
+	{{data = #load("../assets/fonts/IBMPlexSans-BoldItalic.ttf")}, 700, true},
+}
+
+// The faces rendered Markdown is drawn with.
+Md_Face :: enum {
+	Regular,
+	Italic,
+	SemiBold,
+	Bold,
+	Bold_Italic,
 }
 
 System_Fonts :: struct {
@@ -154,52 +177,85 @@ families_destroy :: proc(families: ^[dynamic]Font_Family) {
 	delete(families^)
 }
 
-// The family names to choose from: the bundled one, then the installed ones.
+// The editor font names to choose from: the bundled one, then the installed
+// monospace ones.
 font_family_names :: proc(sf: ^System_Fonts) -> []string {
 	names := make([dynamic]string, 0, len(sf.families) + 1, context.temp_allocator)
 	append(&names, BUNDLED_FAMILY)
+	for f in sf.families do if f.monospace do append(&names, f.name)
+	return names[:]
+}
+
+// The Markdown font names to choose from: the bundled one, then every
+// installed family.
+markdown_family_names :: proc(sf: ^System_Fonts) -> []string {
+	names := make([dynamic]string, 0, len(sf.families) + 2, context.temp_allocator)
+	append(&names, BUNDLED_MD_FAMILY, BUNDLED_FAMILY)
 	for f in sf.families do append(&names, f.name)
 	return names[:]
 }
 
-// Whether `family` is known to be unavailable, so the bundled font is shown instead.
+// Whether `family` is known to be unavailable, so a bundled font is shown instead.
 font_family_missing :: proc(sf: ^System_Fonts, family: string) -> bool {
-	if family == BUNDLED_FAMILY || !sf.scanned do return false
+	if family == BUNDLED_FAMILY || family == BUNDLED_MD_FAMILY || !sf.scanned do return false
 	for f in sf.families do if f.name == family do return false
 	return true
 }
 
-// The faces to draw the editor with: the family's regular and bold styles at
-// the weights nearest the requested one. found is false (and the bundled family
-// is used) while the installed fonts haven't been scanned or don't include it.
-font_family_sources :: proc(sf: ^System_Fonts, family: string, weight: int) -> (regular, bold: Font_Source, found: bool) {
-	faces := BUNDLED_FACES[:]
-	found = family == BUNDLED_FAMILY
-	if !found {
-		for &f in sf.families {
-			if f.name == family {
-				faces, found = f.faces[:], true
-				break
-			}
-		}
+// The faces of `family`, or nil (with found = false) while the installed fonts
+// haven't been scanned or don't include it.
+@(private = "file")
+family_faces :: proc(sf: ^System_Fonts, family: string) -> (faces: []Font_Face, found: bool) {
+	switch family {
+	case BUNDLED_FAMILY:    return BUNDLED_FACES[:], true
+	case BUNDLED_MD_FAMILY: return BUNDLED_MD_FACES[:], true
 	}
+	for &f in sf.families do if f.name == family do return f.faces[:], true
+	return nil, false
+}
+
+// The faces to draw the editor with: the family's regular, bold and italic
+// styles at the weights nearest the requested one. found is false (and the
+// bundled family is used) while the installed fonts haven't been scanned or
+// don't include it.
+font_family_sources :: proc(sf: ^System_Fonts, family: string, weight: int) -> (regular, bold, italic: Font_Source, found: bool) {
+	faces: []Font_Face
+	faces, found = family_faces(sf, family)
 	if !found do faces = BUNDLED_FACES[:]
 	r := nearest_face(faces, weight)
 	// Bold is two steps heavier than the text, and at least 700.
 	b := nearest_face(faces, max(weight + 200, 700), heavier_than = r.weight)
-	return r.source, b.source, found
+	return r.source, b.source, nearest_face(faces, weight, italic = true).source, found
 }
 
+// The faces to draw rendered Markdown with, from `family` or the bundled one.
+markdown_family_sources :: proc(sf: ^System_Fonts, family: string) -> (sources: [Md_Face]Font_Source, found: bool) {
+	faces: []Font_Face
+	faces, found = family_faces(sf, family)
+	if !found do faces = BUNDLED_MD_FACES[:]
+	regular := nearest_face(faces, 400)
+	sources[.Regular] = regular.source
+	sources[.Italic] = nearest_face(faces, 400, italic = true).source
+	sources[.SemiBold] = nearest_face(faces, 600, heavier_than = regular.weight).source
+	sources[.Bold] = nearest_face(faces, 700, heavier_than = regular.weight).source
+	sources[.Bold_Italic] = nearest_face(faces, 700, heavier_than = regular.weight, italic = true).source
+	return
+}
+
+// The face nearest `weight` in the wanted style. Without italic faces, an
+// upright one is slanted.
 @(private = "file")
-nearest_face :: proc(faces: []Font_Face, weight: int, heavier_than := 0) -> Font_Face {
+nearest_face :: proc(faces: []Font_Face, weight: int, heavier_than := 0, italic := false) -> Font_Face {
 	best := faces[0]
 	best_d := max(int)
 	for f in faces {
 		d := abs(f.weight - weight)
 		// Fall back to lighter faces only when nothing heavier exists.
 		if f.weight <= heavier_than do d += 1000
+		if f.italic != italic do d += 10_000
 		if d < best_d do best, best_d = f, d
 	}
+	if italic && !best.italic do best.synthetic_italic = true
 	return best
 }
 
@@ -240,8 +296,8 @@ scan_fonts :: proc(s: ^Font_Scan) {
 	wake_main_loop(nil)
 }
 
-// Adds the upright monospace faces in one font file, including the named
-// instances (Light, Bold, ...) of a variable font.
+// Adds the faces in one font file, including the named instances (Light,
+// Bold, ...) of a variable font.
 @(private = "file")
 add_font_file :: proc(found: ^[dynamic]Font_Family, path: string) {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
@@ -251,7 +307,7 @@ add_font_file :: proc(found: ^[dynamic]Font_Family, path: string) {
 		if font == nil do return
 		defer ttf.CloseFont(font)
 		if face == 0 do faces = max(int(ttf.GetNumFontFaces(font)), 1)
-		if !ttf.FontIsFixedWidth(font) || !has_ascii(font) do continue
+		if !has_ascii(font) do continue
 		add_face(found, font, path, i64(face), int(ttf.GetFontWeight(font)))
 
 		// FreeType ignores the instance bits for a font without variations, so
@@ -295,16 +351,18 @@ open_face :: proc(path: cstring, index: i64) -> ^ttf.Font {
 add_face :: proc(found: ^[dynamic]Font_Family, font: ^ttf.Font, path: string, index: i64, weight: int) {
 	name := string(ttf.GetFontFamilyName(font))
 	style := strings.to_lower(string(ttf.GetFontStyleName(font)), context.temp_allocator)
-	if name == "" || name == BUNDLED_FAMILY do return
-	if strings.contains(style, "italic") || strings.contains(style, "oblique") do return
+	if name == "" || name == BUNDLED_FAMILY || name == BUNDLED_MD_FAMILY do return
+	italic := strings.contains(style, "italic") || strings.contains(style, "oblique")
 	family: ^Font_Family
 	for &f in found do if f.name == name do family = &f
 	if family == nil {
 		append(found, Font_Family{name = strings.clone(name)})
 		family = &found[len(found) - 1]
 	}
-	for f in family.faces do if f.weight == weight do return
-	append(&family.faces, Font_Face{{path = strings.clone(path), face = index}, clamp(weight, 100, 900)})
+	if !italic && ttf.FontIsFixedWidth(font) do family.monospace = true
+	weight := clamp(weight, 100, 900)
+	for f in family.faces do if f.weight == weight && f.italic == italic do return
+	append(&family.faces, Font_Face{{path = strings.clone(path), face = index}, weight, italic})
 }
 
 // The weight a style name such as "SemiBold" or "Extra Light" stands for.

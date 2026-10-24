@@ -1,5 +1,7 @@
 package editor
 
+import "core:math"
+
 import clay "../vendor/clay-odin"
 
 // Scroll bars: a thumb along the right edge of a scrolling area. Dragging it
@@ -53,6 +55,7 @@ scrollbar_thumb_look :: proc(thumb: Rect, active: bool) -> (r: Rect, color: clay
 // leave SCROLLBAR_GUTTER of padding there for it. Declare it after the
 // container; `drag` is kept per container. Works from last frame's layout.
 list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
+	smooth_scroll_list(list)
 	data := clay.GetScrollContainerData(list)
 	area, ok := element_rect(list)
 	if !data.found || !ok do return
@@ -82,4 +85,110 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 			pointerCaptureMode = .Passthrough,
 		},
 	}) {}
+}
+
+// --- Smooth wheel scrolling ------------------------------------------------------
+// Clay scroll containers ease to where the wheel takes them, like the editor,
+// when smooth scrolling is on: Clay picks the container under the pointer and
+// applies the wheel as usual, and that jump becomes a target the shown position
+// moves toward. Lists opt in each frame with smooth_scroll_list.
+
+@(private = "file")
+MAX_SMOOTH_LISTS :: 16
+
+@(private = "file")
+Smooth_Scroll :: struct {
+	id:     u32,
+	target: f32,
+	shown:  f32, // the position last set, to notice when something else moves it
+}
+
+@(private = "file")
+smooth: struct {
+	lists:      [MAX_SMOOTH_LISTS]u32, // declared this frame
+	n_lists:    int,
+	moving:     [MAX_SMOOTH_LISTS]Smooth_Scroll,
+	n_moving:   int,
+}
+
+// Makes a Clay scroll container's wheel scrolling smooth; call while declaring it.
+smooth_scroll_list :: proc(id: clay.ElementId) {
+	for x in smooth.lists[:smooth.n_lists] do if x == id.id do return
+	if smooth.n_lists < MAX_SMOOTH_LISTS {
+		smooth.lists[smooth.n_lists] = id.id
+		smooth.n_lists += 1
+	}
+}
+
+// Whether a list is still easing toward its target.
+smooth_scrolling :: proc() -> bool {
+	return smooth.n_moving > 0
+}
+
+// Applies the wheel to Clay's scroll containers (in place of
+// clay.UpdateScrollContainers) and moves easing lists along.
+update_scroll_containers :: proc() {
+	lists := smooth.lists
+	n := smooth.n_lists
+	smooth.n_lists = 0
+	data_of :: proc(id: u32) -> clay.ScrollContainerData {
+		return clay.GetScrollContainerData(clay.ElementId{id = id})
+	}
+
+	// Something else moving a list (its scroll bar, keyboard focus) ends its easing.
+	for i := 0; i < smooth.n_moving; {
+		m := smooth.moving[i]
+		data := data_of(m.id)
+		if !data.found || data.scrollPosition.y != m.shown {
+			smooth.n_moving -= 1
+			smooth.moving[i] = smooth.moving[smooth.n_moving]
+		} else {
+			i += 1
+		}
+	}
+
+	before: [MAX_SMOOTH_LISTS]f32
+	for id, i in lists[:n] {
+		if data := data_of(id); data.found do before[i] = data.scrollPosition.y
+	}
+	clay.UpdateScrollContainers(false, g.wheel * 3, g.dt)
+	if !g.settings.smooth_scroll {
+		smooth.n_moving = 0
+		return
+	}
+
+	for id, i in lists[:n] {
+		data := data_of(id)
+		if !data.found || data.scrollPosition.y == before[i] do continue
+		m: ^Smooth_Scroll
+		for &x in smooth.moving[:smooth.n_moving] do if x.id == id do m = &x
+		if m == nil {
+			if smooth.n_moving >= MAX_SMOOTH_LISTS do continue
+			m = &smooth.moving[smooth.n_moving]
+			smooth.n_moving += 1
+			m^ = {id = id, target = before[i]}
+		}
+		m.target += data.scrollPosition.y - before[i]
+		data.scrollPosition.y = before[i]
+		m.shown = before[i]
+	}
+
+	t := 1 - math.exp(-f32(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
+	for i := 0; i < smooth.n_moving; {
+		m := &smooth.moving[i]
+		data := data_of(m.id)
+		lowest := -max(data.contentDimensions.height - data.scrollContainerDimensions.height, 0)
+		m.target = clamp(m.target, lowest, 0)
+		y := data.scrollPosition.y + (m.target - data.scrollPosition.y) * t
+		done := abs(m.target - y) < 0.5
+		if done do y = m.target
+		data.scrollPosition.y = y
+		m.shown = y
+		if done {
+			smooth.n_moving -= 1
+			smooth.moving[i] = smooth.moving[smooth.n_moving]
+		} else {
+			i += 1
+		}
+	}
 }

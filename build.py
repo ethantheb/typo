@@ -69,7 +69,7 @@ OBJ = OUT / "obj"
 IS_WINDOWS = platform.system() == "Windows"
 EXE = OUT / ("typo.exe" if IS_WINDOWS else "typo")
 PERF_EXE = OUT / ("typo-perf.exe" if IS_WINDOWS else "typo-perf")
-TEST_PACKAGES = ["src/buffer", "src/syntax", "src/toml", "src/term", "src"]
+TEST_PACKAGES = ["src/buffer", "src/syntax", "src/markdown", "src/toml", "src/term", "src"]
 TS_LIB = OBJ / ("tree_sitter.lib" if IS_WINDOWS else "libtree_sitter.a")
 
 TS_SOURCES = [
@@ -262,6 +262,8 @@ def build_odin(release, exe=EXE, console=False):
     flags = ["-o:speed"] if release else ["-debug"]
     if release and IS_WINDOWS and not console:
         flags.append("-subsystem:windows")
+    if IS_WINDOWS:
+        flags.append("-resource:assets/icon/typo.rc")  # the executable's icon
     cmd = ["odin", "build", "src", f"-out:{exe}", *flags]
     for attempt in range(1, 5):
         result = run(cmd, capture_output=True, text=True)

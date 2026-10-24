@@ -94,6 +94,23 @@ language_for_path :: proc(path: string) -> Language {
 	return .None
 }
 
+@(private = "file")
+LANGUAGE_ALIASES := [?]struct {
+	name: string,
+	lang: Language,
+} {
+	{"javascript", .JavaScript}, {"typescript", .TypeScript}, {"rust", .Rust}, {"golang", .Go},
+	{"python", .Python}, {"csharp", .CSharp}, {"c#", .CSharp}, {"c++", .Cpp},
+}
+
+// The language named by a code fence's info string: a name ("python") or an
+// extension ("py").
+language_for_name :: proc(name: string) -> Language {
+	if name == "" do return .None
+	for a in LANGUAGE_ALIASES do if strings.equal_fold(name, a.name) do return a.lang
+	return language_for_path(strings.concatenate({".", name}, context.temp_allocator))
+}
+
 highlighter_open :: proc(h: ^Highlighter, b: ^buffer.Buffer, path: string) {
 	highlighter_close(h)
 	h.lang = language_for_path(path)

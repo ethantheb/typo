@@ -88,6 +88,7 @@ sidebar :: proc() {
 			if button(clay.ID("OpenButton"), "Open…", "Open a folder") do show_open_folder_dialog()
 		}
 		files_id := clay.ID("SidebarFiles")
+		smooth_scroll_list(files_id)
 		if clay.UI(files_id)({
 			layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
 			clip = {horizontal = true, vertical = true, childOffset = clay.GetScrollOffset()},
@@ -292,9 +293,15 @@ status_bar :: proc() {
 			label(editor_is_modified(e) ? fmt.tprintf("%s •", name) : name, theme.text, FONT_SIZE_SMALL)
 		}
 		if e.status == .Text {
-			label(cursor_status(e), theme.text_dim, FONT_SIZE_SMALL)
+			if !md_caret_hidden(e) do label(cursor_status(e), theme.text_dim, FONT_SIZE_SMALL)
 			label(fmt.tprintf("%d lines", buffer.line_count(&e.buf)), theme.text_dim, FONT_SIZE_SMALL)
 			label(e.buf.crlf ? "CRLF" : "LF", theme.text_dim, FONT_SIZE_SMALL)
+			if e.md != nil {
+				rendered := md_rendered(e)
+				if icon_button(clay.ID("MarkdownView"), rendered ? .Code : .Eye, 20, 15, rendered ? "Show Markdown source" : "Show rendered Markdown", first_chord_label(.Toggle_Markdown_View)) {
+					run_command(.Toggle_Markdown_View)
+				}
+			}
 		}
 		push_right()
 		label(fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, g.ui_scale), theme.text_dim, FONT_SIZE_SMALL)
@@ -336,6 +343,10 @@ update_mouse_cursor :: proc() {
 	case e.status != .Text || terminal_maximized():
 	case e.dragging && g.mouse_down:
 		want = .TEXT // keep the I-beam while drag-selecting, wherever the mouse goes
+	case md_rendered(e) && (e.mdv.code_drag.active || code_bar_under_pointer(e)):
+		want = .DEFAULT
+	case md_rendered(e) && md_pointer_target(e):
+		want = .POINTER
 	case e.scrollbar_drag == nil && editor_text_hit(e, g.mouse_pos):
 		want = .TEXT
 	}
@@ -346,6 +357,12 @@ update_mouse_cursor :: proc() {
 		cursor = cursors[want]
 	}
 	if cursor != nil && sdl.SetCursor(cursor) do current_cursor = want
+}
+
+@(private = "file")
+code_bar_under_pointer :: proc(e: ^Editor) -> bool {
+	_, _, _, _, ok := md_code_bar_at(e, g.mouse_pos)
+	return ok
 }
 
 destroy_mouse_cursors :: proc() {

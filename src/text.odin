@@ -3,6 +3,7 @@ package editor
 import "core:hash"
 import "core:os"
 import "core:strings"
+import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
@@ -13,7 +14,8 @@ import ttf "../vendor/sdl3/ttf"
 // crisp on high-DPI displays, and measurements are divided back by scale.
 
 // Clay passes these back in measure/render. The UI uses the bundled fonts; the
-// editor and terminal use the configured family (see text_set_source).
+// editor and terminal use the configured family, rendered Markdown its own
+// (see text_set_source).
 Font_Id :: enum u16 {
 	Body,
 	SemiBold,
@@ -21,6 +23,21 @@ Font_Id :: enum u16 {
 	Icons,
 	Editor,
 	Editor_Bold,
+	Editor_Italic,
+	Md_Regular,
+	Md_Italic,
+	Md_SemiBold,
+	Md_Bold,
+	Md_Bold_Italic,
+}
+
+// The font id of each Markdown face.
+MD_FONTS := [Md_Face]Font_Id {
+	.Regular     = .Md_Regular,
+	.Italic      = .Md_Italic,
+	.SemiBold    = .Md_SemiBold,
+	.Bold        = .Md_Bold,
+	.Bold_Italic = .Md_Bold_Italic,
 }
 
 ICON_FONT_DATA := #load("../assets/fonts/lucide.ttf")
@@ -106,7 +123,10 @@ Text_System :: struct {
 	sources:        [Font_Id]Font_Source,
 	texts:          map[Text_Key]Text_Entry,
 	char_widths:    map[Font_Key]f32,
+	metrics:        map[Font_Key]Font_Metrics,
+	widths:         map[Width_Key]f32,
 	frame:          u64,
+	generation:     u64, // bumped whenever fonts are reopened, so measurements made with them are stale
 }
 
 text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool {
@@ -121,12 +141,18 @@ text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool
 	}
 	ts.scale = scale
 	ts.sources = {
-		.Body        = BUNDLED_FACES[3].source,
-		.SemiBold    = BUNDLED_FACES[4].source,
-		.Bold        = BUNDLED_FACES[5].source,
-		.Icons       = {data = ICON_FONT_DATA},
-		.Editor      = BUNDLED_FACES[3].source,
-		.Editor_Bold = BUNDLED_FACES[5].source,
+		.Body           = BUNDLED_FACES[3].source,
+		.SemiBold       = BUNDLED_FACES[4].source,
+		.Bold           = BUNDLED_FACES[5].source,
+		.Icons          = {data = ICON_FONT_DATA},
+		.Editor         = BUNDLED_FACES[3].source,
+		.Editor_Bold    = BUNDLED_FACES[5].source,
+		.Editor_Italic  = BUNDLED_FACES[7].source,
+		.Md_Regular     = BUNDLED_MD_FACES[0].source,
+		.Md_SemiBold    = BUNDLED_MD_FACES[1].source,
+		.Md_Bold        = BUNDLED_MD_FACES[2].source,
+		.Md_Italic      = BUNDLED_MD_FACES[3].source,
+		.Md_Bold_Italic = BUNDLED_MD_FACES[4].source,
 	}
 	return true
 }
@@ -141,6 +167,8 @@ text_destroy :: proc(ts: ^Text_System) {
 	delete(ts.fallback_paths)
 	delete(ts.texts)
 	delete(ts.char_widths)
+	delete(ts.metrics)
+	delete(ts.widths)
 	ttf.DestroyRendererTextEngine(ts.engine)
 	ttf.Quit()
 }
@@ -165,6 +193,9 @@ text_clear_caches :: proc(ts: ^Text_System) {
 	}
 	clear(&ts.fallbacks)
 	clear(&ts.char_widths)
+	clear(&ts.metrics)
+	clear(&ts.widths)
+	ts.generation += 1
 }
 
 @(private = "file")
@@ -180,14 +211,18 @@ open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	_ = sdl.SetFloatProperty(props, ttf.PROP_FONT_CREATE_SIZE_FLOAT, size)
 	_ = sdl.SetNumberProperty(props, ttf.PROP_FONT_CREATE_FACE_NUMBER, src.face)
 	font := ttf.OpenFontWithProperties(props)
-	if font != nil do ttf.SetFontHinting(font, FONT_HINTING)
+	if font != nil {
+		ttf.SetFontHinting(font, FONT_HINTING)
+		if src.synthetic_italic do ttf.SetFontStyle(font, {.ITALIC})
+	}
 	return font
 }
 
 // Points a font id at another font, dropping what was opened from the old one.
 text_set_source :: proc(ts: ^Text_System, id: Font_Id, src: Font_Source) {
 	old := &ts.sources[id]
-	if old.path == src.path && raw_data(old.data) == raw_data(src.data) && old.face == src.face do return
+	if old.path == src.path && raw_data(old.data) == raw_data(src.data) && old.face == src.face && old.synthetic_italic == src.synthetic_italic do return
+	ts.generation += 1
 	stale := make([dynamic]Font_Key, context.temp_allocator)
 	for key, font in ts.fonts {
 		if key.id != id do continue
@@ -209,16 +244,20 @@ text_set_source :: proc(ts: ^Text_System, id: Font_Id, src: Font_Source) {
 	for key in stale {
 		delete_key(&ts.fonts, key)
 		delete_key(&ts.char_widths, key)
+		delete_key(&ts.metrics, key)
 	}
+	clear(&ts.widths)
 	if ts.bare[id] != nil {
 		ttf.CloseFont(ts.bare[id])
 		ts.bare[id] = nil
 	}
 	delete(old.path)
-	old^ = {data = src.data, path = strings.clone(src.path), face = src.face}
+	old^ = src
+	old.path = strings.clone(src.path)
 }
 
 text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
+	if ts.engine == nil do return nil
 	key := Font_Key{id, size}
 	if font, ok := ts.fonts[key]; ok do return font
 	font := open_font(ts.sources[id], f32(size) * ts.scale)
@@ -323,6 +362,92 @@ text_char_width :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> f32 {
 	width := f32(w) / len(SAMPLE) / ts.scale
 	ts.char_widths[key] = width
 	return width
+}
+
+// --- Measuring proportional text (rendered Markdown) ------------------------------
+// In logical pixels. Without a text engine (unit tests) each character is half
+// the font size wide.
+
+Width_Key :: struct {
+	font: Font_Key,
+	hash: u64,
+	len:  int,
+}
+
+// Cached widths are dropped when this many have built up.
+@(private = "file")
+WIDTH_CACHE_MAX :: 1 << 16
+
+// Ascent, descent and height of a font, in logical pixels.
+Font_Metrics :: struct {
+	ascent, descent, height: f32,
+}
+
+font_metrics :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> Font_Metrics {
+	if ts.engine == nil do return {f32(size) * 0.8, f32(size) * 0.25, f32(size) * 1.05}
+	key := Font_Key{id, size}
+	if m, ok := ts.metrics[key]; ok do return m
+	font := text_get_font(ts, id, size)
+	if font == nil do return {f32(size) * 0.8, f32(size) * 0.25, f32(size) * 1.05}
+	m := Font_Metrics{f32(ttf.GetFontAscent(font)) / ts.scale, f32(-ttf.GetFontDescent(font)) / ts.scale, f32(ttf.GetFontHeight(font)) / ts.scale}
+	ts.metrics[key] = m
+	return m
+}
+
+// Width of `s` (one line) drawn in a font, cached.
+text_width :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string) -> f32 {
+	if len(s) == 0 do return 0
+	if ts.engine == nil do return f32(strings.rune_count(s)) * f32(size) * 0.5
+	key := Width_Key{{id, size}, hash.fnv64a(transmute([]u8)s), len(s)}
+	if w, ok := ts.widths[key]; ok do return w
+	font := text_get_font(ts, id, size)
+	if font == nil do return 0
+	ensure_fallbacks(ts, font, s)
+	w, h: i32
+	_ = ttf.GetStringSize(font, cstring(raw_data(s)), uint(len(s)), &w, &h)
+	if len(ts.widths) >= WIDTH_CACHE_MAX do clear(&ts.widths)
+	width := f32(w) / ts.scale
+	ts.widths[key] = width
+	return width
+}
+
+// How many bytes of `s` fit in `max_w` (at least one character).
+text_fit :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, max_w: f32) -> int {
+	if len(s) == 0 do return 0
+	n := 0
+	if ts.engine == nil {
+		cols := max(int(max_w / (f32(size) * 0.5)), 0)
+		for _, i in s {
+			if cols == 0 do return max(i, first_rune_len(s))
+			cols -= 1
+		}
+		return len(s)
+	}
+	if font := text_get_font(ts, id, size); font != nil {
+		mw: i32
+		ml: uint
+		_ = ttf.MeasureString(font, cstring(raw_data(s)), uint(len(s)), i32(max_w * ts.scale), &mw, &ml)
+		n = int(ml)
+	}
+	return max(n, first_rune_len(s))
+}
+
+// The character boundary in `s` nearest to x.
+text_index_at :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, x: f32) -> int {
+	if x <= 0 || len(s) == 0 do return 0
+	i := min(text_fit(ts, id, size, s, x), len(s))
+	if text_width(ts, id, size, s[:i]) > x do i = 0 // the first character alone is wider
+	if i >= len(s) do return len(s)
+	_, n := utf8.decode_rune_in_string(s[i:])
+	left := text_width(ts, id, size, s[:i])
+	right := text_width(ts, id, size, s[:i + n])
+	return x - left <= right - x ? i : i + n
+}
+
+@(private = "file")
+first_rune_len :: proc(s: string) -> int {
+	_, n := utf8.decode_rune_in_string(s)
+	return n
 }
 
 measure_text :: proc "c" (text: clay.StringSlice, config: ^clay.TextElementConfig, user_data: rawptr) -> clay.Dimensions {

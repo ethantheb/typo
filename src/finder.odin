@@ -329,6 +329,7 @@ finder_results :: proc() {
 	}
 
 	rows := min(len(f.results), FINDER_VISIBLE_ROWS)
+	smooth_scroll_list(clay.ID("FinderResults"))
 	if clay.UI(clay.ID("FinderResults"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(f32(rows) * FINDER_ROW_HEIGHT)}, layoutDirection = .TopToBottom},
 		clip = {vertical = true, horizontal = true, childOffset = clay.GetScrollOffset()},

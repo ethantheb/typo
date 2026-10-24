@@ -16,14 +16,17 @@ python build.py --perf     performance suite only
 
 `build.py` also builds the dependencies as static libraries (tree-sitter with clang,
 libghostty-vt with a pinned Zig, SDL3 and SDL3_ttf with CMake) and on Windows fetches the
-ConPTY files that `src/term/pty_windows.odin` embeds. The fonts are embedded too, so the
+ConPTY files that `src/term/pty_windows.odin` embeds. The fonts and the window icon
+(`assets/icon`, also the Windows executable's icon via `typo.rc`) are embedded too, so the
 executable is the only runtime file. Run it once before using `odin` directly. Quick type
 check: `odin check src -vet-unused -vet-unused-imports`.
 
 The performance suite (`src/perf.odin`) is an optimized build run as `typo-perf --perf`.
-It opens a real window, runs scripted phases (startup, buffer, syntax, fuzzy search, VT
-parsing, typing, scrolling, huge files, the finder, the settings window and its theme
-and font lists, terminal redraws and shell output, idle CPU/GPU), prints a table and
+It opens a real window, runs scripted phases (startup, buffer, syntax, Markdown parsing,
+fuzzy search, VT parsing, typing, scrolling, rendered Markdown (opening, scrolling,
+typing, moving through long tables and code blocks, typed spaces and tabs measured
+with the real fonts), huge files, the finder, the settings window and its theme and
+font lists, terminal redraws and shell output, idle CPU/GPU), prints a table and
 exits non-zero if any result exceeds its limit. It ignores real keyboard and mouse
 input. Its CPU and GPU figures are for its own process only, but they are affected by
 load from other programs (e.g. other typo instances), so an idle result just over its
@@ -43,8 +46,9 @@ src/                 package editor: the app
                      controls), which the panel animates into, docked at the side with
                      the rest of the window still usable
   theme.odin         Built-in themes (THEMES, as hex Theme_Spec values)
-  fonts.odin         Bundled IBM Plex Mono weights, installed monospace font scan
-                     (background thread), family + weight -> Font_Source
+  fonts.odin         Bundled IBM Plex Mono weights and IBM Plex Sans (rendered Markdown),
+                     installed font scan (background thread; monospace families for the
+                     editor, all for Markdown), family + weight -> Font_Source
   text.odin          Font ids and their sources, fallback fonts, cached ttf.Text,
                      measurement
   renderer_sdl.odin  Clay render commands -> SDL draw calls; draw_text, fill_rect, clips,
@@ -53,11 +57,21 @@ src/                 package editor: the app
                      modal/modal_at, ask (message box), clicked/pointer_in hit tests,
                      transition (Clay transitions), element_at
   scrollbar.odin     Scroll bars: geometry, dragging, look; list_scrollbar for any Clay
-                     scroll container (the editor draws its own from the same parts)
+                     scroll container (the editor draws its own from the same parts);
+                     smooth wheel scrolling (update_scroll_containers, smooth_scroll_list)
   layout.odin        Window layout: sidebar, editor pane, terminal panel and splitter,
                      status bar, focus, mouse cursor
   editor.odin        Editor: open/save, multi-selection, movement, editing, clipboard, keys
   editor_view.odin   Editor per-frame update, mouse, scrolling, scrollbar, drawing
+  md_view.odin       Rendered Markdown view: mode toggle, height map, caches, caret
+                     movement by visual row, code blocks scrolled sideways, reveal-aware
+                     drawing
+  md_layout.odin     Rendered Markdown layout: a line's items (shown/hidden bytes,
+                     widgets) wrapped into rows of runs; tables; layout cache keys
+  md_edit.odin       Rendered Markdown editing keys (md_handle_key): lists and quotes
+                     continued by Enter, nested by Tab, indentation deleted by level
+  md_media.odin      Rendered Markdown links (Ctrl+click) and images (decoded on
+                     threads with vendor:stb/image, uploaded as textures)
   terminal.odin      Terminal: session lifecycle, row cache, drawing
   terminal_input.odin  Keyboard/mouse -> terminal input
   finder.odin        Ctrl+E file finder (background indexer, incremental search)
@@ -65,9 +79,15 @@ src/                 package editor: the app
   workspace.odin     Lazy file tree, folder dialog
   fs_walk*.odin      Recursive file listing (FindFirstFileW on Windows)
   perf*.odin         Performance suite and its CPU/GPU counters
-  editor_test.odin   Unit tests for the main package
+  editor_test.odin   Unit tests for the main package (md_view_test.odin: rendered Markdown;
+                     keys replayed through the key handlers, in scripted sequences and
+                     at every caret position of sample documents, checking that the
+                     incremental parse matches a full one, the caret is never in hidden
+                     text and what is typed is drawn)
 src/buffer/          Piece table in a treap, newline index, undo history, change log
 src/syntax/          Highlighter: tree-sitter backend (Odin, TOML) and line lexer (others)
+src/markdown/        Markdown (CommonMark + GFM + extras): incremental line-by-line block
+                     parser, inline parser, text-view highlighting
 src/term/            libghostty-vt bindings, Session (vt + pty + reader thread), ptys
 src/toml/            Minimal TOML reader for settings
 vendor/              clay-odin, tree-sitter, tree-sitter-odin, tree-sitter-toml (do not edit);
@@ -97,6 +117,9 @@ all there. In particular:
   everything drawn inside the element, editor and terminal included.
 - A clipping element (`clip`) is a Clay scroll container and takes the mouse wheel from
   scroll containers inside it; clip a moving panel only while it moves.
+- **Scrolling** goes through `update_scroll_containers` (scrollbar.odin) instead of
+  `clay.UpdateScrollContainers`, which eases wheel scrolling for lists registered with
+  `smooth_scroll_list` (`list_scrollbar` does that).
 
 ## How a frame works
 
@@ -117,6 +140,30 @@ awake, and `schedule_next_frame` sets a timer only for a blinking cursor. Other 
 Strings referenced by this frame's render commands must stay alive until it is drawn,
 which is why opening files and folders goes through `g.pending` (applied next frame),
 and why per-frame strings use the temp allocator.
+
+## Markdown
+
+Markdown files have an `Editor.md` (`markdown.Doc`): per-line block info, reparsed
+incrementally from `buffer.take_changes` (`doc_edit`, `doc_update`); a line's info
+depends only on the previous line's end state, and setext headings and table headers
+are found by looking at the next line. Inlines are parsed per block when needed.
+The parser follows CommonMark (indented code included) with two deviations for live
+editing: a lone list marker followed by a space ("- ", "1. "), or inside a list item,
+starts an item, and a single "-" is not a heading underline.
+
+The text view colors it through `markdown.highlight_range`. The rendered view
+(`md_rendered`) is the same document and selections drawn by `draw_markdown`: syntax
+is hidden except where a selection touches it (a line's block markers, a span's
+inline markers, a whole fence or table), and the whitespace of the caret's line is
+shown, so a caret is never in hidden text and whatever is typed is drawn. The only
+exception is indentation that Markdown treats as syntax (before a marker, or between
+a marker and the text); the caret is drawn where the text starts. Code that assumes
+one row per line and a fixed column width (scrolling, hit testing, vertical movement)
+branches on `md_rendered`. Its caches (`md_begin`) are in two parts: per document
+(paragraph inlines, tables, code block extents and widths, code highlights) and per
+document and selections (each line's layout). Editing keys take separate paths:
+`editor_handle_key` sends the rendered view to `md_handle_key`, and the text view
+edits like any other file; only caret movement (`navigation_key`) is shared.
 
 ## Conventions
 

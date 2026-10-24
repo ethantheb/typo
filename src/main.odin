@@ -7,6 +7,7 @@ import "core:path/filepath"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
+import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
 
@@ -44,6 +45,7 @@ App :: struct {
 
 	workspace:       Workspace,
 	editor:          Editor,
+	md_modes:        map[string]Md_Mode, // Markdown files toggled this session, by path
 	terminal_panel:  Terminal_Panel,
 	focus:           Focus,
 	sidebar_visible: bool,
@@ -105,6 +107,7 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	}
 	// Shown once the first frame is drawn (see app_iterate), so it never appears empty.
 	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN})
+	set_window_icon()
 	if g.window == nil {
 		sdl.Log("SDL_CreateWindow failed: %s", sdl.GetError())
 		return .FAILURE
@@ -195,10 +198,13 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_window_metrics()
 	clay.SetLayoutDimensions({f32(g.window_w), f32(g.window_h)})
 	clay.SetPointerState(g.mouse_pos, g.mouse_down)
-	clay.UpdateScrollContainers(false, g.wheel * 3, g.dt)
+	update_scroll_containers()
 
 	settings_poll(&g.settings)
-	if fonts_poll(&g.fonts) do apply_editor_font()
+	if fonts_poll(&g.fonts) {
+		apply_editor_font()
+		apply_markdown_font()
+	}
 	apply_pending_action()
 	update_focus()
 	finder_frame()
@@ -239,7 +245,9 @@ needs_continuous_frames :: proc() -> bool {
 	     finder_busy(),
 	     e.dragging && g.mouse_down, // edge auto-scroll
 	     e.status == .Text && syntax.highlighter_busy(&e.hl, &e.buf),
+	     e.md != nil && markdown.doc_busy(e.md),
 	     editor_scrolling(e) || e.scrollbar_drag != nil,
+	     smooth_scrolling(),
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
 	     g.animating,
@@ -365,8 +373,11 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	settings_window_destroy()
 	settings_destroy(&g.settings)
 	fonts_destroy(&g.fonts)
+	md_images_destroy()
 	destroy_mouse_cursors()
 	editor_destroy(&g.editor)
+	for path in g.md_modes do delete(path)
+	delete(g.md_modes)
 	workspace_destroy(&g.workspace)
 	text_destroy(&g.text)
 	delete(g.clay_memory)
@@ -390,6 +401,33 @@ update_window_metrics :: proc() {
 clay_error_handler :: proc "c" (error: clay.ErrorData) {
 	context = g.ctx
 	sdl.Log("Clay error: %.*s", error.errorText.length, error.errorText.chars)
+}
+
+// The window's icon at a few sizes, for SDL to pick the nearest.
+@(private = "file")
+ICON_PNGS := [?][]u8 {
+	#load("../assets/icon/typo-192.png"),
+	#load("../assets/icon/typo-32.png"),
+	#load("../assets/icon/typo-16.png"),
+}
+
+@(private = "file")
+set_window_icon :: proc() {
+	if g.window == nil do return
+	icon: ^sdl.Surface
+	for png in ICON_PNGS {
+		s := sdl.LoadPNG_IO(sdl.IOFromConstMem(raw_data(png), uint(len(png))), true)
+		if s == nil do continue
+		if icon == nil {
+			icon = s
+			continue
+		}
+		_ = sdl.AddSurfaceAlternateImage(icon, s)
+		sdl.DestroySurface(s)
+	}
+	if icon == nil do return
+	_ = sdl.SetWindowIcon(g.window, icon)
+	sdl.DestroySurface(icon)
 }
 
 // --- Actions --------------------------------------------------------------------

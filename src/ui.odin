@@ -123,6 +123,10 @@ Icon :: enum u8 {
 	Terminal,
 	Maximize,
 	Restore,
+	Eye,
+	Code,
+	Check,
+	Image_Off,
 }
 
 // Codepoints in assets/fonts/lucide.ttf (see lucide-static's font/codepoints.json).
@@ -137,6 +141,10 @@ ICON_GLYPHS := [Icon]string {
 	.Terminal      = "", // square-terminal
 	.Maximize      = "", // maximize-2
 	.Restore       = "", // minimize-2
+	.Eye           = "",
+	.Code          = "",
+	.Check         = "",
+	.Image_Off     = "",
 }
 
 // What a Clay custom element asks the renderer to draw.

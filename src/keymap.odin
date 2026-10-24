@@ -23,6 +23,7 @@ Command :: enum {
 	Paste,
 	Add_Cursor_Above,
 	Add_Cursor_Below,
+	Toggle_Markdown_View,
 }
 
 Command_Info :: struct {
@@ -47,6 +48,7 @@ COMMANDS := [Command]Command_Info {
 	.Paste             = {"paste", "Paste", {"Ctrl+V"}},
 	.Add_Cursor_Above  = {"add_cursor_above", "Add cursor above", {"Ctrl+Alt+Up"}},
 	.Add_Cursor_Below  = {"add_cursor_below", "Add cursor below", {"Ctrl+Alt+Down"}},
+	.Toggle_Markdown_View = {"toggle_markdown_view", "Toggle Markdown view", {"Ctrl+Shift+V"}},
 }
 
 // App commands that still work while the terminal has focus; every other chord

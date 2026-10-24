@@ -24,6 +24,13 @@ Theme :: struct {
 	current_line: clay.Color,
 	caret:        clay.Color,
 	backdrop:     clay.Color, // dims the window behind modal popups
+	// Rendered Markdown, derived from the colors above.
+	md_code_bg:   clay.Color, // code blocks and code spans
+	md_mark_bg:   clay.Color, // ==highlighted== text
+	md_heading:   clay.Color,
+	md_link:      clay.Color,
+	md_marker:    clay.Color, // syntax shown where the caret is
+	md_rule:      clay.Color, // quote bars, thematic breaks, table lines
 	syntax:       [syntax.Highlight]clay.Color,
 	ansi:         [16]clay.Color, // terminal colors 0-15: black red green yellow blue magenta cyan white, then bright
 }
@@ -451,5 +458,18 @@ theme_from_spec :: proc "contextless" (s: Theme_Spec) -> (t: Theme) {
 	}
 	for c, h in s.syntax do t.syntax[h] = rgb(c)
 	for c, i in s.ansi do t.ansi[i] = rgb(c)
+	t.md_code_bg = mix(t.bg, t.text, s.dark ? 0.07 : 0.05)
+	t.md_mark_bg = t.ansi[3]
+	t.md_mark_bg.a = s.dark ? 70 : 90
+	t.md_heading = t.text_bright
+	t.md_link = t.accent
+	t.md_marker = t.text_faint
+	t.md_rule = mix(t.bg, t.text, 0.22)
 	return
+}
+
+// a + (b - a) * f, opaque.
+@(private = "file")
+mix :: proc "contextless" (a, b: clay.Color, f: f32) -> clay.Color {
+	return {a.r + (b.r - a.r) * f, a.g + (b.g - a.g) * f, a.b + (b.b - a.b) * f, 255}
 }

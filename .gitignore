@@ -1,3 +1,5 @@
 build/
 *.pdb
 *.exe
+*.res
+resume.txt

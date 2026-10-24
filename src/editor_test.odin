@@ -227,17 +227,33 @@ test_themes :: proc(t: ^testing.T) {
 @(test)
 test_font_weights :: proc(t: ^testing.T) {
 	sf: System_Fonts
-	regular, bold, found := font_family_sources(&sf, BUNDLED_FAMILY, 500)
+	regular, bold, italic, found := font_family_sources(&sf, BUNDLED_FAMILY, 500)
 	testing.expect(t, found)
 	testing.expect(t, raw_data(regular.data) == raw_data(BUNDLED_FACES[3].data))
 	testing.expect(t, raw_data(bold.data) == raw_data(BUNDLED_FACES[5].data))
-	regular, bold, _ = font_family_sources(&sf, BUNDLED_FAMILY, 100)
+	testing.expect(t, raw_data(italic.data) == raw_data(BUNDLED_FACES[7].data) && !italic.synthetic_italic)
+	regular, bold, _, _ = font_family_sources(&sf, BUNDLED_FAMILY, 100)
 	testing.expect(t, raw_data(regular.data) == raw_data(BUNDLED_FACES[0].data))
 	// Nothing heavier than Bold: bold text uses it too.
-	regular, bold, _ = font_family_sources(&sf, BUNDLED_FAMILY, 900)
+	regular, bold, _, _ = font_family_sources(&sf, BUNDLED_FAMILY, 900)
 	testing.expect(t, raw_data(bold.data) == raw_data(BUNDLED_FACES[5].data))
-	_, _, found = font_family_sources(&sf, "Not A Font", 400)
+	_, _, _, found = font_family_sources(&sf, "Not A Font", 400)
 	testing.expect(t, !found)
+
+	md, md_found := markdown_family_sources(&sf, BUNDLED_MD_FAMILY)
+	testing.expect(t, md_found)
+	testing.expect(t, raw_data(md[.Bold_Italic].data) == raw_data(BUNDLED_MD_FACES[4].data))
+	testing.expect(t, raw_data(md[.SemiBold].data) == raw_data(BUNDLED_MD_FACES[1].data))
+	// A family without italics slants its upright faces.
+	md, _ = markdown_family_sources(&sf, BUNDLED_FAMILY)
+	testing.expect(t, raw_data(md[.Italic].data) == raw_data(BUNDLED_FACES[6].data) && !md[.Italic].synthetic_italic)
+	sf.families = make([dynamic]Font_Family)
+	defer delete(sf.families)
+	append(&sf.families, Font_Family{name = "Upright", faces = make([dynamic]Font_Face)})
+	defer delete(sf.families[0].faces)
+	append(&sf.families[0].faces, Font_Face{weight = 400})
+	md, _ = markdown_family_sources(&sf, "Upright")
+	testing.expect(t, md[.Italic].synthetic_italic && !md[.Regular].synthetic_italic)
 }
 
 // A fresh install writes the defaults; they must load back without problems.

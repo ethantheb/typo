@@ -59,6 +59,7 @@ Setting_Item :: union {
 // Settings adjusted in a picker's panel along with its list, shown below it, so
 // the editor can be watched while changing them.
 FONT_EXTRAS := [?]Setting{.Font_Size, .Font_Weight, .Line_Height, .Letter_Spacing}
+MARKDOWN_FONT_EXTRAS := [?]Setting{.Markdown_Font_Size, .Markdown_Line_Height, .Markdown_Max_Width}
 
 // An entry in a picker's list.
 Picker_Option :: struct {
@@ -351,7 +352,7 @@ open_picker :: proc(x: Setting) {
 	w.picker_reveal = true
 	w.extra_focus = -1
 	if i, ok := theme_index(g.settings.theme); ok do w.dark_themes = THEMES[i].dark
-	if x == .Font_Family do fonts_scan(&g.fonts, again = true)
+	if x == .Font_Family || x == .Markdown_Font do fonts_scan(&g.fonts, again = true)
 }
 
 // Leaves the list, keeping what is now applied or restoring the old values.
@@ -372,7 +373,8 @@ close_picker :: proc(commit: bool) {
 @(private = "file")
 picker_extras :: proc(x: Setting) -> []Setting {
 	#partial switch x {
-	case .Font_Family: return FONT_EXTRAS[:]
+	case .Font_Family:   return FONT_EXTRAS[:]
+	case .Markdown_Font: return MARKDOWN_FONT_EXTRAS[:]
 	}
 	return nil
 }
@@ -488,6 +490,8 @@ picker_options :: proc(x: Setting, filter: string) -> []Picker_Option {
 		for spec in THEMES do if spec.dark == g.settings_window.dark_themes do append(&all, Picker_Option{spec.key, spec.name, ""})
 	case .Font_Family:
 		for name in font_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
+	case .Markdown_Font:
+		for name in markdown_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
 	}
 	if filter == "" do return all[:]
 	query := strings.to_lower(filter, context.temp_allocator)
@@ -771,7 +775,7 @@ segmented :: proc(x: Setting, options: []string, selected: int, within := clay.E
 			id := clay.ID("SettingOption", u32(x) * 64 + u32(i))
 			is_selected := i == selected
 			if clay.UI(id)({
-				layout = {sizing = {width = clay.SizingFixed(64), height = clay.SizingFixed(26)}, childAlignment = {x = .Center, y = .Center}},
+				layout = {sizing = {width = clay.SizingFit({min = 64}), height = clay.SizingFixed(26)}, padding = {left = 10, right = 10}, childAlignment = {x = .Center, y = .Center}},
 				backgroundColor = is_selected ? theme.selected : (clay.Hovered() ? theme.hover : {}),
 				cornerRadius = clay.CornerRadiusAll(4),
 			}) {
@@ -824,7 +828,7 @@ picker_button :: proc(x: Setting, value: string) {
 	#partial switch x {
 	case .Theme:
 		if i, ok := theme_index(value); ok do text = THEMES[i].name
-	case .Font_Family:
+	case .Font_Family, .Markdown_Font:
 		missing = font_family_missing(&g.fonts, value)
 	}
 	if clay.UI(id)({
@@ -844,7 +848,7 @@ picker_button :: proc(x: Setting, value: string) {
 		icon(.Chevron_Right, theme.text_dim, 15)
 	}
 	if clicked(id, clay.ID("SettingsList")) do open_picker(x)
-	tooltip(id, missing ? "Not installed; showing " + BUNDLED_FAMILY : "Choose", "Enter")
+	tooltip(id, missing ? (x == .Markdown_Font ? "Not installed; showing " + BUNDLED_MD_FAMILY : "Not installed; showing " + BUNDLED_FAMILY) : "Choose", "Enter")
 }
 
 // A one-line text field; click or Enter to edit. Shows the default, dimmed, when empty.
@@ -977,7 +981,7 @@ picker_page :: proc(width: f32) {
 			for o, i in options do option_row(x, o, i, o.value == current, list)
 			note := ""
 			switch {
-			case x == .Font_Family && !g.fonts.scanned:         note = "Looking for installed fonts…"
+			case (x == .Font_Family || x == .Markdown_Font) && !g.fonts.scanned: note = "Looking for installed fonts…"
 			case len(options) == 0:                              note = "No matches"
 			}
 			if note != "" {
@@ -1060,7 +1064,7 @@ option_row :: proc(x: Setting, o: Picker_Option, index: int, selected: bool, lis
 			if i, ok := theme_index(o.value); ok do theme_swatch(THEMES[i])
 		}
 		label(o.label, selected ? theme.text_bright : theme.text)
-		if x == .Font_Family && o.value == BUNDLED_FAMILY {
+		if (x == .Font_Family && o.value == BUNDLED_FAMILY) || (x == .Markdown_Font && (o.value == BUNDLED_MD_FAMILY || o.value == BUNDLED_FAMILY)) {
 			push_right()
 			label("bundled", theme.text_dim, FONT_SIZE_SMALL)
 		}

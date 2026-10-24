@@ -8,6 +8,7 @@ import "core:strings"
 import "core:time"
 
 import "buffer"
+import "markdown"
 import "syntax"
 import "term"
 import sdl "../vendor/sdl3"
@@ -30,6 +31,7 @@ Perf :: struct {
 	begin:      time.Tick,
 	dir:        string, // temp folder: the workspace and generated files
 	code_text:  string, // generated Odin source, small enough for tree-sitter
+	md_text:    string, // generated Markdown
 	large_text: string, // the same at ~64 MB, highlighted by the lexer
 
 	phase:      int,
@@ -73,12 +75,18 @@ PHASES := [?]Phase {
 	{name = "generate test files", step = phase_generate},
 	{name = "buffer (64 MB)", step = phase_buffer},
 	{name = "syntax", step = phase_syntax},
+	{name = "markdown", step = phase_markdown},
 	{name = "fuzzy file search", step = phase_fuzzy},
 	{name = "terminal emulation", step = phase_vt},
 	{name = "open code file (tree-sitter)", step = phase_open_code, frame_limit = 8},
 	{name = "idle with a file open", step = phase_idle, idle = true},
 	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8},
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
+	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
+	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
+	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
+	{name = "moving through a table and code block (rendered)", step = phase_move_markdown, frame_limit = 8},
+	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
@@ -115,6 +123,7 @@ perf_end :: proc() {
 	_ = os.remove_all(p.dir)
 	delete(p.dir)
 	delete(p.code_text)
+	delete(p.md_text)
 	delete(p.large_text)
 	delete(p.frames)
 	for f in p.failures do delete(f)
@@ -290,11 +299,60 @@ generate_code :: proc(bytes: int) -> string {
 	return strings.to_string(sb)
 }
 
+MARKDOWN_TEMPLATE :: `## Section %d
+
+Some *emphasis* and **strong** text with ` + "`code`" + ` and a [link](https://example.com/%d).
+A second line of the same paragraph, long enough to wrap in a narrow window.
+
+- item one with ~~strike~~
+- [ ] task %d
+  - nested item
+
+> A quote with a lazy
+continuation line.
+
+| a | b |
+|---|:-:|
+| %d | x |
+
+` + "```odin" + `
+x := %d
+` + "```" + `
+
+`
+
+@(private = "file")
+generate_markdown :: proc(bytes: int) -> string {
+	sb := strings.builder_make_len_cap(0, bytes + 512)
+	strings.write_string(&sb, "# Notes\n\n")
+	for i := 0; strings.builder_len(sb) < bytes; i += 1 {
+		fmt.sbprintf(&sb, MARKDOWN_TEMPLATE, i, i, i, i, i)
+	}
+	return strings.to_string(sb)
+}
+
+// A long table followed by a long code block, its lines wider than the column.
+@(private = "file")
+generate_markdown_blocks :: proc() -> string {
+	sb := strings.builder_make()
+	strings.write_string(&sb, "# Blocks\n\nSome text.\n\n| name | value | note |\n|---|:-:|--:|\n")
+	for i in 0 ..< 300 do fmt.sbprintf(&sb, "| row %d | **%d** | `x` |\n", i, i)
+	strings.write_string(&sb, "\n```odin\n")
+	for i in 0 ..< 1500 do fmt.sbprintf(&sb, "value_%d := compute(%d, \"a line long enough to scroll sideways in its box\") // %d\n", i, i, i)
+	strings.write_string(&sb, "```\n")
+	return strings.to_string(sb)
+}
+
 @(private = "file")
 phase_generate :: proc(p: ^Perf, frame: int) -> bool {
 	t := time.tick_now()
 	p.code_text = generate_code(400 << 10)
 	p.large_text = generate_code(64 << 20)
+	p.md_text = generate_markdown(4 << 20)
+	_ = os.write_entire_file(path_in_dir(p, "notes.md"), p.md_text)
+	blocks := generate_markdown_blocks()
+	_ = os.write_entire_file(path_in_dir(p, "blocks.md"), transmute([]u8)blocks)
+	delete(blocks)
 	_ = os.write_entire_file(path_in_dir(p, "code.odin"), p.code_text)
 	_ = os.write_entire_file(path_in_dir(p, "large.odin"), p.large_text)
 
@@ -307,7 +365,7 @@ phase_generate :: proc(p: ^Perf, frame: int) -> bool {
 	for i := 0; strings.builder_len(flood) < 4 << 20; i += 1 do fmt.sbprintf(&flood, "%08d The quick brown fox jumps over the lazy dog, again and again and again.\n", i)
 	_ = os.write_entire_file(path_in_dir(p, "flood.txt"), strings.to_string(flood))
 	strings.builder_destroy(&flood)
-	fmt.printfln("  %-36s %10s ms", "generated 76 MB in 4 files", fmt.tprintf("%.3f", ms_since(t)))
+	fmt.printfln("  %-36s %10s ms", "generated 80 MB in 5 files", fmt.tprintf("%.3f", ms_since(t)))
 	return true
 }
 
@@ -386,6 +444,52 @@ phase_syntax :: proc(p: ^Perf, frame: int) -> bool {
 	return true
 }
 
+@(private = "file")
+phase_markdown :: proc(p: ^Perf, frame: int) -> bool {
+	b: buffer.Buffer
+	buffer.buffer_init(&b, transmute([]u8)strings.clone(p.md_text))
+	defer buffer.buffer_destroy(&b)
+	doc: markdown.Doc
+	defer markdown.doc_destroy(&doc)
+	t := time.tick_now()
+	markdown.doc_open(&doc, &b)
+	markdown.doc_update(&doc, &b, max(int), time.Hour)
+	result(p, fmt.tprintf("block parse (%d MB)", len(p.md_text) >> 20), ms_since(t), "ms", 40)
+
+	EDITS :: 50
+	mid_line := buffer.line_count(&b) / 2
+	mid := buffer.line_start(&b, mid_line)
+	t = time.tick_now()
+	for i in 0 ..< EDITS {
+		buffer.begin(&b, .Typing, u64(i), {})
+		buffer.replace(&b, mid + i, 0, "x")
+		buffer.end(&b, {})
+		markdown.doc_edit(&doc, buffer.take_changes(&b))
+		markdown.doc_update(&doc, &b, mid_line + 60, markdown.PARSE_BUDGET)
+	}
+	result(p, "block re-parse per keystroke", ms_since(t) / EDITS * 1000, "µs", 100)
+
+	// Text view highlighting: blocks, inlines and fenced code for 60 lines.
+	end := buffer.line_start(&b, mid_line + 60)
+	hl := make([]syntax.Highlight, end - mid, context.temp_allocator)
+	styles := make([]markdown.Text_Styles, end - mid, context.temp_allocator)
+	RUNS :: 20
+	t = time.tick_now()
+	for _ in 0 ..< RUNS do markdown.highlight_range(&doc, &b, mid, hl, styles)
+	result(p, "highlight one screen", ms_since(t) / RUNS, "ms", 0.5)
+
+	// An unclosed fence turns the rest of the file into code: the visible part
+	// is parsed at once, the rest in later frames.
+	buffer.begin(&b, .Other, EDITS, {})
+	buffer.replace(&b, mid, 0, "```\n")
+	buffer.end(&b, {})
+	markdown.doc_edit(&doc, buffer.take_changes(&b))
+	t = time.tick_now()
+	markdown.doc_update(&doc, &b, mid_line + 60 + markdown.LOOKAHEAD_LINES, markdown.PARSE_BUDGET)
+	result(p, "re-parse after opening a fence (frame)", ms_since(t), "ms", 3)
+	return true
+}
+
 // Average time to highlight the 60 lines from `offset`.
 @(private = "file")
 highlight_screen :: proc(h: ^syntax.Highlighter, b: ^buffer.Buffer, offset: int) -> f64 {
@@ -448,6 +552,65 @@ phase_open_code :: proc(p: ^Perf, frame: int) -> bool {
 }
 
 @(private = "file")
+phase_open_markdown :: proc(p: ^Perf, frame: int) -> bool {
+	if frame == 0 {
+		open_timed(p, "notes.md")
+		check(p, "opens rendered", md_rendered(&g.editor))
+	}
+	return frame == 30
+}
+
+// Moves the caret down a line per frame, from a long table into a long code block.
+@(private = "file")
+phase_move_markdown :: proc(p: ^Perf, frame: int) -> bool {
+	e := &g.editor
+	if frame == 0 {
+		open_timed(p, "blocks.md")
+		md_show_caret(e)
+		at := buffer.line_start(&e.buf, 252)
+		set_single_selection(e, {at, at, -1})
+		e.reveal = true
+		return false
+	}
+	editor_move(e, .Down, false)
+	return frame == 120
+}
+
+// A space or tab typed after a heading, on a blank line and after a paragraph
+// moves the caret, measured with the real fonts.
+@(private = "file")
+phase_md_whitespace :: proc(p: ^Perf, frame: int) -> bool {
+	if frame > 0 do return true
+	e := &g.editor
+	moves :: proc(e: ^Editor, line: int, key: sdl.Keycode) -> bool {
+		settle :: proc(e: ^Editor) {
+			editor_take_changes(e)
+			markdown.doc_update(e.md, &e.buf, max(int), time.Hour)
+		}
+		at := buffer.line_end(&e.buf, line)
+		set_single_selection(e, {at, at, -1})
+		before := md_caret(e, at).x
+		if key == sdl.K_SPACE {
+			editor_text_input(e, " ")
+		} else {
+			editor_handle_key(e, {key = key})
+		}
+		settle(e)
+		after := md_caret(e, e.sels[0].head).x
+		editor_undo(e)
+		settle(e)
+		return after > before
+	}
+	check(p, "space after a heading", moves(e, 0, sdl.K_SPACE))
+	check(p, "tab after a heading", moves(e, 0, sdl.K_TAB))
+	check(p, "space on a blank line", moves(e, 1, sdl.K_SPACE))
+	check(p, "tab on a blank line", moves(e, 1, sdl.K_TAB))
+	check(p, "space after a paragraph", moves(e, 2, sdl.K_SPACE))
+	check(p, "tab after a paragraph", moves(e, 2, sdl.K_TAB))
+	return false
+}
+
+@(private = "file")
 phase_open_large :: proc(p: ^Perf, frame: int) -> bool {
 	if frame == 0 do open_timed(p, "large.odin")
 	return frame == 30
@@ -475,6 +638,7 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 	e := &g.editor
 	if frame == 0 {
 		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
+		md_show_caret(e)
 		set_single_selection(e, {mid, mid, -1})
 		e.reveal = true
 		return false

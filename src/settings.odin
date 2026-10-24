@@ -31,6 +31,11 @@ Settings :: struct {
 	bundled_conpty: bool,   // Windows only
 	renderer:       string, // SDL render backend; applies on restart
 	show_fps:       bool,
+	markdown_view:      string, // "rendered" or "text"
+	markdown_font:      string,
+	markdown_font_size: int,
+	markdown_line_height: f64, // times the font size
+	markdown_max_width: int, // logical pixels; 0 = the pane's width
 	bindings:       Bindings,
 
 	path:           string,    // settings.toml
@@ -55,12 +60,18 @@ Setting :: enum {
 	Bundled_Conpty,
 	Renderer,
 	Show_Fps,
+	Markdown_View,
+	Markdown_Font,
+	Markdown_Font_Size,
+	Markdown_Line_Height,
+	Markdown_Max_Width,
 }
 
 // Sections of settings.toml and the settings window, in order.
 Section :: enum {
 	Appearance,
 	Font,
+	Markdown,
 	Keybindings,
 	Terminal,
 	Advanced,
@@ -69,6 +80,7 @@ Section :: enum {
 SECTION_KEYS := [Section]string {
 	.Appearance  = "appearance",
 	.Font        = "font",
+	.Markdown    = "markdown",
 	.Keybindings = "keybindings",
 	.Terminal    = "terminal",
 	.Advanced    = "advanced",
@@ -88,6 +100,7 @@ Setting_Info :: struct {
 }
 
 RENDERERS := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
+MARKDOWN_VIEWS := [?]string{"rendered", "text"}
 
 SETTINGS := [Setting]Setting_Info {
 	.Theme = {
@@ -149,6 +162,35 @@ SETTINGS := [Setting]Setting_Info {
 		description = "Redraw every frame and show the frame rate in the status bar.", keywords = "frame rate performance",
 		default = false,
 	},
+	.Markdown_View = {
+		section = .Markdown, key = "view", name = "Open Markdown as",
+		description = "How Markdown files open: \"rendered\" (editable, with the syntax shown where the caret is) or \"text\". Toggle a file with the eye in the status bar.",
+		keywords = "markdown preview rendered source live",
+		default = "rendered", choices = MARKDOWN_VIEWS[:],
+	},
+	.Markdown_Font = {
+		section = .Markdown, key = "font", name = "Markdown font",
+		description = "Font for rendered Markdown text: the bundled IBM Plex Sans or an installed font. Code uses the editor font.",
+		keywords = "markdown font family typeface prose",
+		default = BUNDLED_MD_FAMILY, picker = true,
+	},
+	.Markdown_Font_Size = {
+		section = .Markdown, key = "font_size", name = "Markdown font size",
+		description = "Text size of rendered Markdown; headings are larger.", keywords = "markdown font text zoom",
+		default = int(16), min = 10, max = 32,
+	},
+	.Markdown_Line_Height = {
+		section = .Markdown, key = "line_height", name = "Markdown line height",
+		description = "Space from one line of rendered Markdown to the next, as a multiple of the font size.",
+		keywords = "markdown spacing leading",
+		default = f64(1.7), min = 1.2, max = 2.5, step = 0.05,
+	},
+	.Markdown_Max_Width = {
+		section = .Markdown, key = "max_width", name = "Markdown text width",
+		description = "Widest rendered Markdown text, in pixels, centered in the pane. 0 uses the whole pane. Wider tables may extend past it.",
+		keywords = "markdown readable line length width column wrap",
+		default = int(760), min = 0, max = 4000, step = 20,
+	},
 }
 
 SETTINGS_POLL_MS :: 500
@@ -173,6 +215,11 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Bundled_Conpty: return &s.bundled_conpty
 	case .Renderer:       return &s.renderer
 	case .Show_Fps:       return &s.show_fps
+	case .Markdown_View:      return &s.markdown_view
+	case .Markdown_Font:      return &s.markdown_font
+	case .Markdown_Font_Size: return &s.markdown_font_size
+	case .Markdown_Line_Height: return &s.markdown_line_height
+	case .Markdown_Max_Width: return &s.markdown_max_width
 	}
 	return nil
 }
@@ -450,6 +497,15 @@ apply_settings :: proc() {
 	theme = theme_by_name(g.settings.theme)
 	terminal_apply_theme(&g.terminal_panel.terminal)
 	apply_editor_font()
+	apply_markdown_font()
+}
+
+// Points rendered Markdown at the configured family, like apply_editor_font.
+apply_markdown_font :: proc() {
+	if g.text.engine == nil do return
+	sources, found := markdown_family_sources(&g.fonts, g.settings.markdown_font)
+	if !found do fonts_scan(&g.fonts)
+	for src, face in sources do text_set_source(&g.text, MD_FONTS[face], src)
 }
 
 // Points the editor and terminal at the configured family. One that isn't
@@ -457,8 +513,9 @@ apply_settings :: proc() {
 // (see app_iterate).
 apply_editor_font :: proc() {
 	if g.text.engine == nil do return
-	regular, bold, found := font_family_sources(&g.fonts, g.settings.font_family, g.settings.font_weight)
+	regular, bold, italic, found := font_family_sources(&g.fonts, g.settings.font_family, g.settings.font_weight)
 	if !found do fonts_scan(&g.fonts)
 	text_set_source(&g.text, .Editor, regular)
 	text_set_source(&g.text, .Editor_Bold, bold)
+	text_set_source(&g.text, .Editor_Italic, italic)
 }
