@@ -66,6 +66,10 @@ Md_View :: struct {
 	},
 	token:           u64,
 	memo:            map[int]^Line_Layout,
+	// While the mouse button is down, syntax is revealed for the selections
+	// from before it was pressed, so the text doesn't move under the pointer.
+	holding:         bool,
+	held:            [dynamic]Selection,
 }
 
 // A code block's lines, and the width of its widest line and of its box once
@@ -84,6 +88,7 @@ md_view_destroy :: proc(mv: ^Md_View) {
 	for _, L in mv.layouts do md_layout_destroy(L)
 	delete(mv.layouts)
 	delete(mv.code_scroll)
+	delete(mv.held)
 	hm_destroy(&mv.heights)
 	if mv.doc_allocator.procedure != nil do virtual.arena_destroy(&mv.arena)
 	mv^ = {}
@@ -107,7 +112,7 @@ md_set_mode :: proc(e: ^Editor, mode: Md_Mode) {
 	if mode == .Rendered {
 		md_column(e)
 		md_check_heights(e)
-		scroll_to(e, hm_y(&mv.heights, top))
+		scroll_to(e, top == 0 ? 0 : hm_y(&mv.heights, top))
 	} else {
 		scroll_to(e, f64(top * editor_line_height()))
 	}
@@ -164,7 +169,7 @@ md_begin :: proc(e: ^Editor) {
 		mv.memo = make(map[int]^Line_Layout, mv.doc_allocator)
 		mv.token = 0
 	}
-	h = hash.fnv64a(mem.slice_to_bytes(e.sels[:]), h)
+	h = hash.fnv64a(mem.slice_to_bytes(md_reveal_sels(e)), h)
 	view := [?]u64{u64(mv.caretless), mv.code_scroll_gen}
 	h = hash.fnv64a(mem.slice_to_bytes(view[:]), h)
 	if h == mv.token do return
@@ -188,9 +193,25 @@ md_end_frame :: proc(e: ^Editor) {
 
 // Whether some selection touches [lo, hi] (a caret at either end counts).
 md_touches :: proc(e: ^Editor, lo, hi: int) -> bool {
-	if e.mdv.caretless do return false
-	i := first_selection_at(e, lo)
-	return i < len(e.sels) && sel_lo(e.sels[i]) <= hi
+	sels := md_reveal_sels(e)
+	i := first_selection_in(sels, lo)
+	return i < len(sels) && sel_lo(sels[i]) <= hi
+}
+
+// The selections that reveal syntax.
+@(private = "file")
+md_reveal_sels :: proc(e: ^Editor) -> []Selection {
+	mv := &e.mdv
+	if mv.holding do return mv.held[:]
+	return mv.caretless ? nil : e.sels[:]
+}
+
+// Keeps what is revealed as it is until the mouse button is released.
+md_hold_reveal :: proc(e: ^Editor) {
+	mv := &e.mdv
+	clear(&mv.held)
+	if !mv.caretless do append(&mv.held, ..e.sels[:])
+	mv.holding = true
 }
 
 // --- Frame --------------------------------------------------------------------------------
@@ -213,6 +234,7 @@ md_check_heights :: proc(e: ^Editor) {
 	if m.col_w == mv.col_w && m.generation == g.text.generation && m.size == g.settings.markdown_font_size && m.line_height == g.settings.markdown_line_height && mv.heights.lines == n do return
 	m^ = {mv.col_w, g.text.generation, g.settings.markdown_font_size, g.settings.markdown_line_height}
 	hm_destroy(&mv.heights)
+	mv.heights.pad = math.round(f64(md_body_line_height()))
 	est := make([]f32, n, context.temp_allocator)
 	for &h, i in est do h = md_estimate(e, i)
 	hm_splice(&mv.heights, 0, 0, est)
@@ -754,7 +776,7 @@ draw_md_line :: proc(renderer: ^sdl.Renderer, e: ^Editor, line: int, L: ^Line_La
 		// Code scrolled sideways stays inside its box; markers hanging left
 		// of it are drawn first.
 		if L.kind == .Code {
-			for run in L.runs do if run.x < L.indent - 0.5 do draw_md_run(renderer, L, run, text, hl, left, y, scale)
+			for run in L.runs do if md_hanging(L, run) do draw_md_run(renderer, L, run, text, hl, left, y, scale)
 			push_clip_box(renderer, {x0 - 2 * scale, math.round(y), x1 - x0 + 4 * scale, math.ceil(h)})
 			clipped = true
 		}
@@ -799,7 +821,7 @@ draw_md_line :: proc(renderer: ^sdl.Renderer, e: ^Editor, line: int, L: ^Line_La
 
 	for run in L.runs {
 		// Code lines drew their hanging markers outside the clip.
-		if clipped && run.x < L.indent - 0.5 do continue
+		if clipped && md_hanging(L, run) do continue
 		draw_md_run(renderer, L, run, text, hl, left, y, scale)
 	}
 
@@ -894,8 +916,9 @@ HM_CHUNK :: 512
 
 Height_Map :: struct {
 	chunks: [dynamic]Height_Chunk,
-	total:  f64,
+	total:  f64, // with pad
 	lines:  int,
+	pad:    f64, // space above the first line
 }
 
 Height_Chunk :: struct {
@@ -938,7 +961,7 @@ hm_set :: proc(hm: ^Height_Map, line: int, h: f32) {
 
 // The y of a line's top.
 hm_y :: proc(hm: ^Height_Map, line: int) -> f64 {
-	y: f64
+	y := hm.pad
 	line := clamp(line, 0, hm.lines)
 	for &ch in hm.chunks {
 		if line < len(ch.h) {
@@ -953,7 +976,8 @@ hm_y :: proc(hm: ^Height_Map, line: int) -> f64 {
 
 // The line at y, and its top.
 hm_find :: proc(hm: ^Height_Map, y: f64) -> (line: int, top: f64) {
-	if hm.lines == 0 do return 0, 0
+	if hm.lines == 0 do return 0, hm.pad
+	top = hm.pad
 	for &ch, ci in hm.chunks {
 		if y < top + ch.sum || ci == len(hm.chunks) - 1 {
 			for h, k in ch.h {
@@ -1007,7 +1031,7 @@ hm_splice :: proc(hm: ^Height_Map, at, removed: int, inserted: []f32) {
 			inject_at(&hm.chunks, c, ..parts[:])
 		}
 	}
-	hm.total = 0
+	hm.total = hm.pad
 	for &ch in hm.chunks {
 		ch.sum = 0
 		for h in ch.h do ch.sum += f64(h)

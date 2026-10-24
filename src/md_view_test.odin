@@ -152,6 +152,33 @@ test_md_toggle_keeps_top_line :: proc(t: ^testing.T) {
 	testing.expect(t, moved > md_page_height(e) - 60 && moved < md_page_height(e) + 60)
 }
 
+// While the mouse button is down, what is revealed stays as it was.
+@(test)
+test_md_hold_reveal :: proc(t: ^testing.T) {
+	e := make_md_editor("# Title\n\nSome **bold** text.")
+	defer destroy_md_editor(e)
+	md_hold_reveal(e)
+	at := buffer.line_start(&e.buf, 2) + 7
+	set_single_selection(e, {at, buffer.line_end(&e.buf, 2), -1})
+	testing.expect_value(t, shown(e, 0), "# Title")
+	testing.expect_value(t, shown(e, 2), "Some bold text.")
+	e.mdv.holding = false
+	testing.expect_value(t, shown(e, 0), "Title")
+	testing.expect_value(t, shown(e, 2), "Some **bold** text.")
+}
+
+// The first line starts below a margin; a click in it is on the first line.
+@(test)
+test_md_top_margin :: proc(t: ^testing.T) {
+	e := make_md_editor("# Title\nbody")
+	defer destroy_md_editor(e)
+	testing.expect(t, hm_y(&e.mdv.heights, 0) >= f64(md_body_line_height()) - 1)
+	testing.expect_value(t, md_offset_at_point(e, e.view.x + e.mdv.col_x + 1, e.view.y + 2), 0)
+	md_set_mode(e, .Text)
+	md_set_mode(e, .Rendered)
+	testing.expect_value(t, e.scroll_y, 0)
+}
+
 // The height map against a plain array, through random splices and updates.
 @(test)
 test_height_map :: proc(t: ^testing.T) {
@@ -318,7 +345,7 @@ test_md_list_indent :: proc(t: ^testing.T) {
 	o := md_editor_at("1. a\n2. b|")
 	defer destroy_md_editor(o)
 	md_indent(o, 1)
-	expect_after(t, o, "1. a\n   2. b|")
+	expect_after(t, o, "1. a\n   1. b|")
 
 	// Backspace at the start of an item's text removes its marker.
 	b := md_editor_at("- a\n- |b")
@@ -391,6 +418,12 @@ test_md_code_blocks :: proc(t: ^testing.T) {
 	testing.expect(t, md_scroll_code_at(e, y, 100))
 	testing.expect_value(t, md_line_layout(e, 3).runs[0].x, x0 - 100)
 	testing.expect_value(t, md_line_layout(e, 4).runs[0].x, x0 - 100)
+	// Scrolled code is still code, not a marker hanging left of the text.
+	L3 := md_line_layout(e, 3)
+	testing.expect(t, !md_hanging(L3, L3.runs[0]))
+	text3, _ := md_line_text(e, 3)
+	_, cx := md_caret_x(L3, text3, 20)
+	testing.expect_value(t, cx, L3.runs[0].x + 20 * L3.char_w)
 	md_scroll_code_at(e, y, 1e6)
 	width, box := md_code_widths(e, md_code_block(e, 2) or_else nil)
 	testing.expect_value(t, e.mdv.code_scroll[2], width - box)
@@ -504,8 +537,9 @@ test_md_line_indent :: proc(t: ^testing.T) {
 
 // --- Typing sequences ----------------------------------------------------------------
 // Keys replayed through the editor's handlers: characters are typed, except
-// ⏎ Enter, ⌫ Backspace, ⇥ Tab and ⇤ Shift+Tab. After every key the incremental
-// parse must match a full one and the caret must be in shown text.
+// ⏎ Enter, ⌫ Backspace, ⌦ Delete, ⇥ Tab, ⇤ Shift+Tab, the arrows ← → ↑ ↓ and
+// ↶ undo. After every key the incremental parse must match a full one and the
+// caret must be in shown text.
 
 @(private = "file")
 Typing_Step :: struct {
@@ -545,14 +579,17 @@ shown_at :: proc(e: ^Editor, k: int, n := 0) -> bool {
 
 // Whether only hidden spaces separate byte k from what is drawn after it (text,
 // a bullet or a task box) on its line, or from where the line's text starts
-// after its list and quote markers: indentation, which is syntax.
+// after its list and quote markers: indentation, which is syntax (after a list
+// marker, only its first space).
 @(private = "file")
 before_shown :: proc(e: ^Editor, k: int) -> bool {
 	line := buffer.offset_to_line(&e.buf, k)
 	text, start := md_line_text(e, line)
 	at := k - start
-	content := int(markdown.line_detail(e.md, line, text).content[0])
-	if p := md_prefix(e, line); p.ok do content = p.content
+	d := markdown.line_detail(e.md, line, text)
+	content := int(d.content[0])
+	if d.n_marks > 0 && d.marks[d.n_marks - 1].kind != .Quote do content = min(content, int(d.marks[d.n_marks - 1].hi) + 1)
+	if d.task != {} do content = min(int(d.task[1]) + 1, len(text))
 	if at <= content && strings.trim_space(text[at:content]) == "" do return true
 	next := -1
 	for run in md_line_layout(e, line).runs {
@@ -561,10 +598,46 @@ before_shown :: proc(e: ^Editor, k: int) -> bool {
 	return next >= 0 && strings.trim_space(text[at:next]) == ""
 }
 
+// Whether a space or tab typed at byte k is drawn: it or another in the same
+// run of whitespace, unless it is syntax: indentation that containers or an
+// indented code block consume, before the line's markers, or the one space
+// after a list marker or a task box.
+@(private = "file")
+space_shown :: proc(e: ^Editor, k: int) -> bool {
+	line := buffer.offset_to_line(&e.buf, k)
+	text, start := md_line_text(e, line)
+	at := k - start
+	lo, hi := at, at + 1
+	for lo > 0 && (text[lo - 1] == ' ' || text[lo - 1] == '\t') do lo -= 1
+	for hi < len(text) && (text[hi] == ' ' || text[hi] == '\t') do hi += 1
+	for b in lo ..< hi do if shown_at(e, start + b, 1) do return true
+	d := markdown.line_detail(e.md, line, text)
+	if d.task != {} && at == int(d.task[1]) do return true
+	if at >= int(d.content[0]) do return false
+	if d.n_marks == 0 do return true
+	last := d.marks[d.n_marks - 1]
+	return at < int(last.lo) || at == int(last.hi)
+}
+
 // Whether a caret at byte k is drawn where it is in the text.
 @(private = "file")
 caret_shown :: proc(e: ^Editor, k: int) -> bool {
 	return shown_at(e, k) || before_shown(e, k)
+}
+
+// Whether the primary caret is drawn in the text column, or on a marker
+// hanging left of it that it is in.
+@(private = "file")
+caret_in_column :: proc(e: ^Editor) -> bool {
+	head := e.sels[e.primary].head
+	line := buffer.offset_to_line(&e.buf, head)
+	text, start := md_line_text(e, line)
+	L := md_line_layout(e, line)
+	at := head - start
+	_, x := md_caret_x(L, text, at)
+	if x >= L.indent - 0.5 || L.kind == .Code do return true
+	for run in L.runs do if md_hanging(L, run) && int(run.lo) <= at && at <= int(run.hi) do return true
+	return false
 }
 
 // Where the primary caret is drawn: its line, row and x.
@@ -591,6 +664,12 @@ play :: proc(t: ^testing.T, e: ^Editor, keys: string, label := "", loc := #calle
 		case '⌫': press(e, sdl.K_BACKSPACE)
 		case '⇥': press(e, sdl.K_TAB)
 		case '⇤': press(e, sdl.K_TAB, sdl.KMOD_SHIFT)
+		case '⌦': press(e, sdl.K_DELETE)
+		case '←': press(e, sdl.K_LEFT)
+		case '→': press(e, sdl.K_RIGHT)
+		case '↑': press(e, sdl.K_UP)
+		case '↓': press(e, sdl.K_DOWN)
+		case '↶': editor_undo(e)
 		case:
 			buf, n := utf8.encode_rune(r)
 			editor_text_input(e, string(buf[:n]))
@@ -609,17 +688,17 @@ play :: proc(t: ^testing.T, e: ^Editor, keys: string, label := "", loc := #calle
 			testing.expectf(t, same, "%safter %q: line %d parsed as %v, a full parse gives %v", label, keys[:i + utf8.rune_size(r)], k, a.kind, l.kind, loc = loc)
 		}
 		testing.expectf(t, caret_shown(e, e.sels[0].head), "%safter %q: caret in hidden text", label, keys[:i + utf8.rune_size(r)], loc = loc)
+		testing.expectf(t, caret_in_column(e), "%safter %q: caret drawn left of the text", label, keys[:i + utf8.rune_size(r)], loc = loc)
 		// What is typed is drawn, unless it is indentation; Enter moves the caret.
 		head := e.sels[0].head
 		typed := r == '⇥' ? '\t' : r
 		n := utf8.rune_size(typed)
 		switch {
-		case e.buf.version == version, r == '⌫', r == '⇤':
+		case e.buf.version == version, r == '⌫', r == '⌦', r == '⇤', r == '↶':
 		case r == '⏎':
 			testing.expectf(t, caret_place(e) != before, "%safter %q: the caret didn't move", label, keys[:i + utf8.rune_size(r)], loc = loc)
 		case head >= n && string(buffer.read_alloc(&e.buf, head - n, head)) == utf8.runes_to_string({typed}, context.temp_allocator):
-			whitespace := typed == ' ' || typed == '\t'
-			testing.expectf(t, shown_at(e, head - n, n) || whitespace && before_shown(e, head - n), "%safter %q: %q isn't shown", label, keys[:i + utf8.rune_size(r)], typed, loc = loc)
+			testing.expectf(t, typed == ' ' || typed == '\t' ? space_shown(e, head - n) : shown_at(e, head - n, n), "%safter %q: %q isn't shown", label, keys[:i + utf8.rune_size(r)], typed, loc = loc)
 		}
 	}
 }
@@ -652,6 +731,37 @@ test_md_typing_lists :: proc(t: ^testing.T) {
 		{"Para⏎1. ", "Para\n1. |", ""},
 		{"a⏎b⏎⏎c", "Para\n1. a\n2. b\nc|", "Para\n  1.a\n  2.b\nc"},
 	})
+	// Spaces typed after a marker show, and Backspace deletes them before the
+	// marker; Enter keeps them.
+	expect_typing(t, "|", {
+		{"Para⏎1. a⏎ ", "Para\n1. a\n2.  |", "Para\n  1.a\n  2. "},
+		{"b", "Para\n1. a\n2.  b|", "Para\n  1.a\n  2. b"},
+		{"⏎", "Para\n1. a\n2.  b\n3.  |", ""},
+		{"⌫⌫", "Para\n1. a\n2.  b\n|", "Para\n  1.a\n  2. b\n"},
+	})
+	expect_typing(t, "- a\n- |b", {
+		{"  ", "- a\n-   |b", "  •a\n  •  b"},
+		{"⌫", "- a\n-  |b", "  •a\n  • b"},
+		{"⌫", "- a\n- |b", "  •a\n  •b"},
+		{"⌫", "- a\n|b", "  •a\nb"},
+	})
+	// Numbered lists stay in sequence, as one undo step with the edit.
+	expect_typing(t, "1. a\n2. b|\n3. c", {
+		{"⏎x", "1. a\n2. b\n3. x|\n4. c", ""},
+		{"⇥", "1. a\n2. b\n   1. x|\n3. c", "  1.a\n  2.b\n    1.x\n  3.c"},
+		{"⏎y", "1. a\n2. b\n   1. x\n   2. y|\n3. c", ""},
+		{"⇤", "1. a\n2. b\n   1. x\n3. y|\n4. c", ""},
+	})
+	expect_typing(t, "1. a\n2. |b\n3. c", {{"⌫", "1. a\n|b\n2. c", ""}})
+	expect_typing(t, "1) a\n2) |\n3) c\n\n- d", {{"⏎", "1) a\n|\n2) c\n\n- d", ""}})
+	expect_typing(t, "5. a|\n6. b", {{"⏎", "5. a\n6. |\n7. b", ""}})
+	{
+		e := md_editor_at("1. a|\n2. b")
+		defer destroy_md_editor(e)
+		play(t, e, "⏎")
+		editor_undo(e)
+		expect_after(t, e, "1. a|\n2. b")
+	}
 	// A real underline still makes a heading.
 	expect_typing(t, "|", {{"Title⏎--⏎", "Title\n--\n|", "H Title\n\n"}})
 
@@ -730,6 +840,109 @@ test_md_typing_indentation :: proc(t: ^testing.T) {
 	})
 }
 
+// Editing as someone used to Obsidian's live preview expects it to work.
+@(test)
+test_md_typing_like_obsidian :: proc(t: ^testing.T) {
+	// Headings: the marker shows while the line is edited, Enter starts a
+	// paragraph, and the heading is drawn as one once the caret leaves.
+	expect_typing(t, "|", {
+		{"# Title", "# Title|", "H # Title"},
+		{"⏎body", "# Title\nbody|", "H Title\nbody"},
+		{"↑", "# Ti|tle\nbody", "H # Title\nbody"}, // keeping its x
+	})
+	expect_typing(t, "|", {{"## A⏎### B⏎", "## A\n### B\n|", "H A\nH B\n"}})
+	// "#" without a space is text; adding the space makes the heading.
+	expect_typing(t, "|", {
+		{"#tag", "#tag|", "#tag"},
+		{"←←← ", "# |tag", "H # tag"},
+	})
+
+	// Inline styles hide their markers once the caret leaves the span.
+	expect_typing(t, "|", {
+		{"some **bold** and *it* and `c`", "some **bold** and *it* and `c`|", "some bold and it and `c`"},
+		{"←←←←←←←←←", "some **bold** and *it|* and `c`", "some bold and *it* and c"},
+		{"→→→→→→→→→", "some **bold** and *it* and `c`|", ""},
+		{"⏎", "some **bold** and *it* and `c`\n|", "some bold and it and c\n"},
+	})
+
+	// A task list: "- [ ] " makes a box, Enter continues with an empty one,
+	// and Enter on an empty one leaves the list.
+	expect_typing(t, "|", {
+		{"- [ ] buy milk", "- [ ] buy milk|", ""},
+		{"⏎", "- [ ] buy milk\n- [ ] |", "  •☐buy milk\n  •☐"},
+		{"eggs⏎⏎", "- [ ] buy milk\n- [ ] eggs\n|", "  •☐buy milk\n  •☐eggs\n"},
+	})
+
+	// Enter at the start of an item's text pushes it down as a new item.
+	expect_typing(t, "- one\n- |two", {{"⏎", "- one\n- \n- |two", "  •one\n  •\n  •two"}})
+
+	// Nesting three levels with Tab, then back out with Shift+Tab.
+	expect_typing(t, "|", {
+		{"- a⏎⇥b⏎⇥c", "- a\n  - b\n    - c|", "  •a\n    •b\n      •c"},
+		{"⇤⇤", "- a\n  - b\n- c|", "  •a\n    •b\n  •c"},
+		{"⇤", "- a\n  - b\nc|", "  •a\n    •b\nc"},
+	})
+
+	// Undo takes back a list edit and its renumbering in one step.
+	expect_typing(t, "1. a\n2. b|\n3. c", {
+		{"⇥", "1. a\n   1. b|\n2. c", ""},
+		{"↶", "1. a\n2. b|\n3. c", ""},
+		{"⏎", "1. a\n2. b\n3. |\n4. c", ""},
+		{"↶", "1. a\n2. b|\n3. c", ""},
+	})
+
+	// Quotes: continued by Enter, nested items inside them, left by Enter on
+	// an empty line.
+	expect_typing(t, "|", {
+		{"> a⏎- b⏎", "> a\n> - b\n> - |", ""},
+		{"⏎", "> a\n> - b\n> |", ""},
+		{"⏎", "> a\n> - b\n|", ""},
+	})
+
+	// Typing after the last item, then going back up into the list.
+	expect_typing(t, "- a\n- b\n\n|", {
+		{"text", "- a\n- b\n\ntext|", "  •a\n  •b\n\ntext"},
+		{"↑↑", "- a\n- b|\n\ntext", ""},
+		{"⏎c", "- a\n- b\n- c|\n\ntext", "  •a\n  •b\n  •c\n\ntext"},
+	})
+
+	// Delete at the end of an item joins the next line's text.
+	expect_typing(t, "- a|\nb", {{"⌦", "- a|b", "  •ab"}})
+
+	// A rule after a blank line, a heading underline right under a paragraph.
+	expect_typing(t, "x\n\n|", {{"---⏎", "x\n\n---\n|", ""}})
+	{
+		e := md_editor_at("x\n\n|")
+		defer destroy_md_editor(e)
+		play(t, e, "---⏎")
+		testing.expect_value(t, md_line_layout(e, 2).kind, Md_Line_Kind.Rule)
+	}
+
+	// Numbers keep going past 9, and the text stays aligned in the column.
+	expect_typing(t, "8. a|", {{"⏎b⏎c", "8. a\n9. b\n10. c|", ""}})
+
+	// Multiple carets each continue their own item.
+	{
+		e := md_editor_at("- a|\n- b")
+		defer destroy_md_editor(e)
+		end := buffer.length(&e.buf)
+		append(&e.sels, Selection{end, end, -1})
+		play(t, e, "⏎x")
+		testing.expect_value(t, md_text(e), "- a\n- x\n- b\n- x")
+	}
+
+	// Tab on several selected items indents each under the one before.
+	{
+		e := md_editor_at("- a\n- b\n- c|")
+		defer destroy_md_editor(e)
+		set_single_selection(e, {buffer.line_start(&e.buf, 1), buffer.length(&e.buf), -1})
+		play(t, e, "⇥")
+		testing.expect_value(t, md_text(e), "- a\n  - b\n  - c")
+		play(t, e, "⇤")
+		testing.expect_value(t, md_text(e), "- a\n- b\n- c")
+	}
+}
+
 // The text view edits Markdown like any other file.
 @(test)
 test_md_text_view_plain_keys :: proc(t: ^testing.T) {
@@ -768,6 +981,11 @@ test_md_typing_everywhere :: proc(t: ^testing.T) {
 		"**bold** and `code` [link](u)",
 		"x\n\n\t\t\n  ",
 		"",
+		"1. a\n2. ",
+		"> - a\n> - ",
+		"-  two spaces\n- [ ]  task",
+		"8. a\n9. b\n10. c",
+		"# Head\n- a\n> q\n\n---",
 	}
 	keys := [?]string{"a", " ", "-", "#", "*", "`", ">", "⏎", "⌫", "⇥", "⇤"}
 	for doc in docs {

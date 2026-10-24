@@ -113,6 +113,16 @@ begin :: proc(b: ^Buffer, kind: Edit_Kind, now: u64, sels: []Selection) {
 	h.applied = len(h.groups)
 }
 
+// Reopens the most recent step, so edits up to `end` join it. Returns false
+// (opening nothing) if there is none or it was undone.
+amend :: proc(b: ^Buffer) -> bool {
+	h := &b.history
+	assert(!h.open)
+	if h.applied == 0 || h.applied < len(h.groups) do return false
+	h.open, h.coalesced = true, true
+	return true
+}
+
 // Finishes the step begun with `begin`, recording the selections after it.
 end :: proc(b: ^Buffer, sels: []Selection) {
 	h := &b.history

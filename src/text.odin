@@ -1,6 +1,7 @@
 package editor
 
 import "core:hash"
+import "core:math"
 import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
@@ -44,6 +45,10 @@ ICON_FONT_DATA := #load("../assets/fonts/lucide.ttf")
 
 // Snaps glyphs only vertically and positions them at fractional pixels.
 FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
+// For semibold and heavier proportional fonts: the font's own hinting, which
+// keeps their small gaps (the dot of an i) a whole pixel wide. Monospace keeps
+// FONT_HINTING, whose advances match the regular weight's columns.
+FONT_HINTING_HEAVY :: ttf.Hinting.NORMAL
 
 // Cached ttf.Text objects not drawn for this many frames are destroyed.
 TEXT_CACHE_EVICT_FRAMES :: 120
@@ -127,6 +132,7 @@ Text_System :: struct {
 	widths:         map[Width_Key]f32,
 	frame:          u64,
 	generation:     u64, // bumped whenever fonts are reopened, so measurements made with them are stale
+	coverage_for:   [2]f32, // text brightness and contrast glyph coverage is mapped for (text_set_contrast)
 }
 
 text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool {
@@ -140,6 +146,7 @@ text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool
 		return false
 	}
 	ts.scale = scale
+	ts.coverage_for = -1
 	ts.sources = {
 		.Body           = BUNDLED_FACES[3].source,
 		.SemiBold       = BUNDLED_FACES[4].source,
@@ -198,6 +205,41 @@ text_clear_caches :: proc(ts: ^Text_System) {
 	ts.generation += 1
 }
 
+// Sets what glyph coverage is mapped for (see set_coverage): text of the given
+// color, with contrast enhanced by `contrast` (0 = none). Re-rasterizes
+// everything when that changes.
+text_set_contrast :: proc(ts: ^Text_System, c: clay.Color, contrast: f32) {
+	if ts.engine == nil do return
+	// Rec. 601 brightness, in tenths so that similar themes share a mapping.
+	b := math.round((0.30 * c.r + 0.59 * c.g + 0.11 * c.b) / 255 * 10) / 10
+	if ts.coverage_for == {b, contrast} do return
+	ts.coverage_for = {b, contrast}
+	text_clear_caches(ts)
+}
+
+// Maps a font's glyph coverage to alpha: grayscale DirectWrite's gamma
+// correction (as in Windows Terminal's shader, which Zed uses too) after
+// enhancing contrast, which DirectWrite does only for dark text but thin light
+// text needs as much. Heavier weights get less, so the gaps in bold letters
+// (the dot of an i) stay open; lighter ones more.
+@(private = "file")
+set_coverage :: proc(ts: ^Text_System, font: ^ttf.Font) {
+	b, contrast := ts.coverage_for[0], ts.coverage_for[1]
+	if b < 0 do return
+	k := contrast * clamp(f32(700 - ttf.GetFontWeight(font)) / 300, 0, 2)
+	// DirectWrite's alpha correction for a gamma of 1.8 (from Windows Terminal,
+	// MIT license, Copyright (c) Microsoft Corporation).
+	g := [4]f32{0.1469 * 0x10000 / (255 * 255), -0.8911 * 0x100 / 255, 1.4644 * 0x10000 / (255 * 255), -0.3234 * 0x100 / 255}
+	table: [256]u8
+	for &v, i in table {
+		a := f32(i) / 255
+		a = a * (k + 1) / (a * k + 1)
+		a += a * (1 - a) * ((g[0] * b + g[1]) * a + (g[2] * b + g[3]))
+		v = u8(math.round(clamp(a, 0, 1) * 255))
+	}
+	_ = ttf.SetFontCoverageTable(font, &table[0])
+}
+
 @(private = "file")
 open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	props := sdl.CreateProperties()
@@ -212,7 +254,8 @@ open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	_ = sdl.SetNumberProperty(props, ttf.PROP_FONT_CREATE_FACE_NUMBER, src.face)
 	font := ttf.OpenFontWithProperties(props)
 	if font != nil {
-		ttf.SetFontHinting(font, FONT_HINTING)
+		heavy := ttf.GetFontWeight(font) >= ttf.FONT_WEIGHT_SEMI_BOLD && !ttf.FontIsFixedWidth(font)
+		ttf.SetFontHinting(font, heavy ? FONT_HINTING_HEAVY : FONT_HINTING)
 		if src.synthetic_italic do ttf.SetFontStyle(font, {.ITALIC})
 	}
 	return font
@@ -265,6 +308,7 @@ text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 		sdl.Log("opening font %d failed: %s", i32(id), sdl.GetError())
 		return nil
 	}
+	set_coverage(ts, font)
 	ts.fonts[key] = font
 	return font
 }
@@ -282,6 +326,7 @@ ensure_fallbacks :: proc(ts: ^Text_System, font: ^ttf.Font, s: string) {
 		for path in ts.fallback_paths {
 			fallback := open_font({path = path}, size)
 			if fallback == nil do continue
+			set_coverage(ts, fallback)
 			if ttf.AddFallbackFont(font, fallback) do append(&list, fallback)
 			else do ttf.CloseFont(fallback)
 		}

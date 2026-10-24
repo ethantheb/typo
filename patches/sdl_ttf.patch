@@ -1,0 +1,180 @@
+diff --git a/include/SDL3_ttf/SDL_ttf.h b/include/SDL3_ttf/SDL_ttf.h
+index b723bc7..10f6093 100644
+--- a/include/SDL3_ttf/SDL_ttf.h
++++ b/include/SDL3_ttf/SDL_ttf.h
+@@ -1142,6 +1142,15 @@ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImage(TTF_Font *font, Uint
+  */
+ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_ImageType *image_type);
+ 
++/**
++ * Set a table mapping glyph coverage (0-255) to the alpha of a font's glyph
++ * images, or NULL to use the coverage as it is. Set it before drawing text
++ * with the font: glyph images made before keep theirs.
++ *
++ * (Added by typo's patch.)
++ */
++extern SDL_DECLSPEC bool SDLCALL TTF_SetFontCoverageTable(TTF_Font *font, const Uint8 *table);
++
+ /**
+  * Query the metrics (dimensions) of a font's glyph for a UNICODE codepoint.
+  *
+diff --git a/src/SDL_ttf.c b/src/SDL_ttf.c
+index be517a1..769018c 100644
+--- a/src/SDL_ttf.c
++++ b/src/SDL_ttf.c
+@@ -344,6 +344,10 @@ struct TTF_Font {
+     // Hinting modes
+     int ft_load_target;
+     int render_subpixel;
++
++    // Maps glyph coverage to the alpha of glyph images (TTF_SetFontCoverageTable).
++    Uint8 coverage_table[256];
++    bool use_coverage_table;
+ #if TTF_USE_HARFBUZZ
+     hb_font_t *hb_font;
+     hb_language_t hb_language;
+@@ -1433,6 +1437,15 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+         int glyph_rows = glyph->sz_rows;
+         TTF_DrawOperation *op;
+ 
++        // Glyphs are placed at a quarter of a pixel, rendered shifted by that
++        // (see TTF_GetGlyphImageForIndex).
++        int quarter = 0;
++        if (glyph_font->render_subpixel && !glyph_font->render_sdf) {
++            int quarters = (x + 8) >> 4;
++            quarter = quarters & 3;
++            x = (quarters >> 2) * 64;
++        }
++
+         // Position updated after glyph rendering
+         x = xstart + FT_FLOOR(x) + glyph->sz_left;
+         y = ystart + FT_FLOOR(y) - glyph->sz_top;
+@@ -1467,7 +1480,7 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+             op->cmd = TTF_DRAW_COMMAND_COPY;
+             op->copy.text_offset = offset;
+             op->copy.glyph_font = glyph_font;
+-            op->copy.glyph_index = idx;
++            op->copy.glyph_index = idx | ((Uint32)quarter << 30);
+             op->copy.src.x = glyph_x;
+             op->copy.src.y = glyph_y;
+             op->copy.src.w = glyph_width + 2 * font->outline;
+@@ -3177,12 +3190,26 @@ SDL_Surface *TTF_GetGlyphImage(TTF_Font *font, Uint32 ch, TTF_ImageType *image_t
+     return TTF_GetGlyphImageForIndex(glyph_font, idx, image_type);
+ }
+ 
++bool TTF_SetFontCoverageTable(TTF_Font *font, const Uint8 *table)
++{
++    TTF_CHECK_FONT(font, false);
++    font->use_coverage_table = (table != NULL);
++    if (table) {
++        SDL_memcpy(font->coverage_table, table, sizeof(font->coverage_table));
++    }
++    return true;
++}
++
+ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_ImageType *image_type)
+ {
+     const int alignment = Get_Alignment() - 1;
++    c_glyph *glyph;
+     TTF_Image *image;
+     SDL_Surface *surface;
+     const Uint8 *src;
++    // A subpixel position, in quarters of a pixel, can be in the top bits (see Render_Line_TextEngine).
++    const int quarter = (int)(glyph_index >> 30);
++    glyph_index &= 0x3FFFFFFF;
+ 
+     if (image_type) {
+         *image_type = TTF_IMAGE_INVALID;
+@@ -3190,7 +3217,12 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+ 
+     TTF_CHECK_FONT(font, NULL);
+ 
+-    if (!Find_GlyphByIndex(font, glyph_index, COLOR, 0, 0, NULL, &image)) {
++    const bool subpixel = font->render_subpixel && !font->render_sdf;
++    if (subpixel) {
++        if (!Find_GlyphByIndex(font, glyph_index, COLOR, SUBPIX, quarter * 16, &glyph, &image)) {
++            return NULL;
++        }
++    } else if (!Find_GlyphByIndex(font, glyph_index, COLOR, 0, 0, &glyph, &image)) {
+         return NULL;
+     }
+ 
+@@ -3198,7 +3230,15 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+         return SDL_CreateSurface(1, 1, SDL_PIXELFORMAT_ARGB8888);
+     }
+ 
+-    surface = SDL_CreateSurface(image->width, image->rows, SDL_PIXELFORMAT_ARGB8888);
++    // A subpixel image keeps the glyph's left edge and width, which leave room for the shift.
++    int width = image->width;
++    int dx = 0;
++    if (subpixel) {
++        width = SDL_max(glyph->sz_width, image->width);
++        dx = SDL_clamp(image->left - glyph->sz_left, 0, width - image->width);
++    }
++
++    surface = SDL_CreateSurface(width, image->rows, SDL_PIXELFORMAT_ARGB8888);
+     if (!surface) {
+         return NULL;
+     }
+@@ -3212,17 +3252,14 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+             *image_type = (font->render_sdf ? TTF_IMAGE_SDF : TTF_IMAGE_COLOR);
+         }
+ 
+-        if (surface->pitch == image->pitch) {
+-            SDL_memcpy(surface->pixels, src, image->rows * image->pitch);
+-        } else {
+-            int row;
+-            Uint8 *dst = (Uint8 *)surface->pixels;
+-            size_t length = image->width * 4;
+-            for (row = 0; row < image->rows; ++row) {
+-                SDL_memcpy(dst, src, length);
+-                src += image->pitch;
+-                dst += surface->pitch;
+-            }
++        SDL_ClearSurface(surface, 0.0f, 0.0f, 0.0f, 0.0f);
++        int row;
++        Uint8 *dst = (Uint8 *)surface->pixels + dx * 4;
++        size_t length = image->width * 4;
++        for (row = 0; row < image->rows; ++row) {
++            SDL_memcpy(dst, src, length);
++            src += image->pitch;
++            dst += surface->pitch;
+         }
+     } else {
+         if (image_type) {
+@@ -3230,15 +3267,17 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+         }
+ 
+         int row, col;
+-        Uint32 *dst = (Uint32 *)surface->pixels;
+-        int skip = (surface->pitch - surface->w * 4) / 4;
+         for (row = 0; row < image->rows; ++row) {
+-            for (col = 0; col < image->width; ++col) {
+-                Uint32 v = src[col];
+-                *dst++ = (0x00FFFFFF | v << 24);
++            Uint32 *dst = (Uint32 *)((Uint8 *)surface->pixels + row * surface->pitch);
++            for (col = 0; col < width; ++col) {
++                int k = col - dx;
++                Uint32 v = (k >= 0 && k < image->width) ? src[k] : 0;
++                if (font->use_coverage_table) {
++                    v = font->coverage_table[v];
++                }
++                dst[col] = (0x00FFFFFF | v << 24);
+             }
+             src += image->pitch;
+-            dst += skip;
+         }
+     }
+     return surface;
+diff --git a/src/SDL_ttf.sym b/src/SDL_ttf.sym
+index 564eaf3..d49a3db 100644
+--- a/src/SDL_ttf.sym
++++ b/src/SDL_ttf.sym
+@@ -43,6 +43,7 @@ SDL3_ttf_0.0.0 {
+     TTF_GetFreeTypeVersion;
+     TTF_GetGlyphImage;
+     TTF_GetGlyphImageForIndex;
++    TTF_SetFontCoverageTable;
+     TTF_GetGlyphKerning;
+     TTF_GetGlyphMetrics;
+     TTF_GetGlyphScript;

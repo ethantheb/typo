@@ -226,6 +226,9 @@ foreign lib {
 
 @(default_calling_convention="c", link_prefix="TTF_")
 foreign lib {
+	// From typo's patch (patches/sdl_ttf.patch): 256 entries, or nil.
+	SetFontCoverageTable :: proc(font: ^Font, table: [^]u8) -> bool ---
+
 	GetFreeTypeVersion :: proc(major, minor, patch: ^c.int) ---
 	GetHarfBuzzVersion :: proc(major, minor, patch: ^c.int) ---
 

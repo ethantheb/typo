@@ -387,6 +387,12 @@ md_items :: proc(e: ^Editor, i: int, text: string, start: int) -> (items: []Md_I
 		pos = int(m.hi)
 	}
 	content := int(d.content[0])
+	// After a list marker, spaces beyond the first are shown.
+	if d.n_marks > 0 && d.marks[d.n_marks - 1].kind != .Quote && pos < content {
+		hide(&ib, pos, pos + 1)
+		for k in pos + 1 ..< content do add_item(&ib, {lo = i32(k), hi = i32(k + 1), subst = text[k] == '\t' ? MD_TAB : ""})
+		pos = content
+	}
 	if d.task != {} {
 		hide(&ib, pos, int(d.task[0]))
 		pos = int(d.task[1])
@@ -477,7 +483,7 @@ md_items :: proc(e: ^Editor, i: int, text: string, start: int) -> (items: []Md_I
 	switch {
 	case info.kind == .Atx_Heading:
 		heading = info.aux
-		marker_or_hide(&ib, int(d.open[0]), int(d.open[1]), revealed)
+		marker_or_hide(&ib, content, int(d.open[1]), revealed)
 		content = int(d.open[1])
 		if d.close != {} do content_hi = int(d.close[0])
 	case info.kind == .Paragraph || info.kind == .Footnote_Def:
@@ -1188,6 +1194,8 @@ md_caret_x :: proc(L: ^Line_Layout, text: string, k: int) -> (row: int, x: f32) 
 			if run.kind == .Checkbox do return row, k <= int(run.lo) ? run.x : run.x + run.w
 			return row, run.x + run_prefix_w(L, run, text, k)
 		}
+		// A marker hanging left of the content holds only carets within it.
+		if md_hanging(L, run) do continue
 		if int(run.lo) > k && after < 0 do after = int(ri)
 		if int(run.hi) <= k do x = run.x + run.w
 	}
@@ -1250,6 +1258,12 @@ index_in_row :: proc(L: ^Line_Layout, text: string, x, y: f32) -> (row, k: int) 
 	return row, end
 }
 
+// Whether a run is a bullet or marker hanging left of the content (code
+// scrolled sideways starts left of it too).
+md_hanging :: proc(L: ^Line_Layout, run: Md_Run) -> bool {
+	return run.kind != .Mono && run.x < L.indent - 0.5
+}
+
 // The first and last caret positions of a row's text.
 md_row_bounds :: proc(L: ^Line_Layout, row: int, text_len: int) -> (lo, hi: int) {
 	r := L.rows[row]
@@ -1257,7 +1271,7 @@ md_row_bounds :: proc(L: ^Line_Layout, row: int, text_len: int) -> (lo, hi: int)
 	for ri in r.runs[0] ..< r.runs[1] {
 		run := L.runs[ri]
 		if run.kind == .Bullet || run.hi <= run.lo do continue
-		if run.x < L.indent - 0.5 do continue // a hanging marker
+		if md_hanging(L, run) do continue
 		if lo < 0 do lo = run.kind == .Checkbox ? int(run.hi) : int(run.lo)
 		hi = int(run.hi)
 	}

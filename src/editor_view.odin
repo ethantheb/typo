@@ -45,6 +45,7 @@ editor_frame :: proc(e: ^Editor, interactive: bool) {
 	editor_take_changes(e)
 	if r, ok := element_rect(clay.ID("EditorText")); ok do e.view = r
 	e.char_w = editor_char_width()
+	if !g.mouse_down do e.mdv.holding = false
 	rendered := md_rendered(e)
 	if rendered {
 		e.gutter_w = 0
@@ -144,6 +145,7 @@ editor_mouse :: proc(e: ^Editor) {
 		}
 		// Beside the rendered text, a click hides the caret.
 		if md_rendered(e) {
+			if g.mouse_down do md_hold_reveal(e)
 			e.mdv.caretless = !md_column_hit(e, g.mouse_pos.x, g.mouse_pos.y)
 			if e.mdv.caretless {
 				e.dragging = false
@@ -483,10 +485,14 @@ col_x :: proc(text: string, i: int, text_x, adv: f32) -> f32 {
 
 // Index of the first selection that ends at or after `offset`.
 first_selection_at :: proc(e: ^Editor, offset: int) -> int {
-	lo, hi := 0, len(e.sels)
+	return first_selection_in(e.sels[:], offset)
+}
+
+first_selection_in :: proc(sels: []Selection, offset: int) -> int {
+	lo, hi := 0, len(sels)
 	for lo < hi {
 		mid := (lo + hi) / 2
-		if sel_hi(e.sels[mid]) < offset {
+		if sel_hi(sels[mid]) < offset {
 			lo = mid + 1
 		} else {
 			hi = mid

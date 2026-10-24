@@ -16,9 +16,11 @@ Steps:
      a pinned Zig, both downloaded into build/ on first use. Rebuilt only when
      GHOSTTY_COMMIT changes.
   3. Build SDL3 and SDL3_ttf (with FreeType, HarfBuzz and plutosvg) with CMake
-     from pinned releases, downloaded into build/ on first use. Rebuilt only
-     when SDL_VERSION or SDL_TTF_VERSION changes; these must match the bindings
-     in vendor/sdl3.
+     from pinned releases, downloaded into build/ on first use, SDL3_ttf with
+     patches/sdl_ttf.patch applied (glyphs at quarter-pixel positions, and a
+     glyph coverage table for gamma and contrast). Rebuilt only when
+     SDL_VERSION, SDL_TTF_VERSION or the patch changes; these must match the
+     bindings in vendor/sdl3.
   4. On Windows, fetch Microsoft's ConPTY package (conpty.dll + OpenConsole.exe,
      the pseudo console host Windows Terminal ships). It is newer and faster
      than the one built into Windows. The executable embeds both files and
@@ -95,6 +97,7 @@ SDL_TTF_REPO = "https://github.com/libsdl-org/SDL_ttf.git"
 SDL_TTF_SUBMODULES = ["external/freetype", "external/harfbuzz", "external/plutosvg", "external/plutovg"]
 SDL_SRC = OUT / "deps" / "SDL"
 SDL_TTF_SRC = OUT / "deps" / "SDL_ttf"
+SDL_TTF_PATCH = ROOT / "patches" / "sdl_ttf.patch"
 SDL_OUT = OBJ / "sdl"  # install prefix; vendor/sdl3 links the libraries in lib/
 if IS_WINDOWS:
     SDL_LIBS = [SDL_OUT / "lib" / "SDL3-static.lib", SDL_OUT / "lib" / "SDL3_ttf-static.lib"]
@@ -223,13 +226,15 @@ def cmake_build(src, build_dir, options):
 
 def build_sdl():
     stamp = SDL_OUT / "versions.txt"
-    versions = f"{SDL_VERSION} {SDL_TTF_VERSION}"
+    patch = hashlib.sha256(SDL_TTF_PATCH.read_bytes()).hexdigest()[:12]
+    versions = f"{SDL_VERSION} {SDL_TTF_VERSION} {patch}"
     if all(lib.exists() for lib in SDL_LIBS) and stamp.exists() and stamp.read_text().strip() == versions:
         return
     print("Building SDL3 and SDL3_ttf...", flush=True)
     shutil.rmtree(SDL_OUT, ignore_errors=True)
     git_checkout(SDL_SRC, SDL_REPO, f"refs/tags/release-{SDL_VERSION}")
     git_checkout(SDL_TTF_SRC, SDL_TTF_REPO, f"refs/tags/release-{SDL_TTF_VERSION}", SDL_TTF_SUBMODULES)
+    check(["git", "-C", SDL_TTF_SRC, "apply", SDL_TTF_PATCH])
     build_dir = OBJ / "sdl-build"
     shutil.rmtree(build_dir, ignore_errors=True)
     cmake_build(SDL_SRC, build_dir / "SDL", [

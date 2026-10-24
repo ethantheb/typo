@@ -154,7 +154,8 @@ fill_rect :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32, c: clay.Color) {
 	_ = sdl.RenderFillRect(renderer, &r)
 }
 
-// Rounded rectangles are convex, so a triangle fan from the centre covers them.
+// Rounded rectangles are convex, so a triangle fan from the centre covers them,
+// inset half a pixel; a ring fading out to half a pixel outside smooths the edge.
 fill_rounded_rect :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Color) {
 	if r.topLeft <= 0 && r.topRight <= 0 && r.bottomLeft <= 0 && r.bottomRight <= 0 {
 		fill_rect(renderer, b.x, b.y, b.width, b.height, c)
@@ -171,26 +172,32 @@ fill_rounded_rect :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.
 		{b.x + min(r.topLeft, max_r), b.y + min(r.topLeft, max_r), min(r.topLeft, max_r), math.PI},
 	}
 
+	RING :: 4 * (CORNER_SEGMENTS + 1)
 	fc := to_fcolor(c)
-	verts: [1 + 4 * (CORNER_SEGMENTS + 1)]sdl.Vertex
+	clear := fc
+	clear.a = 0
+	verts: [1 + 2 * RING]sdl.Vertex
 	verts[0] = {position = {b.x + b.width / 2, b.y + b.height / 2}, color = fc}
-	n := 1
+	k := 0
 	for corner in corners {
 		for s in 0 ..= CORNER_SEGMENTS {
 			a := corner.start + f32(s) / CORNER_SEGMENTS * (math.PI / 2)
-			verts[n] = {position = {corner.cx + math.cos(a) * corner.radius, corner.cy + math.sin(a) * corner.radius}, color = fc}
-			n += 1
+			n := [2]f32{math.cos(a), math.sin(a)}
+			p := [2]f32{corner.cx, corner.cy} + n * corner.radius
+			verts[1 + k] = {position = sdl.FPoint(p - n * 0.5), color = fc}
+			verts[1 + RING + k] = {position = sdl.FPoint(p + n * 0.5), color = clear}
+			k += 1
 		}
 	}
 
-	ring := n - 1
-	indices: [3 * (4 * (CORNER_SEGMENTS + 1))]i32
-	for i in 0 ..< ring {
-		indices[i * 3 + 0] = 0
-		indices[i * 3 + 1] = i32(1 + i)
-		indices[i * 3 + 2] = i32(1 + (i + 1) % ring)
+	indices: [9 * RING]i32
+	for i in 0 ..< RING {
+		j := (i + 1) % RING
+		in_i, in_j := i32(1 + i), i32(1 + j)
+		out_i, out_j := in_i + RING, in_j + RING
+		copy(indices[i * 9:], []i32{0, in_i, in_j, in_i, out_i, out_j, in_i, out_j, in_j})
 	}
-	_ = sdl.RenderGeometry(renderer, nil, &verts[0], i32(n), &indices[0], i32(ring * 3))
+	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
 }
 
 @(private = "file")
@@ -208,30 +215,35 @@ draw_border :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.Corner
 	if r.bottomLeft > 0 do draw_arc(renderer, b.x + r.bottomLeft, b.y + b.height - r.bottomLeft, r.bottomLeft, bottom, math.PI / 2, c)
 }
 
-// Quarter-circle ring of the given thickness, starting at angle `start` (radians, clockwise in screen space).
+// Quarter-circle ring of the given thickness, starting at angle `start` (radians,
+// clockwise in screen space), its edges fading out over a pixel.
 @(private = "file")
 draw_arc :: proc(renderer: ^sdl.Renderer, cx, cy, radius, thickness, start: f32, c: clay.Color) {
 	if thickness <= 0 do return
 	inner := max(radius - thickness, 0)
 	fc := to_fcolor(c)
+	clear := fc
+	clear.a = 0
+	// Per step: outside the ring, its outer edge, its inner edge, inside it.
+	radii := [4]f32{radius + 0.5, radius - 0.5, inner + 0.5, max(inner - 0.5, 0)}
+	colors := [4]sdl.FColor{clear, fc, fc, clear}
+	if thickness < 1 do radii[1], radii[2] = radius - thickness / 2, radius - thickness / 2
 
-	verts: [2 * (CORNER_SEGMENTS + 1)]sdl.Vertex
+	verts: [4 * (CORNER_SEGMENTS + 1)]sdl.Vertex
 	for s in 0 ..= CORNER_SEGMENTS {
 		a := start + f32(s) / CORNER_SEGMENTS * (math.PI / 2)
 		ca, sa := math.cos(a), math.sin(a)
-		verts[s * 2 + 0] = {position = {cx + ca * radius, cy + sa * radius}, color = fc}
-		verts[s * 2 + 1] = {position = {cx + ca * inner, cy + sa * inner}, color = fc}
+		for k in 0 ..< 4 do verts[s * 4 + k] = {position = {cx + ca * radii[k], cy + sa * radii[k]}, color = colors[k]}
 	}
 
-	indices: [6 * CORNER_SEGMENTS]i32
+	indices: [18 * CORNER_SEGMENTS]i32
+	n := 0
 	for s in 0 ..< CORNER_SEGMENTS {
-		o := i32(s * 2)
-		indices[s * 6 + 0] = o
-		indices[s * 6 + 1] = o + 1
-		indices[s * 6 + 2] = o + 2
-		indices[s * 6 + 3] = o + 1
-		indices[s * 6 + 4] = o + 3
-		indices[s * 6 + 5] = o + 2
+		for k in 0 ..< 3 {
+			a, b := i32(s * 4 + k), i32((s + 1) * 4 + k)
+			copy(indices[n:], []i32{a, a + 1, b, a + 1, b + 1, b})
+			n += 6
+		}
 	}
 	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
 }

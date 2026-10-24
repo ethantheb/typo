@@ -16,7 +16,11 @@ python build.py --perf     performance suite only
 
 `build.py` also builds the dependencies as static libraries (tree-sitter with clang,
 libghostty-vt with a pinned Zig, SDL3 and SDL3_ttf with CMake) and on Windows fetches the
-ConPTY files that `src/term/pty_windows.odin` embeds. The fonts and the window icon
+ConPTY files that `src/term/pty_windows.odin` embeds. SDL3_ttf gets `patches/sdl_ttf.patch`
+(make it with `git diff` in `build/deps/SDL_ttf`): glyphs placed at quarter-pixel
+positions by its renderer text engine, and `TTF_SetFontCoverageTable`, through which
+text.odin applies gamma and contrast correction to each font (less contrast for
+heavier weights, which also get full hinting). The fonts and the window icon
 (`assets/icon`, also the Windows executable's icon via `typo.rc`) are embedded too, so the
 executable is the only runtime file. Run it once before using `odin` directly. Quick type
 check: `odin check src -vet-unused -vet-unused-imports`.
@@ -50,9 +54,9 @@ src/                 package editor: the app
                      installed font scan (background thread; monospace families for the
                      editor, all for Markdown), family + weight -> Font_Source
   text.odin          Font ids and their sources, fallback fonts, cached ttf.Text,
-                     measurement
-  renderer_sdl.odin  Clay render commands -> SDL draw calls; draw_text, fill_rect, clips,
-                     overlay colors
+                     measurement, glyph gamma and contrast (text_set_contrast)
+  renderer_sdl.odin  Clay render commands -> SDL draw calls; draw_text, fill_rect,
+                     antialiased rounded shapes, clips, overlay colors
   ui.odin            Widgets: label, button, icon, input_box, text_field_event, tooltip,
                      modal/modal_at, ask (message box), clicked/pointer_in hit tests,
                      transition (Clay transitions), element_at
@@ -69,7 +73,8 @@ src/                 package editor: the app
   md_layout.odin     Rendered Markdown layout: a line's items (shown/hidden bytes,
                      widgets) wrapped into rows of runs; tables; layout cache keys
   md_edit.odin       Rendered Markdown editing keys (md_handle_key): lists and quotes
-                     continued by Enter, nested by Tab, indentation deleted by level
+                     continued by Enter, nested by Tab, indentation deleted by level,
+                     numbered lists renumbered
   md_media.odin      Rendered Markdown links (Ctrl+click) and images (decoded on
                      threads with vendor:stb/image, uploaded as textures)
   terminal.odin      Terminal: session lifecycle, row cache, drawing
@@ -83,7 +88,7 @@ src/                 package editor: the app
                      keys replayed through the key handlers, in scripted sequences and
                      at every caret position of sample documents, checking that the
                      incremental parse matches a full one, the caret is never in hidden
-                     text and what is typed is drawn)
+                     text or left of the text column, and what is typed is drawn)
 src/buffer/          Piece table in a treap, newline index, undo history, change log
 src/syntax/          Highlighter: tree-sitter backend (Odin, TOML) and line lexer (others)
 src/markdown/        Markdown (CommonMark + GFM + extras): incremental line-by-line block
@@ -156,8 +161,11 @@ The text view colors it through `markdown.highlight_range`. The rendered view
 is hidden except where a selection touches it (a line's block markers, a span's
 inline markers, a whole fence or table), and the whitespace of the caret's line is
 shown, so a caret is never in hidden text and whatever is typed is drawn. The only
-exception is indentation that Markdown treats as syntax (before a marker, or between
-a marker and the text); the caret is drawn where the text starts. Code that assumes
+exception is indentation that Markdown treats as syntax (before a marker, the one
+space after it, indentation consumed by a container or an indented code block); the
+caret is drawn where the text starts. While the mouse button is down, what is
+revealed stays as it was before the press (`md_hold_reveal`), so the text doesn't
+move under a drag. The first line starts below a margin (`Height_Map.pad`). Code that assumes
 one row per line and a fixed column width (scrolling, hit testing, vertical movement)
 branches on `md_rendered`. Its caches (`md_begin`) are in two parts: per document
 (paragraph inlines, tables, code block extents and widths, code highlights) and per

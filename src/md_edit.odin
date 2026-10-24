@@ -1,6 +1,7 @@
 package editor
 
 import "core:fmt"
+import "core:slice"
 import "core:strconv"
 import "core:strings"
 
@@ -12,8 +13,9 @@ import sdl "../vendor/sdl3"
 // any other file. Enter continues a list item (or quote) on a new line, and on
 // an empty item leaves the list (or outdents a nested one). Tab and Shift+Tab
 // indent and outdent list items, the top level's Shift+Tab leaving the list.
-// Backspace at the start of an item's text does the same as Shift+Tab, and in a
-// list's indentation deletes a level.
+// Backspace at the start of an item's text does the same as Shift+Tab (after
+// deleting any extra spaces after the marker), and in a list's indentation
+// deletes a level. Numbered lists these keys change are renumbered.
 
 // The innermost list item or quote marker of a line.
 Md_Prefix :: struct {
@@ -113,15 +115,101 @@ md_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 	shift := key.mod & sdl.KMOD_SHIFT != {}
 	switch key.key {
 	case sdl.K_BACKSPACE:
-		if ctrl || !md_backspace(e) do editor_delete(e, -1, ctrl)
-	case sdl.K_DELETE: editor_delete(e, +1, ctrl)
+		if ctrl || !md_backspace(e) {
+			editor_delete(e, -1, ctrl)
+			return true
+		}
+	case sdl.K_DELETE:
+		editor_delete(e, +1, ctrl)
+		return true
 	case sdl.K_RETURN, sdl.K_KP_ENTER: md_newline(e)
 	case sdl.K_TAB:
 		if !md_indent(e, shift ? -1 : 1) && !shift do editor_insert(e, "\t", .Other)
 	case:
 		return false
 	}
+	renumber(e)
 	return true
+}
+
+// Numbers the items of the ordered lists on and next to the selected lines in
+// sequence from each list's first number, as part of the last undo step.
+@(private = "file")
+renumber :: proc(e: ^Editor) {
+	editor_take_changes(e)
+	markdown.doc_update(e.md, &e.buf, max(int), 0)
+	edits := make([dynamic]Line_Edit, context.temp_allocator)
+	done := make(map[[2]int]bool, context.temp_allocator) // lists, by first item and level
+	n := len(e.md.lines)
+	for s in e.sels {
+		first := max(buffer.offset_to_line(&e.buf, sel_lo(s)) - 1, 0)
+		last := min(buffer.offset_to_line(&e.buf, sel_hi(s)) + 1, n - 1)
+		for line in first ..= last {
+			text, _ := line_text(e, line)
+			d := markdown.line_detail(e.md, line, text)
+			for m in d.marks[:d.n_marks] {
+				if m.kind != .Ordered do continue
+				items := list_items(e, line, int(m.container))
+				key := [2]int{items[0].line, int(m.container)}
+				if key in done do continue
+				done[key] = true
+				start, _ := strconv.parse_int(items[0].number)
+				for it, k in items {
+					want := fmt.tprint(start + k)
+					if it.number != want do append(&edits, Line_Edit{it.pos, len(it.number), want})
+				}
+			}
+		}
+	}
+	if len(edits) == 0 do return
+	slice.sort_by(edits[:], proc(a, b: Line_Edit) -> bool {return a.pos < b.pos})
+	apply_line_edits(e, edits[:], join = true)
+}
+
+@(private = "file")
+List_Item :: struct {
+	line:   int,
+	pos:    int,    // document offset of its number
+	number: string,
+}
+
+// The items of the ordered list that has an item at container level k on `line`.
+@(private = "file")
+list_items :: proc(e: ^Editor, line, k: int) -> []List_Item {
+	// The line's item at level k, and whether it starts an item further out
+	// (which ends a list at level k).
+	item_at :: proc(e: ^Editor, line, k: int) -> (it: List_Item, delim: u8, ok, outer: bool) {
+		text, start := line_text(e, line)
+		d := markdown.line_detail(e.md, line, text)
+		for m in d.marks[:d.n_marks] {
+			if int(m.container) < k && m.kind != .Quote do outer = true
+			if int(m.container) == k && m.kind == .Ordered {
+				it = {line, start + int(m.lo), text[m.lo:m.hi - 1]}
+				delim, ok = text[m.hi - 1], true
+			}
+		}
+		return
+	}
+	// Whether the list is still open at the end of a line.
+	open :: proc(e: ^Editor, line, k: int, delim: u8) -> bool {
+		st := markdown.line_state(e.md, line)
+		return int(st.depth) > k && st.containers[k].kind == .Ordered && st.containers[k].marker == delim
+	}
+	items := make([dynamic]List_Item, context.temp_allocator)
+	it, delim, _, first := item_at(e, line, k)
+	for i := line - 1; i >= 0 && !first && open(e, i, k, delim); i -= 1 {
+		prev, d, ok, outer := item_at(e, i, k)
+		if ok && d == delim do append(&items, prev)
+		if outer do break
+	}
+	slice.reverse(items[:])
+	append(&items, it)
+	for i := line + 1; i < len(e.md.lines) && open(e, i, k, delim); i += 1 {
+		next, d, ok, outer := item_at(e, i, k)
+		if outer do break
+		if ok && d == delim do append(&items, next)
+	}
+	return items[:]
 }
 
 // Enter. In a list item or quote's text it continues it; elsewhere the new
@@ -196,7 +284,11 @@ md_indent :: proc(e: ^Editor, dir: int) -> bool {
 			first_item = false
 			switch {
 			case dir < 0: append(&edits, outdent_edit(start, p))
-			case nests:   append(&edits, Line_Edit{start + p.ws_lo, 0, strings.repeat(" ", p.indent, context.temp_allocator)})
+			case nests:
+				append(&edits, Line_Edit{start + p.ws_lo, 0, strings.repeat(" ", p.indent, context.temp_allocator)})
+				// A numbered item starts the list it moves into at 1 (renumber
+				// follows the list).
+				if p.hi - p.lo > 1 do append(&edits, Line_Edit{start + p.lo, p.hi - 1 - p.lo, "1"})
 			}
 		}
 		last_line = max(last_line, last)
@@ -230,7 +322,8 @@ md_backspace :: proc(e: ^Editor) -> bool {
 		text, start := line_text(e, line)
 		at := s.head - start
 		p := md_prefix(e, line)
-		if p.ok && at == p.content {
+		// Spaces shown after the marker are deleted first.
+		if p.ok && at == p.content && len(p.gap) <= 1 {
 			append(&edits, outdent_edit(start, p))
 			continue
 		}
@@ -273,10 +366,10 @@ Line_Edit :: struct {
 	insert: string,
 }
 
-// Applies edits (sorted, not overlapping) as one undo step, keeping each
-// selection on the same text.
+// Applies edits (sorted, not overlapping) as one undo step, or as part of the
+// last one, keeping each selection on the same text.
 @(private = "file")
-apply_line_edits :: proc(e: ^Editor, edits: []Line_Edit) {
+apply_line_edits :: proc(e: ^Editor, edits: []Line_Edit, join := false) {
 	moved :: proc(x: int, edits: []Line_Edit) -> int {
 		d := 0
 		for ed in edits {
@@ -290,7 +383,7 @@ apply_line_edits :: proc(e: ^Editor, edits: []Line_Edit) {
 		}
 		return x + d
 	}
-	buffer.begin(&e.buf, .Other, sdl.GetTicksNS(), e.sels[:])
+	if !join || !buffer.amend(&e.buf) do buffer.begin(&e.buf, .Other, sdl.GetTicksNS(), e.sels[:])
 	#reverse for ed in edits do buffer.replace(&e.buf, ed.pos, ed.remove, ed.insert)
 	for &s in e.sels do s = {moved(s.anchor, edits), moved(s.head, edits), -1}
 	normalize(e)

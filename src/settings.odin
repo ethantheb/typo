@@ -27,6 +27,7 @@ Settings :: struct {
 	line_height:    f64, // times the font size
 	letter_spacing: f64, // logical pixels
 	smooth_scroll:  bool,
+	text_contrast:  f64,
 	terminal_shell: string, // "" = platform default
 	bundled_conpty: bool,   // Windows only
 	renderer:       string, // SDL render backend; applies on restart
@@ -51,6 +52,7 @@ Settings :: struct {
 Setting :: enum {
 	Theme,
 	Smooth_Scroll,
+	Text_Contrast,
 	Font_Family,
 	Font_Size,
 	Font_Weight,
@@ -112,6 +114,12 @@ SETTINGS := [Setting]Setting_Info {
 		section = .Appearance, key = "smooth_scroll", name = "Smooth scrolling",
 		description = "Ease the view when scrolling, instead of moving in notches.", keywords = "scroll animation wheel",
 		default = true,
+	},
+	.Text_Contrast = {
+		section = .Appearance, key = "text_contrast", name = "Text contrast",
+		description = "How solid the edges of letters are drawn; raise it for thin or small text. 0 draws them as the font is rasterized.",
+		keywords = "font smoothing antialiasing gamma thin dim weight sharp",
+		default = f64(0.5), min = 0, max = 4, step = 0.25,
 	},
 	.Font_Family = {
 		section = .Font, key = "family", name = "Font",
@@ -211,6 +219,7 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Line_Height:    return &s.line_height
 	case .Letter_Spacing: return &s.letter_spacing
 	case .Smooth_Scroll:  return &s.smooth_scroll
+	case .Text_Contrast:  return &s.text_contrast
 	case .Terminal_Shell: return &s.terminal_shell
 	case .Bundled_Conpty: return &s.bundled_conpty
 	case .Renderer:       return &s.renderer
@@ -495,6 +504,9 @@ settings_changed :: proc() {
 
 apply_settings :: proc() {
 	theme = theme_by_name(g.settings.theme)
+	// Not for each theme the theme list previews: that re-rasterizes all text.
+	w := &g.settings_window
+	if !(w.picking && w.picker == .Theme) do text_set_contrast(&g.text, theme.text, f32(g.settings.text_contrast))
 	terminal_apply_theme(&g.terminal_panel.terminal)
 	apply_editor_font()
 	apply_markdown_font()
