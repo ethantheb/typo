@@ -9,8 +9,8 @@ Currently supported:
 - Text editing
 - Syntax highlighting (tree-sitter/custom lexer)
 - Integrated terminal (libghostty-vt)
+- Markdown live rendering/editing
 
 Might try soon:
 - LSP
-- Markdown rendering
 - Tabular data rendering (CSV)
