@@ -165,9 +165,11 @@ Md_Params :: struct {
 // A table's columns, shared by the layouts of its rows.
 Md_Table :: struct {
 	first, last: int,   // lines: the header to the last row
+	widths:      []f32, // per column: its widest cell, padding included
+	aligns:      []u8,  // per column: 0 left, 1 center, 2 right
+	// Fitted to the pane (md_fit_table).
 	x:           f32,   // left edge, from the text column's left
 	edges:       []f32, // column edges from x, one more than the columns
-	aligns:      []u8,  // per column: 0 left, 1 center, 2 right
 }
 
 md_font_size :: proc() -> u16 {
@@ -600,7 +602,7 @@ md_table :: proc(e: ^Editor, i: int) -> ^Md_Table {
 	}
 
 	size := md_font_size()
-	widths := make([]f32, cols, context.temp_allocator)
+	t.widths = make([]f32, cols, mv.doc_allocator)
 	for line in t.first ..= min(t.last, t.first + MD_TABLE_MAX_ROWS) {
 		if line == delim do continue
 		text, _ := md_line_text(e, line)
@@ -608,25 +610,26 @@ md_table :: proc(e: ^Editor, i: int) -> ^Md_Table {
 		font: Font_Id = line == t.first ? .Md_Bold : .Md_Regular
 		for c, k in table_cells(text, content) {
 			if k >= cols do break
-			widths[k] = max(widths[k], text_width(&g.text, font, size, shown_cell_text(strings.trim_space(text[c[0]:c[1]]))))
+			t.widths[k] = max(t.widths[k], text_width(&g.text, font, size, shown_cell_text(strings.trim_space(text[c[0]:c[1]]))))
 		}
 	}
-	total: f32
-	for &w in widths {
-		w = max(w + 2 * MD_CELL_PAD, 3 * MD_CELL_PAD)
-		total += w
-	}
-	// Within the text column if it fits, else wider (centered in the pane),
-	// and shrunk to fit the pane if even that isn't enough.
-	full := max(e.view.w - 2 * MD_COLUMN_PAD, mv.col_w)
-	if total > full {
-		for &w in widths do w *= full / total
-		total = full
-	}
-	t.x = total <= mv.col_w ? 0 : math.round((mv.col_w - total) / 2)
+	for &w in t.widths do w = max(w + 2 * MD_CELL_PAD, 3 * MD_CELL_PAD)
 	t.edges = make([]f32, cols + 1, mv.doc_allocator)
-	for w, k in widths do t.edges[k + 1] = t.edges[k] + math.round(w)
+	md_fit_table(e, t)
 	return t
+}
+
+// Places a table's columns within the text column if they fit, else wider
+// (centered in the pane), and shrunk to fit the pane if even that isn't enough.
+md_fit_table :: proc(e: ^Editor, t: ^Md_Table) {
+	mv := &e.mdv
+	total: f32
+	for w in t.widths do total += w
+	full := max(e.view.w - 2 * MD_COLUMN_PAD, mv.col_w)
+	shrink: f32 = total > full ? full / total : 1
+	total = min(total, full)
+	t.x = total <= mv.col_w ? 0 : math.round((mv.col_w - total) / 2)
+	for w, k in t.widths do t.edges[k + 1] = t.edges[k] + math.round(w * shrink)
 }
 
 // A cell's text without its inline syntax, to measure.
@@ -1278,6 +1281,27 @@ md_row_bounds :: proc(L: ^Line_Layout, row: int, text_len: int) -> (lo, hi: int)
 	if lo < 0 do lo = int(r.lo)
 	if row == len(L.rows) - 1 do hi = max(hi, lo)
 	return
+}
+
+// The x range a selection of line bytes [lo, hi] covers on a row.
+md_selection_span :: proc(L: ^Line_Layout, text: string, row, lo, hi: int) -> (x1, x2: f32, ok: bool) {
+	last := row == len(L.rows) - 1
+	row_lo := int(L.rows[row].lo)
+	row_hi := last ? len(text) : int(L.rows[row + 1].lo)
+	if hi < row_lo || lo > row_hi || (lo == row_hi && !last) do return
+	_, x1 = md_caret_x(L, text, max(lo, row_lo))
+	if hi < row_hi || last {
+		_, x2 = md_caret_x(L, text, min(hi, row_hi))
+		return x1, x2, true
+	}
+	// Reaching the next row: to this row's end (a caret there is on the next row).
+	r := L.rows[row]
+	x2 = x1
+	for ri in r.runs[0] ..< r.runs[1] {
+		run := L.runs[ri]
+		if !md_hanging(L, run) do x2 = max(x2, run.x + run.w)
+	}
+	return x1, x2, true
 }
 
 // --- Cache keys ---------------------------------------------------------------------------

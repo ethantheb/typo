@@ -27,8 +27,8 @@ check: `odin check src -vet-unused -vet-unused-imports`.
 
 The performance suite (`src/perf.odin`) is an optimized build run as `typo-perf --perf`.
 It opens a real window, runs scripted phases (startup, buffer, syntax, Markdown parsing,
-fuzzy search, VT parsing, typing, scrolling, rendered Markdown (opening, scrolling,
-typing, moving through long tables and code blocks, typed spaces and tabs measured
+fuzzy search, VT parsing, typing, scrolling, resizing the window, rendered Markdown
+(opening, scrolling, typing, resizing, moving through long tables and code blocks, typed spaces and tabs measured
 with the real fonts), huge files, the finder, the settings window and its theme and
 font lists, terminal redraws and shell output, idle CPU/GPU), prints a table and
 exits non-zero if any result exceeds its limit. It ignores real keyboard and mouse
@@ -74,7 +74,10 @@ src/                 package editor: the app
                      widgets) wrapped into rows of runs; tables; layout cache keys
   md_edit.odin       Rendered Markdown editing keys (md_handle_key): lists and quotes
                      continued by Enter, nested by Tab, indentation deleted by level,
-                     numbered lists renumbered
+                     numbered lists renumbered; copy and cut take the syntax of what
+                     is selected: formatting markers (added around a part of it) and
+                     the markers of lines selected from where their text starts
+                     (md_copy_range)
   md_media.odin      Rendered Markdown links (Ctrl+click) and images (decoded on
                      threads with vendor:stb/image, uploaded as textures)
   terminal.odin      Terminal: session lifecycle, row cache, drawing
@@ -126,6 +129,7 @@ all there. In particular:
   `clay.UpdateScrollContainers`, which eases wheel scrolling for lists registered with
   `smooth_scroll_list` (`list_scrollbar` does that).
 
+
 ## How a frame works
 
 `app_iterate` (main.odin) runs once per frame:
@@ -137,6 +141,11 @@ all there. In particular:
    custom elements (`custom_element`) that the renderer draws itself
    (`draw_editor`, `draw_terminal`).
 3. `render_clay_commands`, present, `free_all(context.temp_allocator)`.
+
+Nothing is shown half ready. A newly opened file isn't drawn (`Editor.shown`) until
+`editor_frame` has its element's real bounds from a layout and no image in view is
+still loading (or `EDITOR_SHOW_WAIT` has passed), and the window starts hidden and
+is shown after the first frame drawn with the editor ready.
 
 The loop sleeps when nothing changes: `needs_continuous_frames` lists what keeps it
 awake, and `schedule_next_frame` sets a timer only for a blinking cursor. Other threads
@@ -165,11 +174,13 @@ exception is indentation that Markdown treats as syntax (before a marker, the on
 space after it, indentation consumed by a container or an indented code block); the
 caret is drawn where the text starts. While the mouse button is down, what is
 revealed stays as it was before the press (`md_hold_reveal`), so the text doesn't
-move under a drag. The first line starts below a margin (`Height_Map.pad`). Code that assumes
+move under a drag; on release the selection grows to what copying it takes
+(`md_snap_selection`). The first line starts below a margin (`Height_Map.pad`). Code that assumes
 one row per line and a fixed column width (scrolling, hit testing, vertical movement)
 branches on `md_rendered`. Its caches (`md_begin`) are in two parts: per document
-(paragraph inlines, tables, code block extents and widths, code highlights) and per
-document and selections (each line's layout). Editing keys take separate paths:
+(paragraph inlines, tables, code block extents and widths, code highlights; tables
+are refitted when the pane's width changes) and per document, selections and column
+width (each line's layout), so resizing past the text's maximum width rewraps nothing. Editing keys take separate paths:
 `editor_handle_key` sends the rendered view to `md_handle_key`, and the text view
 edits like any other file; only caret movement (`navigation_key`) is shared.
 

@@ -32,6 +32,7 @@ App :: struct {
 	wheel:           [2]f32,
 
 	frame:           u64,
+	window_shown:    bool,
 	last_ticks:      u64,
 	dt:              f32,
 	fps:             f32, // frames presented per second, measured over FPS_WINDOW
@@ -105,7 +106,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		sdl.Log("SDL_Init failed: %s", sdl.GetError())
 		return .FAILURE
 	}
-	// Shown once the first frame is drawn (see app_iterate), so it never appears empty.
+	// Shown once a frame is drawn with the editor ready (see app_iterate), so it
+	// never appears empty or half laid out.
 	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN})
 	set_window_icon()
 	if g.window == nil {
@@ -225,7 +227,10 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	render_clay_commands(g.renderer, &commands, g.ui_scale)
 	if g.perf != nil do perf_mark(.Render)
 	_ = sdl.RenderPresent(g.renderer)
-	if g.frame == 0 do _ = sdl.ShowWindow(g.window)
+	if !g.window_shown && (g.editor.status != .Text || g.editor.shown) {
+		_ = sdl.ShowWindow(g.window)
+		g.window_shown = true
+	}
 	if g.perf != nil do perf_mark(.Present)
 
 	g.wheel = {}
@@ -243,6 +248,7 @@ needs_continuous_frames :: proc() -> bool {
 	switch {
 	case g.pending != nil,
 	     finder_busy(),
+	     e.status == .Text && !e.shown, // waiting for it to be ready
 	     e.dragging && g.mouse_down, // edge auto-scroll
 	     e.status == .Text && syntax.highlighter_busy(&e.hl, &e.buf),
 	     e.md != nil && markdown.doc_busy(e.md),

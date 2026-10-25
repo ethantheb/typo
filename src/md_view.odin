@@ -51,12 +51,13 @@ Md_View :: struct {
 		last:   int, // the block's last line, which holds its scroll bar
 		grab:   f32, // pointer x minus the thumb's left when the drag began
 	},
-	// Caches for the current document, cleared when it (or the column or
-	// fonts) changes, and the lines laid out for the current selections too
-	// (see md_begin).
+	// Caches for the current document, cleared when it (or the fonts) changes,
+	// and the lines laid out for the current selections and column too (see
+	// md_begin).
 	arena:           virtual.Arena,
 	doc_allocator:   mem.Allocator,
 	doc_token:       u64,
+	fitted:          [2]f32, // the column width and view width tables are fitted to
 	blocks:          map[int]^Md_Block,
 	tables:          map[int]^Md_Table, // by delimiter row
 	code_blocks:     [dynamic]^Md_Code_Block,
@@ -72,11 +73,10 @@ Md_View :: struct {
 	held:            [dynamic]Selection,
 }
 
-// A code block's lines, and the width of its widest line and of its box once
-// measured.
+// A code block's lines, and the width of its widest line once measured.
 Md_Code_Block :: struct {
 	first, last: int,
-	width, box:  f32,
+	width:       f32,
 	measured:    bool,
 }
 
@@ -143,7 +143,8 @@ md_default_mode :: proc(e: ^Editor) -> Md_Mode {
 // layouts, which also depend on the selections.
 md_begin :: proc(e: ^Editor) {
 	mv := &e.mdv
-	if mv.doc_allocator.procedure == nil {
+	fresh := mv.doc_allocator.procedure == nil
+	if fresh {
 		_ = virtual.arena_init_growing(&mv.arena)
 		mv.doc_allocator = virtual.arena_allocator(&mv.arena)
 	}
@@ -151,15 +152,13 @@ md_begin :: proc(e: ^Editor) {
 		e.buf.version,
 		e.md.version,
 		e.md.refdef_gen,
-		u64(transmute(u32)mv.col_w),
 		g.text.generation,
 		u64(transmute(u32)g.text.scale),
 		u64(g.settings.markdown_font_size),
 		transmute(u64)g.settings.markdown_line_height,
-		u64(transmute(u32)e.view.w),
 	}
 	h := hash.fnv64a(mem.slice_to_bytes(doc[:]))
-	if h != mv.doc_token || mv.memo == nil {
+	if h != mv.doc_token || fresh {
 		mv.doc_token = h
 		virtual.arena_free_all(&mv.arena)
 		mv.blocks = make(map[int]^Md_Block, mv.doc_allocator)
@@ -169,8 +168,13 @@ md_begin :: proc(e: ^Editor) {
 		mv.memo = make(map[int]^Line_Layout, mv.doc_allocator)
 		mv.token = 0
 	}
+	fit := [2]f32{mv.col_w, e.view.w}
+	if fit != mv.fitted {
+		mv.fitted = fit
+		for _, t in mv.tables do md_fit_table(e, t)
+	}
 	h = hash.fnv64a(mem.slice_to_bytes(md_reveal_sels(e)), h)
-	view := [?]u64{u64(mv.caretless), mv.code_scroll_gen}
+	view := [?]u64{u64(mv.caretless), mv.code_scroll_gen, u64(transmute(u32)mv.col_w), u64(transmute(u32)e.view.w)}
 	h = hash.fnv64a(mem.slice_to_bytes(view[:]), h)
 	if h == mv.token do return
 	mv.token = h
@@ -306,6 +310,19 @@ md_layout_visible :: proc(e: ^Editor) {
 		e.scroll_y += delta
 		e.target_y += delta
 	}
+}
+
+// Whether an image in view is still loading (drawn as a placeholder of another size).
+md_images_loading :: proc(e: ^Editor) -> bool {
+	hm := &e.mdv.heights
+	if hm.lines == 0 do return false
+	line, y := hm_find(hm, e.scroll_y)
+	for ; line < hm.lines && y < e.scroll_y + f64(e.view.h); line += 1 {
+		L := md_line_layout(e, line)
+		for box in L.images do if md_image(string(L.strings[box.path[0]:box.path[1]])).state == .Loading do return true
+		y += f64(L.height)
+	}
+	return false
 }
 
 md_max_scroll :: proc(e: ^Editor) -> f64 {
@@ -460,11 +477,11 @@ md_code_widths :: proc(e: ^Editor, b: ^Md_Code_Block) -> (width, box: f32) {
 			content := int(markdown.line_detail(e.md, line, text).content[0])
 			cols = max(cols, visual_col(text[content:], len(text) - content))
 		}
-		L := md_line_layout(e, b.first)
-		b.width, b.box = f32(cols) * cw, L.code_bg[1] - L.code_bg[0] - 2 * MD_CODE_PAD
+		b.width = f32(cols) * cw
 		b.measured = true
 	}
-	return b.width, b.box
+	L := md_line_layout(e, b.first)
+	return b.width, L.code_bg[1] - L.code_bg[0] - 2 * MD_CODE_PAD
 }
 
 // A code block under line i that is wider than its box, to scroll sideways.
@@ -715,7 +732,7 @@ draw_markdown :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, 
 		hl = c.hl
 	}
 
-	caret_on := g.focus == .Editor && !mv.caretless && ((sdl.GetTicksNS() - e.blink_t0) / CARET_BLINK_NS) % 2 == 0
+	caret_on := !mv.caretless && editor_caret_on(e)
 	for v in lines {
 		text, start := md_line_text(e, v.line)
 		line_hl := hl[clamp(start - hl_lo, 0, len(hl)):clamp(start - hl_lo + len(text), 0, len(hl))]
@@ -809,11 +826,8 @@ draw_md_line :: proc(renderer: ^sdl.Renderer, e: ^Editor, line: int, L: ^Line_La
 		if lo > end do break
 		if hi < start || lo == hi do continue
 		for r, ri in L.rows {
-			row_lo := start + int(r.lo)
-			row_hi := ri + 1 < len(L.rows) ? start + int(L.rows[ri + 1].lo) : end
-			if hi < row_lo || lo > row_hi || (lo == row_hi && ri + 1 < len(L.rows)) do continue
-			_, x1 := md_caret_x(L, text, max(lo, row_lo) - start)
-			_, x2 := md_caret_x(L, text, min(hi, row_hi) - start)
+			x1, x2, ok := md_selection_span(L, text, ri, lo - start, hi - start)
+			if !ok do continue
 			if hi > end && ri == len(L.rows) - 1 do x2 += f32(md_font_size()) * 0.4
 			fill_rect(renderer, px(left, x1, scale), math.round(y + r.y * scale), (x2 - x1) * scale, math.ceil(r.h * scale), theme.selection)
 		}

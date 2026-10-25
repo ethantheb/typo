@@ -116,6 +116,15 @@ test_md_wrapped_rows :: proc(t: ^testing.T) {
 		ok := got == k || (k == int(r.lo) && row > 0 && got == k - 1)
 		testing.expectf(t, ok, "offset %d: point %v gives %d", k, x, got)
 	}
+
+	// A selection across the wraps covers each row to its end.
+	for r, ri in L.rows {
+		x1, x2, ok := md_selection_span(L, text, ri, 0, len(text))
+		end := L.runs[r.runs[1] - 1]
+		testing.expectf(t, ok && x1 == 0 && x2 == end.x + end.w, "row %d: %v..%v", ri, x1, x2)
+	}
+	x1, x2, _ := md_selection_span(L, text, 0, 3, int(L.rows[1].lo))
+	testing.expectf(t, x1 > 0 && x2 > x1, "to the wrap: %v..%v", x1, x2)
 }
 
 @(test)
@@ -165,6 +174,16 @@ test_md_hold_reveal :: proc(t: ^testing.T) {
 	e.mdv.holding = false
 	testing.expect_value(t, shown(e, 0), "Title")
 	testing.expect_value(t, shown(e, 2), "Some **bold** text.")
+
+	// No caret is drawn while a selection is being dragged.
+	focus := g.focus
+	defer g.focus, g.mouse_down = focus, false
+	g.focus = .Editor
+	e.dragging, g.mouse_down = true, true
+	e.blink_t0 = sdl.GetTicksNS()
+	testing.expect(t, !editor_caret_on(e))
+	g.mouse_down = false
+	testing.expect(t, editor_caret_on(e))
 }
 
 // The first line starts below a margin; a click in it is on the first line.
@@ -240,6 +259,27 @@ test_md_tables :: proc(t: ^testing.T) {
 
 	cells := table_cells(`| a \| b | c |`, 0)
 	testing.expect_value(t, len(cells), 2)
+}
+
+// A wider pane keeps the caches that depend only on the document, and refits
+// tables wider than the text column.
+@(test)
+test_md_resize :: proc(t: ^testing.T) {
+	e := make_md_editor("a *b*\n\n| aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | b |\n|--|--|\n| c | d |", 200)
+	defer destroy_md_editor(e)
+	md_begin(e)
+	block, tbl, token := md_block(e, 0), md_table(e, 2), e.mdv.doc_token
+	testing.expect(t, abs(tbl.edges[2] - 200) <= 1)
+	testing.expect_value(t, md_line_layout(e, 4).edges[2], tbl.x + tbl.edges[2])
+
+	e.view.w = 1000
+	md_column(e)
+	md_begin(e)
+	testing.expect(t, md_block(e, 0) == block && md_table(e, 2) == tbl)
+	testing.expect_value(t, e.mdv.doc_token, token)
+	testing.expect(t, tbl.edges[2] > 200)
+	L := md_line_layout(e, 4)
+	testing.expect_value(t, L.edges[2], tbl.x + tbl.edges[2])
 }
 
 @(test)
@@ -325,6 +365,83 @@ test_md_enter_continues_lists :: proc(t: ^testing.T) {
 		{"plain|", "plain\n|"},
 	}
 	for c in cases do expect_typing(t, c[0], {{"⏎", c[1], ""}})
+}
+
+// An editor for `text` with "«" and "»" removed, selecting what they enclose.
+@(private = "file")
+md_editor_selecting :: proc(text: string) -> ^Editor {
+	lo := strings.index(text, "«")
+	hi := strings.index(text, "»") - len("«")
+	text, _ := strings.remove_all(text, "«", context.temp_allocator)
+	text, _ = strings.remove_all(text, "»", context.temp_allocator)
+	e := make_md_editor(text)
+	set_single_selection(e, {lo, hi, -1})
+	return e
+}
+
+// Copying in the rendered view takes the syntax of what is selected: the
+// markers of formatting (added around a part of it), and the list, quote or
+// heading markers of lines selected from where their text starts.
+@(test)
+test_md_copy_takes_markers :: proc(t: ^testing.T) {
+	cases := [?][2]string {
+		{"- «a\n- b»", "- a\n- b"},
+		{"- a«\n- b»", "\n- b"},
+		{"- «a»\n- b", "a"},
+		{"- [ ] «t\nx»", "- [ ] t\nx"},
+		{"1. «a\n2. b»", "1. a\n2. b"},
+		{"> «q\nx»", "> q\nx"},
+		{"## «H\nx»", "## H\nx"},
+		{"> - «a\n> - b»", "> - a\n> - b"},
+		{"x\n  - «a\nb»", "  - a\nb"},
+		{"p«ara\nx»", "ara\nx"},
+		{"Some **«bold»** text", "**bold**"},
+		{"So«me **bo»ld** text", "me **bo**"},
+		{"Some **b«ol»d** text", "**ol**"},
+		{"Some **«bold** te»xt", "**bold** te"},
+		{"«Some **»bold** text", "Some "},
+		{"Some **bold«** text»", " text"},
+		{"***«x»***", "***x***"},
+		{"***x«y»z***", "***y***"},
+		{"a **b«\nc» d** e", "**\nc**"},
+		{"[l«ink»](http://a) after", "[ink](http://a)"},
+		{"`«code»`", "`code`"},
+		{"~~«gone»~~", "~~gone~~"},
+		{"a \\«*» b", "\\*"},
+		{"- **«a**\n- b»", "- **a**\n- b"},
+	}
+	for c in cases {
+		e := md_editor_selecting(c[0])
+		lo, hi, before, after := md_copy_range(e, sel_lo(e.sels[0]), sel_hi(e.sels[0]))
+		got := strings.concatenate({before, string(buffer.read_alloc(&e.buf, lo, hi)), after}, context.temp_allocator)
+		testing.expectf(t, got == c[1], "%q copies %q, want %q", c[0], got, c[1])
+		destroy_md_editor(e)
+	}
+
+	// Cut takes the same range: no empty item or markers left behind.
+	cuts := [?][2]string {
+		{"- «a\n- b»\n- c", "\n- c"},
+		{"Some **«bold»** text", "Some  text"},
+		{"Some **b«ol»d** text", "Some **bd** text"},
+	}
+	for c in cuts {
+		e := md_editor_selecting(c[0])
+		editor_copy(e, true)
+		testing.expect_value(t, md_text(e), c[1])
+		destroy_md_editor(e)
+	}
+
+	// A mouse selection snaps to the same range when released, either way round.
+	e := md_editor_selecting("- **«a**\n- b» c")
+	defer destroy_md_editor(e)
+	md_snap_selection(e)
+	testing.expect_value(t, e.sels[0], Selection{0, 11, -1})
+	set_single_selection(e, {11, 4, -1})
+	md_snap_selection(e)
+	testing.expect_value(t, e.sels[0], Selection{11, 0, -1})
+	set_single_selection(e, {6, 6, -1})
+	md_snap_selection(e)
+	testing.expect_value(t, e.sels[0], Selection{6, 6, -1})
 }
 
 @(test)

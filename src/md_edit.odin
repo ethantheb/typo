@@ -73,6 +73,95 @@ md_prefix :: proc(e: ^Editor, line: int) -> (p: Md_Prefix) {
 	return
 }
 
+// What copying (or cutting) a selection from lo to hi takes in the rendered
+// view: the range grown to the markers of the formatting it covers, less
+// markers it covers without their text, and the markers to add around it for
+// formatting it covers only part of. A selection over several lines that starts
+// where a line's text does takes the line's list, quote or heading markers too.
+md_copy_range :: proc(e: ^Editor, lo, hi: int) -> (from, to: int, before, after: string) {
+	editor_take_changes(e)
+	first, last := buffer.offset_to_line(&e.buf, lo), buffer.offset_to_line(&e.buf, hi)
+	markdown.doc_update(e.md, &e.buf, last + markdown.MAX_BLOCK_LINES, 0)
+	md_begin(e)
+
+	// The inline spans with markers in the blocks at either end, in document offsets.
+	Marked :: struct {
+		lo, open_hi, close_lo, hi: int,
+		open, close:               string,
+	}
+	spans := make([dynamic]Marked, context.temp_allocator)
+	for line, i in ([2]int{first, last}) {
+		b := md_block(e, line)
+		if b == nil || (i == 1 && b.bt.first <= first) do continue
+		bt := &b.bt
+		for s in b.spans {
+			#partial switch s.kind {
+			case .Url, .Html, .Entity, .Hard_Break: continue
+			}
+			append(&spans, Marked {
+				markdown.block_to_doc(bt, int(s.lo)), markdown.block_to_doc(bt, int(s.open_hi)),
+				markdown.block_to_doc(bt, int(s.close_lo)), markdown.block_to_doc(bt, int(s.hi)),
+				bt.text[s.lo:s.open_hi], bt.text[s.close_lo:s.hi],
+			})
+		}
+	}
+
+	from, to = lo, hi
+	for _ in 0 ..< 8 {
+		was := [2]int{from, to}
+		for s in spans {
+			switch {
+			case from > s.lo && from <= s.open_hi && to > s.open_hi: from = s.lo
+			case from >= s.close_lo && from < s.hi && to >= s.hi:    from = s.hi
+			}
+			switch {
+			case to >= s.close_lo && to < s.hi && from < s.close_lo: to = s.hi
+			case to > s.lo && to <= s.open_hi && from <= s.lo:       to = s.lo
+			}
+		}
+		if was == {from, to} do break
+	}
+	if from >= to do return lo, hi, "", ""
+
+	opens := make([dynamic]Marked, context.temp_allocator)
+	closes := make([dynamic]Marked, context.temp_allocator)
+	for s in spans {
+		if s.open_hi < from && from < s.close_lo do append(&opens, s)
+		if s.open_hi < to && to < s.close_lo do append(&closes, s)
+	}
+	slice.sort_by(opens[:], proc(a, b: Marked) -> bool {return a.lo < b.lo})
+	slice.sort_by(closes[:], proc(a, b: Marked) -> bool {return a.close_lo < b.close_lo})
+	sb := strings.builder_make(context.temp_allocator)
+	for s in opens do strings.write_string(&sb, s.open)
+	before = strings.to_string(sb)
+	sb = strings.builder_make(context.temp_allocator)
+	for s in closes do strings.write_string(&sb, s.close)
+	after = strings.to_string(sb)
+	return copy_line_start(e, from, to), to, before, after
+}
+
+// Grows the primary selection to what copying it takes, once the mouse
+// button is released, so the highlight shows that.
+md_snap_selection :: proc(e: ^Editor) {
+	s := &e.sels[e.primary]
+	if s.anchor == s.head do return
+	from, to, _, _ := md_copy_range(e, sel_lo(s^), sel_hi(s^))
+	s^ = s.anchor < s.head ? {from, to, -1} : {to, from, -1}
+	normalize(e)
+}
+
+@(private = "file")
+copy_line_start :: proc(e: ^Editor, lo, hi: int) -> int {
+	line := buffer.offset_to_line(&e.buf, lo)
+	if buffer.offset_to_line(&e.buf, hi) == line || line >= len(e.md.lines) do return lo
+	text, start := line_text(e, line)
+	d := markdown.line_detail(e.md, line, text)
+	content := int(d.content[0])
+	if d.task != {} do content = min(int(d.task[1]) + 1, len(text))
+	if e.md.lines[line].kind == .Atx_Heading do content = max(content, int(d.open[1]))
+	return lo - start <= content ? start : lo
+}
+
 // The marker of the item after one: the same bullet, or the next number.
 @(private = "file")
 next_marker :: proc(marker: string) -> string {

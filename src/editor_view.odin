@@ -20,6 +20,8 @@ import ttf "../vendor/sdl3/ttf"
 CARET_BLINK_NS :: 530_000_000
 TEXT_MARGIN :: 8 // logical pixels between the gutter and the text
 SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
+// The longest an opened file waits for what is in view (images) before it is drawn.
+EDITOR_SHOW_WAIT :: 500_000_000 // ns
 
 editor_font_size :: proc() -> u16 {
 	return u16(g.settings.font_size)
@@ -43,7 +45,8 @@ editor_char_width :: proc() -> f32 {
 editor_frame :: proc(e: ^Editor, interactive: bool) {
 	if e.status != .Text do return
 	editor_take_changes(e)
-	if r, ok := element_rect(clay.ID("EditorText")); ok do e.view = r
+	r, placed := element_rect(clay.ID("EditorText"))
+	if placed do e.view = r
 	e.char_w = editor_char_width()
 	if !g.mouse_down do e.mdv.holding = false
 	rendered := md_rendered(e)
@@ -66,6 +69,20 @@ editor_frame :: proc(e: ^Editor, interactive: bool) {
 		last := int(e.scroll_y + f64(e.view.h)) / editor_line_height() + 1
 		markdown.doc_update(e.md, &e.buf, last + markdown.LOOKAHEAD_LINES, markdown.PARSE_BUDGET)
 	}
+	if !e.shown do e.shown = (placed && editor_ready(e)) || sdl.GetTicksNS() - e.opened_at > EDITOR_SHOW_WAIT
+}
+
+// Whether what is in view is final: no image in it still loading.
+@(private = "file")
+editor_ready :: proc(e: ^Editor) -> bool {
+	return !md_rendered(e) || !md_images_loading(e)
+}
+
+// Whether to draw the carets now: in the blink's on phase, and not while a mouse
+// selection is being made.
+editor_caret_on :: proc(e: ^Editor) -> bool {
+	if g.focus != .Editor || (e.dragging && g.mouse_down) do return false
+	return ((sdl.GetTicksNS() - e.blink_t0) / CARET_BLINK_NS) % 2 == 0
 }
 
 // Passes the buffer's edits since the last call to the highlighter and the
@@ -218,6 +235,10 @@ editor_mouse :: proc(e: ^Editor) {
 		}
 		normalize(e)
 	} else if !g.mouse_down {
+		if e.dragging {
+			if md_rendered(e) do md_snap_selection(e)
+			e.blink_t0 = sdl.GetTicksNS()
+		}
 		e.dragging = false
 	}
 
@@ -326,7 +347,7 @@ editor_scrollbar_mouse :: proc(e: ^Editor) -> bool {
 // --- Drawing -------------------------------------------------------------------
 
 draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, scale: f32) {
-	if e.status != .Text || e.char_w <= 0 do return
+	if e.status != .Text || e.char_w <= 0 || !e.shown do return
 	if md_rendered(e) {
 		draw_markdown(renderer, e, b, scale)
 		draw_scrollbar(renderer, e, scale)
@@ -370,7 +391,7 @@ draw_editor :: proc(renderer: ^sdl.Renderer, e: ^Editor, b: clay.BoundingBox, sc
 
 	primary := e.sels[e.primary]
 	primary_line := buffer.offset_to_line(&e.buf, primary.head)
-	caret_on := g.focus == .Editor && ((sdl.GetTicksNS() - e.blink_t0) / CARET_BLINK_NS) % 2 == 0
+	caret_on := editor_caret_on(e)
 	caret_w := max(math.round(2 * scale), 1)
 
 	lines := visible_lines(e, first, last, hl_start, hl_end)

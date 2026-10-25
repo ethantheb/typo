@@ -47,6 +47,7 @@ Perf :: struct {
 	gpu:        Gpu_Counter,
 	results:    int,
 	failures:   [dynamic]string,
+	window_size:  [2]i32, // before a resizing phase
 	// Terminal output phase.
 	flood_parsed: u64,
 	flood_last:   time.Tick,
@@ -82,10 +83,12 @@ PHASES := [?]Phase {
 	{name = "idle with a file open", step = phase_idle, idle = true},
 	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8},
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
+	{name = "resizing the window (tree-sitter)", step = phase_resize, frame_limit = 8},
 	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
 	{name = "moving through a table and code block (rendered)", step = phase_move_markdown, frame_limit = 8},
+	{name = "resizing the window, Markdown (rendered)", step = phase_resize, frame_limit = 8},
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
@@ -651,6 +654,17 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 @(private = "file")
 phase_scroll :: proc(p: ^Perf, frame: int) -> bool {
 	editor_move(&g.editor, .Page_Down, false)
+	return frame == 120
+}
+
+// Narrows the window by 10 pixels a frame for 60 frames, then widens it back:
+// rendered Markdown keeps its column at its maximum width at first, then
+// rewraps every frame.
+@(private = "file")
+phase_resize :: proc(p: ^Perf, frame: int) -> bool {
+	if frame == 0 do _ = sdl.GetWindowSize(g.window, &p.window_size.x, &p.window_size.y)
+	step := i32(frame <= 60 ? frame : 120 - frame)
+	_ = sdl.SetWindowSize(g.window, p.window_size.x - 10 * step, p.window_size.y)
 	return frame == 120
 }
 

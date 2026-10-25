@@ -42,6 +42,10 @@ Editor :: struct {
 	view:     Rect,     // text area bounds from the last layout
 	char_w:   f32,      // monospace advance of the editor font
 	gutter_w: f32,
+	// Drawn only once laid out for its real size, with what is in view final
+	// (see editor_ready); until then the pane is empty.
+	shown:     bool,
+	opened_at: u64, // ticks
 
 	reveal:   bool, // scroll the primary caret into view next frame
 	dragging: bool,
@@ -101,6 +105,7 @@ editor_open :: proc(e: ^Editor, path: string) {
 		e.mdv.caretless = e.mdv.mode == .Rendered
 	}
 	e.status = .Text
+	e.opened_at = sdl.GetTicksNS()
 	append(&e.sels, Selection{0, 0, -1})
 }
 
@@ -588,10 +593,19 @@ editor_copy :: proc(e: ^Editor, cut: bool) {
 	ranges := make([][2]int, len(e.sels), context.temp_allocator)
 	for s, i in e.sels {
 		lo, hi := sel_lo(s), sel_hi(s)
-		if whole_lines do lo, hi = line_span(e, buffer.offset_to_line(&e.buf, lo))
+		before, after: string
+		if whole_lines {
+			lo, hi = line_span(e, buffer.offset_to_line(&e.buf, lo))
+		} else if md_rendered(e) {
+			lo, hi, before, after = md_copy_range(e, lo, hi)
+			// Grown ranges must not overlap.
+			if i > 0 do lo = min(max(lo, ranges[i - 1][1]), hi)
+		}
 		ranges[i] = {lo, hi}
 		if i > 0 && !whole_lines do strings.write_string(&sb, buffer.newline(&e.buf))
+		strings.write_string(&sb, before)
 		strings.write_bytes(&sb, buffer.read_alloc(&e.buf, lo, hi))
+		strings.write_string(&sb, after)
 	}
 	_ = sdl.SetClipboardText(strings.to_cstring(&sb))
 	if cut do apply(e, .Other, ranges, {""})
