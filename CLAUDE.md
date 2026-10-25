@@ -74,10 +74,8 @@ src/                 package editor: the app
                      widgets) wrapped into rows of runs; tables; layout cache keys
   md_edit.odin       Rendered Markdown editing keys (md_handle_key): lists and quotes
                      continued by Enter, nested by Tab, indentation deleted by level,
-                     numbered lists renumbered; copy and cut take the syntax of what
-                     is selected: formatting markers (added around a part of it) and
-                     the markers of lines selected from where their text starts
-                     (md_copy_range)
+                     numbered lists renumbered; copy and cut keep the Markdown of
+                     what is selected (md_copy_range)
   md_media.odin      Rendered Markdown links (Ctrl+click) and images (decoded on
                      threads with vendor:stb/image, uploaded as textures)
   terminal.odin      Terminal: session lifecycle, row cache, drawing
@@ -175,12 +173,12 @@ space after it, indentation consumed by a container or an indented code block); 
 caret is drawn where the text starts. While the mouse button is down, what is
 revealed stays as it was before the press (`md_hold_reveal`), so the text doesn't
 move under a drag; on release the selection grows to what copying it takes
-(`md_snap_selection`). The first line starts below a margin (`Height_Map.pad`). Code that assumes
-one row per line and a fixed column width (scrolling, hit testing, vertical movement)
+(`md_snap_selection`). The first line starts below a margin (`Height_Map.pad`).
+Code that assumes one row per line and a fixed column width (scrolling, hit testing, vertical movement)
 branches on `md_rendered`. Its caches (`md_begin`) are in two parts: per document
-(paragraph inlines, tables, code block extents and widths, code highlights; tables
-are refitted when the pane's width changes) and per document, selections and column
-width (each line's layout), so resizing past the text's maximum width rewraps nothing. Editing keys take separate paths:
+(paragraph inlines, tables, code block extents and widths, code highlights) and per
+document, selections and column width (each line's layout); a new pane width only
+refits tables. Editing keys take separate paths:
 `editor_handle_key` sends the rendered view to `md_handle_key`, and the text view
 edits like any other file; only caret movement (`navigation_key`) is shared.
 

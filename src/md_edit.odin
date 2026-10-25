@@ -73,18 +73,22 @@ md_prefix :: proc(e: ^Editor, line: int) -> (p: Md_Prefix) {
 	return
 }
 
-// What copying (or cutting) a selection from lo to hi takes in the rendered
-// view: the range grown to the markers of the formatting it covers, less
-// markers it covers without their text, and the markers to add around it for
-// formatting it covers only part of. A selection over several lines that starts
-// where a line's text does takes the line's list, quote or heading markers too.
+// What copying or cutting [lo, hi] in the rendered view takes, so it pastes
+// with the formatting that was seen selected:
+// - [from, to]: the selection grown over the markers of formatted text it
+//   covers ("**bold**", not "bold"), and shrunk off markers selected without
+//   any of their text.
+// - before, after: markers to add when it is inside formatted text ("ol" in
+//   "**bold**" copies as "**ol**").
+// - Over several lines, starting at a line's text: from the line's start, with
+//   its list, quote or heading marker.
 md_copy_range :: proc(e: ^Editor, lo, hi: int) -> (from, to: int, before, after: string) {
 	editor_take_changes(e)
 	first, last := buffer.offset_to_line(&e.buf, lo), buffer.offset_to_line(&e.buf, hi)
 	markdown.doc_update(e.md, &e.buf, last + markdown.MAX_BLOCK_LINES, 0)
 	md_begin(e)
 
-	// The inline spans with markers in the blocks at either end, in document offsets.
+	// The spans with markers in the blocks at either end, in document offsets.
 	Marked :: struct {
 		lo, open_hi, close_lo, hi: int,
 		open, close:               string,
@@ -140,8 +144,8 @@ md_copy_range :: proc(e: ^Editor, lo, hi: int) -> (from, to: int, before, after:
 	return copy_line_start(e, from, to), to, before, after
 }
 
-// Grows the primary selection to what copying it takes, once the mouse
-// button is released, so the highlight shows that.
+// Grows the primary selection to what copying it takes (md_copy_range), so the
+// highlight shows what will be copied. Called when the mouse button is released.
 md_snap_selection :: proc(e: ^Editor) {
 	s := &e.sels[e.primary]
 	if s.anchor == s.head do return
@@ -150,6 +154,8 @@ md_snap_selection :: proc(e: ^Editor) {
 	normalize(e)
 }
 
+// The start of lo's line if [lo, hi] spans lines and starts at or before the
+// line's text (after its markers), else lo.
 @(private = "file")
 copy_line_start :: proc(e: ^Editor, lo, hi: int) -> int {
 	line := buffer.offset_to_line(&e.buf, lo)

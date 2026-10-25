@@ -51,13 +51,12 @@ Md_View :: struct {
 		last:   int, // the block's last line, which holds its scroll bar
 		grab:   f32, // pointer x minus the thumb's left when the drag began
 	},
-	// Caches for the current document, cleared when it (or the fonts) changes,
-	// and the lines laid out for the current selections and column too (see
-	// md_begin).
+	// Caches for the document, cleared when it or the fonts change, then memo:
+	// line layouts for the current selections and column width (see md_begin).
 	arena:           virtual.Arena,
 	doc_allocator:   mem.Allocator,
 	doc_token:       u64,
-	fitted:          [2]f32, // the column width and view width tables are fitted to
+	fitted:          [2]f32, // the column and view widths tables are fitted to
 	blocks:          map[int]^Md_Block,
 	tables:          map[int]^Md_Table, // by delimiter row
 	code_blocks:     [dynamic]^Md_Code_Block,
@@ -312,7 +311,7 @@ md_layout_visible :: proc(e: ^Editor) {
 	}
 }
 
-// Whether an image in view is still loading (drawn as a placeholder of another size).
+// Whether an image in view is still loading (its placeholder has another size).
 md_images_loading :: proc(e: ^Editor) -> bool {
 	hm := &e.mdv.heights
 	if hm.lines == 0 do return false

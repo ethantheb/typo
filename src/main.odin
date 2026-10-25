@@ -106,8 +106,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		sdl.Log("SDL_Init failed: %s", sdl.GetError())
 		return .FAILURE
 	}
-	// Shown once a frame is drawn with the editor ready (see app_iterate), so it
-	// never appears empty or half laid out.
+	// Shown after the first frame drawn with the editor ready (see app_iterate),
+	// so it never appears half drawn.
 	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN})
 	set_window_icon()
 	if g.window == nil {

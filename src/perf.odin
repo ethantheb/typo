@@ -657,9 +657,8 @@ phase_scroll :: proc(p: ^Perf, frame: int) -> bool {
 	return frame == 120
 }
 
-// Narrows the window by 10 pixels a frame for 60 frames, then widens it back:
-// rendered Markdown keeps its column at its maximum width at first, then
-// rewraps every frame.
+// Narrows the window 10 pixels a frame for 60 frames, then widens it back.
+// Rendered Markdown first only re-centers its column, then rewraps every frame.
 @(private = "file")
 phase_resize :: proc(p: ^Perf, frame: int) -> bool {
 	if frame == 0 do _ = sdl.GetWindowSize(g.window, &p.window_size.x, &p.window_size.y)

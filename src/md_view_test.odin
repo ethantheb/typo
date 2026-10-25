@@ -379,9 +379,9 @@ md_editor_selecting :: proc(text: string) -> ^Editor {
 	return e
 }
 
-// Copying in the rendered view takes the syntax of what is selected: the
-// markers of formatting (added around a part of it), and the list, quote or
-// heading markers of lines selected from where their text starts.
+// Copying in the rendered view keeps the Markdown of what is selected:
+// formatting markers (added when only part of formatted text is selected), and
+// list, quote and heading markers of lines selected from their text.
 @(test)
 test_md_copy_takes_markers :: proc(t: ^testing.T) {
 	cases := [?][2]string {

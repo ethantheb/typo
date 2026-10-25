@@ -20,7 +20,7 @@ import ttf "../vendor/sdl3/ttf"
 CARET_BLINK_NS :: 530_000_000
 TEXT_MARGIN :: 8 // logical pixels between the gutter and the text
 SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
-// The longest an opened file waits for what is in view (images) before it is drawn.
+// How long an opened file waits for images in view to load before it is drawn anyway.
 EDITOR_SHOW_WAIT :: 500_000_000 // ns
 
 editor_font_size :: proc() -> u16 {
@@ -72,14 +72,14 @@ editor_frame :: proc(e: ^Editor, interactive: bool) {
 	if !e.shown do e.shown = (placed && editor_ready(e)) || sdl.GetTicksNS() - e.opened_at > EDITOR_SHOW_WAIT
 }
 
-// Whether what is in view is final: no image in it still loading.
+// Whether nothing in view is still loading (images in rendered Markdown).
 @(private = "file")
 editor_ready :: proc(e: ^Editor) -> bool {
 	return !md_rendered(e) || !md_images_loading(e)
 }
 
-// Whether to draw the carets now: in the blink's on phase, and not while a mouse
-// selection is being made.
+// Whether carets are drawn now: in the blink's on phase, and not while a
+// selection is being dragged.
 editor_caret_on :: proc(e: ^Editor) -> bool {
 	if g.focus != .Editor || (e.dragging && g.mouse_down) do return false
 	return ((sdl.GetTicksNS() - e.blink_t0) / CARET_BLINK_NS) % 2 == 0

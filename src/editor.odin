@@ -42,8 +42,8 @@ Editor :: struct {
 	view:     Rect,     // text area bounds from the last layout
 	char_w:   f32,      // monospace advance of the editor font
 	gutter_w: f32,
-	// Drawn only once laid out for its real size, with what is in view final
-	// (see editor_ready); until then the pane is empty.
+	// Set once laid out at its real size with nothing in view still loading
+	// (editor_ready); until then the pane is drawn empty.
 	shown:     bool,
 	opened_at: u64, // ticks
 
@@ -598,7 +598,7 @@ editor_copy :: proc(e: ^Editor, cut: bool) {
 			lo, hi = line_span(e, buffer.offset_to_line(&e.buf, lo))
 		} else if md_rendered(e) {
 			lo, hi, before, after = md_copy_range(e, lo, hi)
-			// Grown ranges must not overlap.
+			// Grown ranges can overlap: start each after the previous one.
 			if i > 0 do lo = min(max(lo, ranges[i - 1][1]), hi)
 		}
 		ranges[i] = {lo, hi}

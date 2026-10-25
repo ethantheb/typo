@@ -619,8 +619,8 @@ md_table :: proc(e: ^Editor, i: int) -> ^Md_Table {
 	return t
 }
 
-// Places a table's columns within the text column if they fit, else wider
-// (centered in the pane), and shrunk to fit the pane if even that isn't enough.
+// Places a table's columns: within the text column if they fit, else wider and
+// centered on it, shrunk to the pane's width if need be.
 md_fit_table :: proc(e: ^Editor, t: ^Md_Table) {
 	mv := &e.mdv
 	total: f32
@@ -1294,7 +1294,8 @@ md_selection_span :: proc(L: ^Line_Layout, text: string, row, lo, hi: int) -> (x
 		_, x2 = md_caret_x(L, text, min(hi, row_hi))
 		return x1, x2, true
 	}
-	// Reaching the next row: to this row's end (a caret there is on the next row).
+	// It continues past this row: cover to the row's end, since a caret at
+	// row_hi is drawn on the next row.
 	r := L.rows[row]
 	x2 = x1
 	for ri in r.runs[0] ..< r.runs[1] {
