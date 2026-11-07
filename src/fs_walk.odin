@@ -5,6 +5,8 @@ import "core:slice"
 import "core:strings"
 import "core:sync"
 
+import "gfx"
+
 // Directory listing for the sidebar and the file finder. On Windows this lists
 // with FindFirstFileW (fs_walk_windows.odin), which reads names and attributes
 // without opening each file as core:os does; that is slow on network and
@@ -37,7 +39,7 @@ list_directory_generic :: proc(dir: string) -> (entries: []Dir_Entry, ok: bool) 
 	return list, true
 }
 
-Walk_Visit :: proc(path: string, user: rawptr) -> bool
+Walk_Visit :: gfx.Walk_Visit
 
 // Recursive file listing for the file finder. Calls visit(path, user) for each
 // file, with `path` valid only during the call; visit returns false to stop.

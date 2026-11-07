@@ -4,10 +4,11 @@ import "core:strings"
 
 import "../buffer"
 
-// Grouping lines into the blocks whose text is parsed for inlines together, and
-// the link reference labels those inlines resolve against.
+// Queries over the parsed lines: the blocks whose text is parsed for inlines
+// together, and structure found by looking at nearby lines.
 
-// Lines scanned up or down to find a block's extent.
+// Longer paragraphs are parsed for inlines in pieces of this many lines, from
+// their first line.
 MAX_BLOCK_LINES :: 200
 
 // One line's part of a block's inline text.
@@ -48,10 +49,12 @@ block_extent :: proc(doc: ^Doc, i: int) -> (first, last: int, ok: bool) {
 		return i, i, true
 	case .Paragraph, .Footnote_Def:
 		if is_table_header(doc, i) do return i, i, true
-		first = i
-		for first > 0 && i - first < MAX_BLOCK_LINES && continues_paragraph(doc, first) do first -= 1
+		// After the link reference definitions it may start with.
+		first = block_first(doc, i)
+		for first < i && !continues_paragraph(doc, first + 1) do first += 1
+		first += (i - first) / MAX_BLOCK_LINES * MAX_BLOCK_LINES
 		last = i
-		for last + 1 < len(doc.lines) && last - i < MAX_BLOCK_LINES && continues_paragraph(doc, last + 1) && !is_table_header(doc, last + 1) {
+		for last + 1 < len(doc.lines) && last + 1 < first + MAX_BLOCK_LINES && continues_paragraph(doc, last + 1) && !is_table_header(doc, last + 1) {
 			last += 1
 		}
 		return first, last, true
@@ -106,36 +109,15 @@ block_to_doc :: proc(bt: ^Block_Text, at: int) -> int {
 	return last.doc_lo + last.hi - last.lo
 }
 
-// The labels of the document's link reference definitions, rebuilt when a
-// definition line has changed.
-doc_labels :: proc(doc: ^Doc, b: ^buffer.Buffer) -> ^Labels {
-	if doc.labels_gen == doc.refdef_gen && doc.labels_built do return &doc.labels
-	doc.labels_gen = doc.refdef_gen
-	doc.labels_built = true
-	clear(&doc.labels)
-	for l, i in doc.lines {
-		if l.kind != .Link_Ref_Def do continue
-		start := buffer.line_start(b, i)
-		text := string(buffer.read_alloc(b, start, start + int(l.len)))
-		d := line_detail(doc, i, text)
-		if d.label[1] <= d.label[0] do continue
-		h := label_hash(text[d.label[0]:d.label[1]])
-		if h not_in doc.labels do doc.labels[h] = i
-	}
-	return &doc.labels
+// Whether the paragraph ending at line `last` is a setext heading.
+setext_heading :: proc(doc: ^Doc, last: int) -> bool {
+	return last + 1 < len(doc.lines) && doc.lines[last + 1].kind == .Setext_Underline
 }
 
-// The destination of the link reference definition for `label`.
-reference_destination :: proc(doc: ^Doc, b: ^buffer.Buffer, label: string) -> (dest: string, ok: bool) {
-	i := doc_labels(doc, b)[label_hash(label)] or_return
-	start := buffer.line_start(b, i)
-	text := string(buffer.read_alloc(b, start, start + int(doc.lines[i].len)))
-	d := line_detail(doc, i, text)
-	rest := strings.trim_left_space(text[min(int(d.label[1]) + 2, len(text)):])
-	if strings.has_prefix(rest, "<") {
-		end := strings.index_byte(rest, '>')
-		return rest[1:max(end, 1)], true
-	}
-	end := strings.index_any(rest, " \t")
-	return end < 0 ? rest : rest[:end], true
+// Whether line i is inside a block quote.
+quoted :: proc(doc: ^Doc, i: int) -> bool {
+	s := line_state(doc, i)
+	if doc.lines[i].kind == .Blank do return false
+	for c in s.containers[:s.depth] do if c.kind == .Quote do return true
+	return false
 }

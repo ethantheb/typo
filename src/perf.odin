@@ -11,7 +11,11 @@ import "buffer"
 import "markdown"
 import "syntax"
 import "term"
+import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
+import "gfx"
+import "textedit"
+import "mdview"
 
 // The performance suite: `typo --perf` (run by `python build.py --test` on an
 // optimized build). It drives the real app, with a real window and renderer,
@@ -88,6 +92,8 @@ PHASES := [?]Phase {
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
 	{name = "moving through a table and code block (rendered)", step = phase_move_markdown, frame_limit = 8},
+	{name = "typing above a long table (rendered)", step = phase_type_above_table, frame_limit = 8},
+	{name = "typing in a long table's cell (rendered)", step = phase_type_in_table, frame_limit = 8},
 	{name = "resizing the window, Markdown (rendered)", step = phase_resize, frame_limit = 8},
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
@@ -267,10 +273,10 @@ PERF_FONT_SIZE :: 37
 @(private = "file")
 phase_fonts :: proc(p: ^Perf, frame: int) -> bool {
 	t := time.tick_now()
-	font := text_get_font(&g.text, .Body, PERF_FONT_SIZE)
+	font := gfx.text_get_font(&gfx.text_system, .Body, PERF_FONT_SIZE)
 	result(p, "open a new font size", ms_since(t), "ms", 5)
 	t = time.tick_now()
-	_ = text_get(&g.text, font, "→ ✓ 漢字")
+	_ = gfx.text_get(&gfx.text_system, font, "→ ✓ 漢字")
 	result(p, "first text needing fallback fonts", ms_since(t), "ms")
 	return true
 }
@@ -569,14 +575,51 @@ phase_move_markdown :: proc(p: ^Perf, frame: int) -> bool {
 	e := &g.editor
 	if frame == 0 {
 		open_timed(p, "blocks.md")
-		md_show_caret(e)
+		textedit.show_caret(e, true)
 		at := buffer.line_start(&e.buf, 252)
-		set_single_selection(e, {at, at, -1})
+		textedit.set_single_selection(e, {at, at, -1})
 		e.reveal = true
 		return false
 	}
-	editor_move(e, .Down, false)
+	textedit.move(e, .Down, false)
 	return frame == 120
+}
+
+// Types in the paragraph above blocks.md's table, which stays in view: each
+// edit drops the caches of the document, the table's measured columns too.
+@(private = "file")
+phase_type_above_table :: proc(p: ^Perf, frame: int) -> bool {
+	e := &g.editor
+	if frame == 0 {
+		at := buffer.line_end(&e.buf, 2)
+		textedit.set_single_selection(e, {at, at, -1})
+		textedit.scroll_to(e, 0)
+		e.reveal = true
+		return false
+	}
+	text := " more words"
+	editor_text_input(e, text[frame % len(text):][:1])
+	return frame == 120
+}
+
+// Types in a cell of blocks.md's table, which stays rendered: each edit
+// measures the table's columns again, and the caret is kept in the cell.
+@(private = "file")
+phase_type_in_table :: proc(p: ^Perf, frame: int) -> bool {
+	e := &g.editor
+	if frame == 0 {
+		at := buffer.line_start(&e.buf, 8) + 3
+		textedit.set_single_selection(e, {at, at, -1})
+		textedit.scroll_to(e, 0)
+		e.reveal = true
+		return false
+	}
+	text := " more words"
+	editor_text_input(e, text[frame % len(text):][:1])
+	if frame < 120 do return false
+	row, _ := textedit.line_text(e, 8)
+	check(p, "typed text is in the cell", strings.count(row, "|") == 4 && strings.count(row, "more words") >= 10)
+	return true
 }
 
 // A space or tab typed after a heading, on a blank line and after a paragraph
@@ -587,20 +630,20 @@ phase_md_whitespace :: proc(p: ^Perf, frame: int) -> bool {
 	e := &g.editor
 	moves :: proc(e: ^Editor, line: int, key: sdl.Keycode) -> bool {
 		settle :: proc(e: ^Editor) {
-			editor_take_changes(e)
+			textedit.take_changes(e)
 			markdown.doc_update(e.md, &e.buf, max(int), time.Hour)
 		}
 		at := buffer.line_end(&e.buf, line)
-		set_single_selection(e, {at, at, -1})
-		before := md_caret(e, at).x
+		textedit.set_single_selection(e, {at, at, -1})
+		before := mdview.caret_at(&e.md_view, at).x
 		if key == sdl.K_SPACE {
 			editor_text_input(e, " ")
 		} else {
 			editor_handle_key(e, {key = key})
 		}
 		settle(e)
-		after := md_caret(e, e.sels[0].head).x
-		editor_undo(e)
+		after := mdview.caret_at(&e.md_view, e.sels[0].head).x
+		textedit.undo(e)
 		settle(e)
 		return after > before
 	}
@@ -641,8 +684,8 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 	e := &g.editor
 	if frame == 0 {
 		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
-		md_show_caret(e)
-		set_single_selection(e, {mid, mid, -1})
+		textedit.show_caret(e, true)
+		textedit.set_single_selection(e, {mid, mid, -1})
 		e.reveal = true
 		return false
 	}
@@ -653,7 +696,7 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 
 @(private = "file")
 phase_scroll :: proc(p: ^Perf, frame: int) -> bool {
-	editor_move(&g.editor, .Page_Down, false)
+	textedit.move(&g.editor, .Page_Down, false)
 	return frame == 120
 }
 
@@ -694,21 +737,56 @@ phase_finder :: proc(p: ^Perf, frame: int) -> bool {
 	return false
 }
 
-// Opens the settings window, searches it, moves through the rows and closes it.
+// Opens the settings window, searches it, moves through the rows, scrolls it with
+// the wheel (over a row's label, and over a horizontally clipped element such
+// as an input box, which is a Clay scroll container of its own), and closes it
+// while the list may still be easing.
 @(private = "file")
 phase_settings :: proc(p: ^Perf, frame: int) -> bool {
+	WHEEL_FRAMES :: 10
 	w := &g.settings_window
-	switch frame {
-	case 0:
+	@(static) scrolled, start: int
+	@(static) mouse: [2]f32
+	switch {
+	case frame == 0:
 		settings_window_toggle()
-	case 1 ..= 4:
+		scrolled, start = 0, 0
+	case frame <= 4:
 		search := "font"
 		append(&w.search, search[frame - 1])
-	case 5:
+	case frame == 5:
 		clear(&w.search)
-	case 6 ..= 30:
+	case frame <= 30:
 		w.focus, w.reveal = (frame - 6) % max(len(w.items), 1), true
+	// The pointer reaches elements only once they stop moving.
+	case start == 0 && g.animating:
+	case start == 0 || frame < start + 2 * WHEEL_FRAMES:
+		if start == 0 do start = frame
+		list := clay.ID("SettingsList")
+		data := clay.GetScrollContainerData(list)
+		r, ok := element_rect(list)
+		if !data.found || !ok do break
+		// From the top of the list: the second step finds where to point, from
+		// the layout scrolled back by the first.
+		step := (frame - start) % WHEEL_FRAMES
+		switch step {
+		case 0:
+			if frame == start do mouse = g.mouse_pos
+			data.scrollPosition.y = 0
+		case 1:
+			g.mouse_pos = {r.x + 40, r.y + r.h / 2}
+			if frame == start + 1 {
+				at, found := clipped_point(r)
+				if !found do break
+				g.mouse_pos = at
+			}
+			g.wheel = {0, -1}
+		case WHEEL_FRAMES - 1:
+			if data.scrollPosition.y < 0 do scrolled += 1
+		}
 	case:
+		g.mouse_pos = mouse
+		check(p, "the wheel scrolls the settings", scrolled == 2)
 		file_only := 0
 		for info in SETTINGS do if info.name == "" do file_only += 1
 		check(p, "lists every setting and command", len(w.items) == len(Command) + len(Setting) - file_only)
@@ -716,6 +794,23 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 		return true
 	}
 	return false
+}
+
+// A point in `r` over an element that clips only horizontally.
+@(private = "file")
+clipped_point :: proc(r: gfx.Rect) -> (at: [2]f32, found: bool) {
+	defer clay.SetPointerState(g.mouse_pos, g.mouse_down)
+	for y := r.y + 4; y < r.y + r.h; y += 6 {
+		for x := r.x + 4; x < r.x + r.w - SCROLLBAR_GUTTER; x += 12 {
+			clay.SetPointerState({x, y}, false)
+			ids := clay.GetPointerOverIds()
+			for id in ids.internalArray[:ids.length] {
+				data := clay.GetScrollContainerData(id)
+				if data.found && data.config.horizontal && !data.config.vertical do return {x, y}, true
+			}
+		}
+	}
+	return
 }
 
 // A key press, as if typed.
@@ -748,7 +843,7 @@ phase_theme_picker :: proc(p: ^Perf, frame: int) -> bool {
 	w := &g.settings_window
 	darks, lights: int
 	first_dark, last_light: string
-	for spec in THEMES {
+	for spec in gfx.THEMES {
 		if spec.dark {
 			if darks == 0 do first_dark = spec.key
 			darks += 1
@@ -775,7 +870,7 @@ phase_theme_picker :: proc(p: ^Perf, frame: int) -> bool {
 		press(sdl.K_ESCAPE)
 	case g.animating:
 	case:
-		check(p, "Esc restores the theme", g.settings.theme == DEFAULT_THEME && theme == theme_by_name(DEFAULT_THEME))
+		check(p, "Esc restores the theme", g.settings.theme == gfx.DEFAULT_THEME && gfx.theme == gfx.theme_by_name(gfx.DEFAULT_THEME))
 		settings_window_toggle()
 		return !w.open
 	}
@@ -791,7 +886,7 @@ phase_font_picker :: proc(p: ^Perf, frame: int) -> bool {
 	case frame <= 1:
 		p.mark_frame = 0
 		if open_settings_at(.Font_Family, frame) do press(sdl.K_RETURN)
-	case fonts_scanning(&g.fonts):
+	case gfx.fonts_scanning(&g.fonts):
 		if time.tick_since(p.phase_t0) < 30 * time.Second do return false
 		check(p, "finds installed fonts", false)
 		return true
@@ -806,7 +901,7 @@ phase_font_picker :: proc(p: ^Perf, frame: int) -> bool {
 		press(sdl.K_ESCAPE)
 	case g.animating:
 	case:
-		check(p, "Esc restores the font", g.settings.font_family == BUNDLED_FAMILY)
+		check(p, "Esc restores the font", g.settings.font_family == gfx.BUNDLED_FAMILY)
 		settings_window_toggle()
 		return true
 	}
@@ -819,12 +914,12 @@ phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
 	switch frame {
 	case 0:
 		g.settings.letter_spacing = 1
-		editor_move(&g.editor, .Doc_Start, false)
+		textedit.move(&g.editor, .Doc_Start, false)
 	case 120:
 		g.settings.letter_spacing = 0
 		return true
 	case:
-		editor_move(&g.editor, .Page_Down, false)
+		textedit.move(&g.editor, .Page_Down, false)
 	}
 	return false
 }
@@ -833,7 +928,7 @@ phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
 @(private = "file")
 phase_jump_large :: proc(p: ^Perf, frame: int) -> bool {
 	e := &g.editor
-	scroll_to(e, max_scroll_y(e) * f64(frame) / 120)
+	textedit.scroll_to(e, max_scroll_y(e) * f64(frame) / 120)
 	return frame == 120
 }
 
@@ -844,7 +939,7 @@ phase_long_line :: proc(p: ^Perf, frame: int) -> bool {
 	case 0:
 		open_timed(p, "long.js")
 	case 1:
-		editor_move(e, .Doc_End, false)
+		textedit.move(e, .Doc_End, false)
 	case:
 		editor_text_input(e, "x")
 	}

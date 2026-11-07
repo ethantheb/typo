@@ -1,4 +1,4 @@
-package editor
+package gfx
 
 import "base:runtime"
 import "core:os"
@@ -8,8 +8,8 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
-import sdl "../vendor/sdl3"
-import ttf "../vendor/sdl3/ttf"
+import sdl "../../vendor/sdl3"
+import ttf "../../vendor/sdl3/ttf"
 
 // Font families: the bundled IBM Plex Mono (editor and terminal) and IBM Plex
 // Sans (rendered Markdown), and the fonts installed on the system. Installed fonts are found by a
@@ -44,22 +44,22 @@ Font_Family :: struct {
 }
 
 BUNDLED_FACES := [?]Font_Face {
-	{{data = #load("../assets/fonts/IBMPlexMono-ExtraLight.ttf")}, 200, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-Light.ttf")}, 300, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-Regular.ttf")}, 400, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-Medium.ttf")}, 500, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-SemiBold.ttf")}, 600, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-Bold.ttf")}, 700, false},
-	{{data = #load("../assets/fonts/IBMPlexMono-Italic.ttf")}, 400, true},
-	{{data = #load("../assets/fonts/IBMPlexMono-MediumItalic.ttf")}, 500, true},
+	{{data = #load("../../assets/fonts/IBMPlexMono-ExtraLight.ttf")}, 200, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-Light.ttf")}, 300, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-Regular.ttf")}, 400, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-Medium.ttf")}, 500, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-SemiBold.ttf")}, 600, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-Bold.ttf")}, 700, false},
+	{{data = #load("../../assets/fonts/IBMPlexMono-Italic.ttf")}, 400, true},
+	{{data = #load("../../assets/fonts/IBMPlexMono-MediumItalic.ttf")}, 500, true},
 }
 
 BUNDLED_MD_FACES := [?]Font_Face {
-	{{data = #load("../assets/fonts/IBMPlexSans-Regular.ttf")}, 400, false},
-	{{data = #load("../assets/fonts/IBMPlexSans-SemiBold.ttf")}, 600, false},
-	{{data = #load("../assets/fonts/IBMPlexSans-Bold.ttf")}, 700, false},
-	{{data = #load("../assets/fonts/IBMPlexSans-Italic.ttf")}, 400, true},
-	{{data = #load("../assets/fonts/IBMPlexSans-BoldItalic.ttf")}, 700, true},
+	{{data = #load("../../assets/fonts/IBMPlexSans-Regular.ttf")}, 400, false},
+	{{data = #load("../../assets/fonts/IBMPlexSans-SemiBold.ttf")}, 600, false},
+	{{data = #load("../../assets/fonts/IBMPlexSans-Bold.ttf")}, 700, false},
+	{{data = #load("../../assets/fonts/IBMPlexSans-Italic.ttf")}, 400, true},
+	{{data = #load("../../assets/fonts/IBMPlexSans-BoldItalic.ttf")}, 700, true},
 }
 
 // The faces rendered Markdown is drawn with.
@@ -78,8 +78,13 @@ System_Fonts :: struct {
 	scanned:   bool,                 // a scan has finished
 }
 
+// Lists the files under `root` (see walk_files in the app's fs_walk.odin).
+Walk_Visit :: proc(path: string, user: rawptr) -> bool
+Walk_Files :: proc(root: string, ignore: []string, cancel: ^bool, user: rawptr, visit: Walk_Visit)
+
 // Shared with the scanning thread.
 Font_Scan :: struct {
+	walk:     Walk_Files,
 	thread:   ^thread.Thread,
 	mutex:    sync.Mutex,
 	done:     bool,
@@ -125,10 +130,11 @@ when ODIN_OS == .Windows {
 }
 
 // Starts looking for installed fonts on a background thread, unless a scan is
-// running or (without `again`) one has already finished.
-fonts_scan :: proc(sf: ^System_Fonts, again := false) {
+// running or (without `again`) one has already finished. `walk` lists the files.
+fonts_scan :: proc(sf: ^System_Fonts, walk: Walk_Files, again := false) {
 	if sf.scan != nil || (sf.scanned && !again) do return
 	sf.scan = new(Font_Scan)
+	sf.scan.walk = walk
 	sf.scan.started = time.tick_now()
 	sf.scan.thread = thread.create_and_start_with_poly_data(sf.scan, scan_fonts, init_context = runtime.default_context())
 }
@@ -278,7 +284,7 @@ scan_fonts :: proc(s: ^Font_Scan) {
 	st := State{s, &found}
 	dirs := font_dirs()
 	for dir in dirs {
-		walk_files(dir, nil, &s.cancel, &st, visit)
+		s.walk(dir, nil, &s.cancel, &st, visit)
 		delete(dir)
 	}
 	delete(dirs)
@@ -293,7 +299,7 @@ scan_fonts :: proc(s: ^Font_Scan) {
 	s.found = found
 	s.done = true
 	s.finished = time.tick_now()
-	wake_main_loop(nil)
+	if wake != nil do wake(nil)
 }
 
 // Adds the faces in one font file, including the named instances (Light,

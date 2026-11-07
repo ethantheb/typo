@@ -7,21 +7,20 @@ import "core:path/filepath"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
+import "gfx"
 import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
+import "mdview"
 
 App :: struct {
 	ctx:             runtime.Context,
 	window:          ^sdl.Window,
-	renderer:        ^sdl.Renderer,
-	text:            Text_System,
 	clay_memory:     []u8,
 
 	// Logical window size and pixels-per-logical-unit.
 	window_w:        i32,
 	window_h:        i32,
-	ui_scale:        f32,
 
 	// Input collected from events, consumed once per frame.
 	mouse_pos:       [2]f32,
@@ -46,19 +45,20 @@ App :: struct {
 
 	workspace:       Workspace,
 	editor:          Editor,
-	md_modes:        map[string]Md_Mode, // Markdown files toggled this session, by path
+	md_modes:        map[string]mdview.Mode, // Markdown files toggled this session, by path
 	terminal_panel:  Terminal_Panel,
 	focus:           Focus,
 	sidebar_visible: bool,
 	finder:          Finder,
 	settings:        Settings,
-	fonts:           System_Fonts,
+	fonts:           gfx.System_Fonts,
 	settings_window: Settings_Window,
 	in_modal:        bool, // building a popup's UI (see ui_interactive)
 	animating:       bool, // a Clay transition was unfinished at the end of the last layout
 	tooltip:         Tooltip_State,
 	pending:         Action,
-	perf:            ^Perf, // set by --perf
+	open_heading:    string, // owned; where the caret goes in the file `pending` opens
+	perf:           ^Perf, // set by --perf
 }
 
 g: App
@@ -114,11 +114,13 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		sdl.Log("SDL_CreateWindow failed: %s", sdl.GetError())
 		return .FAILURE
 	}
+	gfx.wake = wake_main_loop
+	md_env_init()
 	// The renderer backend is a setting.
 	settings_init(&g.settings)
 	if !create_renderer(g.settings.renderer) do return .FAILURE
 	update_window_metrics()
-	if !text_init(&g.text, g.renderer, g.ui_scale) do return .FAILURE
+	if !gfx.text_init(&gfx.text_system) do return .FAILURE
 	apply_settings()
 
 	min_memory := uint(clay.MinMemorySize())
@@ -140,16 +142,16 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 create_renderer :: proc(name: string) -> bool {
 	if name != "auto" {
 		cname := strings.clone_to_cstring(name, context.temp_allocator)
-		g.renderer = sdl.CreateRenderer(g.window, cname)
-		if g.renderer == nil do sdl.Log("renderer %s unavailable (%s); using the default", cname, sdl.GetError())
+		gfx.renderer = sdl.CreateRenderer(g.window, cname)
+		if gfx.renderer == nil do sdl.Log("renderer %s unavailable (%s); using the default", cname, sdl.GetError())
 	}
-	if g.renderer == nil do g.renderer = sdl.CreateRenderer(g.window, nil)
-	if g.renderer == nil {
+	if gfx.renderer == nil do gfx.renderer = sdl.CreateRenderer(g.window, nil)
+	if gfx.renderer == nil {
 		sdl.Log("SDL_CreateRenderer failed: %s", sdl.GetError())
 		return false
 	}
-	_ = sdl.SetRenderVSync(g.renderer, g.perf != nil ? 0 : 1)
-	_ = sdl.SetRenderDrawBlendMode(g.renderer, {.BLEND})
+	_ = sdl.SetRenderVSync(gfx.renderer, g.perf != nil ? 0 : 1)
+	_ = sdl.SetRenderDrawBlendMode(gfx.renderer, {.BLEND})
 	return true
 }
 
@@ -203,7 +205,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_scroll_containers()
 
 	settings_poll(&g.settings)
-	if fonts_poll(&g.fonts) {
+	if gfx.fonts_poll(&g.fonts) {
 		apply_editor_font()
 		apply_markdown_font()
 	}
@@ -222,11 +224,11 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_mouse_cursor()
 	if g.perf != nil do perf_mark(.Update)
 
-	_ = sdl.SetRenderDrawColor(g.renderer, u8(theme.bg.r), u8(theme.bg.g), u8(theme.bg.b), 255)
-	_ = sdl.RenderClear(g.renderer)
-	render_clay_commands(g.renderer, &commands, g.ui_scale)
+	_ = sdl.SetRenderDrawColor(gfx.renderer, u8(gfx.theme.bg.r), u8(gfx.theme.bg.g), u8(gfx.theme.bg.b), 255)
+	_ = sdl.RenderClear(gfx.renderer)
+	render_clay_commands(&commands, gfx.scale)
 	if g.perf != nil do perf_mark(.Render)
-	_ = sdl.RenderPresent(g.renderer)
+	_ = sdl.RenderPresent(gfx.renderer)
 	if !g.window_shown && (g.editor.status != .Text || g.editor.shown) {
 		_ = sdl.ShowWindow(g.window)
 		g.window_shown = true
@@ -236,7 +238,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	g.wheel = {}
 	g.mouse_pressed = false
 	g.frame += 1
-	text_end_frame(&g.text)
+	gfx.text_end_frame(&gfx.text_system)
 	schedule_next_frame()
 	free_all(context.temp_allocator)
 	return .CONTINUE
@@ -378,14 +380,15 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	terminal_destroy(&g.terminal_panel.terminal)
 	settings_window_destroy()
 	settings_destroy(&g.settings)
-	fonts_destroy(&g.fonts)
-	md_images_destroy()
+	gfx.fonts_destroy(&g.fonts)
+	mdview.images_destroy()
+	delete(g.open_heading)
 	destroy_mouse_cursors()
 	editor_destroy(&g.editor)
 	for path in g.md_modes do delete(path)
 	delete(g.md_modes)
 	workspace_destroy(&g.workspace)
-	text_destroy(&g.text)
+	gfx.text_destroy(&gfx.text_system)
 	delete(g.clay_memory)
 	if g.perf != nil do perf_end()
 	// SDL destroys the window/renderer and calls SDL_Quit after this returns.
@@ -396,12 +399,9 @@ update_window_metrics :: proc() {
 	_ = sdl.GetWindowSize(g.window, &g.window_w, &g.window_h)
 	scale := sdl.GetWindowDisplayScale(g.window)
 	if scale <= 0 do scale = 1
-	if scale == g.ui_scale do return
-	g.ui_scale = scale
-	if g.text.engine != nil {
-		text_set_scale(&g.text, scale)
-		clay.ResetMeasureTextCache()
-	}
+	if scale == gfx.scale do return
+	gfx.set_scale(&gfx.text_system, scale)
+	if gfx.text_system.engine != nil do clay.ResetMeasureTextCache()
 }
 
 clay_error_handler :: proc "c" (error: clay.ErrorData) {
@@ -463,8 +463,11 @@ apply_pending_action :: proc() {
 			editor_open(&g.editor, string(a))
 			workspace_reveal(&g.workspace, string(a))
 			g.focus = .Editor
+			if g.open_heading != "" do mdview.jump_to_heading(&g.editor.md_view, g.open_heading)
 		}
 		delete(string(a))
+		delete(g.open_heading)
+		g.open_heading = ""
 	case Open_Folder:
 		if editor_confirm_discard(&g.editor) do open_folder(string(a))
 		delete(string(a))

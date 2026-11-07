@@ -6,6 +6,9 @@ import "core:strings"
 import "core:testing"
 
 import "buffer"
+import "gfx"
+import "textedit"
+import sdl "../vendor/sdl3"
 
 // Unit tests for the main package: editing operations, matching and settings,
 // without a window. Run with: python build.py --test
@@ -15,6 +18,7 @@ make_editor :: proc(text: string) -> (e: Editor) {
 	g.settings.font_size = 15
 	buffer.buffer_init(&e.buf, transmute([]u8)strings.clone(text))
 	e.status = .Text
+	e.kind = &TEXT_KIND
 	append(&e.sels, Selection{0, 0, -1})
 	return
 }
@@ -34,16 +38,16 @@ contents :: proc(e: ^Editor) -> string {
 test_multi_cursor_edits :: proc(t: ^testing.T) {
 	e := make_editor("one\ntwo\nthree")
 	defer destroy_editor(&e)
-	editor_add_cursor_vertical(&e, +1)
-	editor_add_cursor_vertical(&e, +1)
+	textedit.add_cursor_vertical(&e, +1)
+	textedit.add_cursor_vertical(&e, +1)
 	testing.expect_value(t, len(e.sels), 3)
-	editor_insert(&e, "> ")
+	textedit.insert(&e, "> ")
 	testing.expect_value(t, contents(&e), "> one\n> two\n> three")
-	editor_delete(&e, -1, word = false)
+	textedit.delete_text(&e, -1, word = false)
 	testing.expect_value(t, contents(&e), ">one\n>two\n>three")
-	editor_undo(&e)
+	textedit.undo(&e)
 	testing.expect_value(t, contents(&e), "> one\n> two\n> three")
-	editor_single_cursor(&e)
+	textedit.single_cursor(&e)
 	testing.expect_value(t, len(e.sels), 1)
 }
 
@@ -51,9 +55,9 @@ test_multi_cursor_edits :: proc(t: ^testing.T) {
 test_newline_keeps_indent :: proc(t: ^testing.T) {
 	e := make_editor("\tif x {")
 	defer destroy_editor(&e)
-	editor_move(&e, .Doc_End, false)
-	editor_newline(&e)
-	editor_insert(&e, "y")
+	textedit.move(&e, .Doc_End, false)
+	editor_handle_key(&e, {key = sdl.K_RETURN})
+	textedit.insert(&e, "y")
 	testing.expect_value(t, contents(&e), "\tif x {\n\ty")
 }
 
@@ -62,26 +66,16 @@ test_movement :: proc(t: ^testing.T) {
 	e := make_editor("    foo_bar(baz)\r\nnext")
 	defer destroy_editor(&e)
 	testing.expect(t, e.buf.crlf)
-	editor_move(&e, .Home, false) // to the first non-blank
+	textedit.move(&e, .Home, false) // to the first non-blank
 	testing.expect_value(t, e.sels[0].head, 4)
-	editor_move(&e, .Word_Right, false)
+	textedit.move(&e, .Word_Right, false)
 	testing.expect_value(t, e.sels[0].head, 11) // after foo_bar
-	editor_move(&e, .End, false)
+	textedit.move(&e, .End, false)
 	testing.expect_value(t, e.sels[0].head, 16)
-	editor_move(&e, .Right, false) // over "\r\n" in one step
+	textedit.move(&e, .Right, false) // over "\r\n" in one step
 	testing.expect_value(t, e.sels[0].head, 18)
-	editor_move(&e, .Up, true)
+	textedit.move(&e, .Up, true)
 	testing.expect_value(t, e.sels[0], Selection{18, 0, 0})
-}
-
-@(test)
-test_columns :: proc(t: ^testing.T) {
-	text := "\tab\tc"
-	testing.expect_value(t, visual_col(text, 1), 4)
-	testing.expect_value(t, visual_col(text, 4), 8)
-	testing.expect_value(t, byte_at_col(text, 1), 0) // nearer the tab's start
-	testing.expect_value(t, byte_at_col(text, 3), 1)
-	testing.expect_value(t, byte_at_col(text, 9), 5)
 }
 
 @(test)
@@ -207,55 +201,6 @@ test_number_settings :: proc(t: ^testing.T) {
 	testing.expect_value(t, format_decimal(2), "2.0")
 }
 
-// Every built-in theme has a unique key and all of its syntax colors set.
-@(test)
-test_themes :: proc(t: ^testing.T) {
-	for spec, i in THEMES {
-		for other in THEMES[i + 1:] do testing.expectf(t, spec.key != other.key, "duplicate theme %s", spec.key)
-		for c, h in spec.syntax do testing.expectf(t, c != spec.bg, "%s: %v is the background color", spec.key, h)
-		testing.expect_value(t, theme_by_name(spec.key).bg, rgb(spec.bg))
-	}
-	testing.expect_value(t, theme_by_name("no-such-theme").bg, rgb(THEMES[0].bg))
-	// Each family has a dark and a light theme, for the theme list's dark/light switch.
-	for spec in THEMES {
-		other := false
-		for o in THEMES do if o.family == spec.family && o.dark != spec.dark do other = true
-		testing.expectf(t, other, "%s has no %s counterpart", spec.key, spec.dark ? "light" : "dark")
-	}
-}
-
-@(test)
-test_font_weights :: proc(t: ^testing.T) {
-	sf: System_Fonts
-	regular, bold, italic, found := font_family_sources(&sf, BUNDLED_FAMILY, 500)
-	testing.expect(t, found)
-	testing.expect(t, raw_data(regular.data) == raw_data(BUNDLED_FACES[3].data))
-	testing.expect(t, raw_data(bold.data) == raw_data(BUNDLED_FACES[5].data))
-	testing.expect(t, raw_data(italic.data) == raw_data(BUNDLED_FACES[7].data) && !italic.synthetic_italic)
-	regular, bold, _, _ = font_family_sources(&sf, BUNDLED_FAMILY, 100)
-	testing.expect(t, raw_data(regular.data) == raw_data(BUNDLED_FACES[0].data))
-	// Nothing heavier than Bold: bold text uses it too.
-	regular, bold, _, _ = font_family_sources(&sf, BUNDLED_FAMILY, 900)
-	testing.expect(t, raw_data(bold.data) == raw_data(BUNDLED_FACES[5].data))
-	_, _, _, found = font_family_sources(&sf, "Not A Font", 400)
-	testing.expect(t, !found)
-
-	md, md_found := markdown_family_sources(&sf, BUNDLED_MD_FAMILY)
-	testing.expect(t, md_found)
-	testing.expect(t, raw_data(md[.Bold_Italic].data) == raw_data(BUNDLED_MD_FACES[4].data))
-	testing.expect(t, raw_data(md[.SemiBold].data) == raw_data(BUNDLED_MD_FACES[1].data))
-	// A family without italics slants its upright faces.
-	md, _ = markdown_family_sources(&sf, BUNDLED_FAMILY)
-	testing.expect(t, raw_data(md[.Italic].data) == raw_data(BUNDLED_FACES[6].data) && !md[.Italic].synthetic_italic)
-	sf.families = make([dynamic]Font_Family)
-	defer delete(sf.families)
-	append(&sf.families, Font_Family{name = "Upright", faces = make([dynamic]Font_Face)})
-	defer delete(sf.families[0].faces)
-	append(&sf.families[0].faces, Font_Face{weight = 400})
-	md, _ = markdown_family_sources(&sf, "Upright")
-	testing.expect(t, md[.Italic].synthetic_italic && !md[.Regular].synthetic_italic)
-}
-
 // A fresh install writes the defaults; they must load back without problems.
 @(test)
 test_default_settings_are_valid :: proc(t: ^testing.T) {
@@ -268,6 +213,6 @@ test_default_settings_are_valid :: proc(t: ^testing.T) {
 	settings_save(&s)
 	settings_load(&s)
 	testing.expect_value(t, s.error, "")
-	testing.expect_value(t, s.theme, DEFAULT_THEME)
-	testing.expect_value(t, s.font_family, BUNDLED_FAMILY)
+	testing.expect_value(t, s.theme, gfx.DEFAULT_THEME)
+	testing.expect_value(t, s.font_family, gfx.BUNDLED_FAMILY)
 }

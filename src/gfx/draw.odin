@@ -1,13 +1,15 @@
-package editor
+package gfx
 
 import "core:math"
 
-import clay "../vendor/clay-odin"
-import sdl "../vendor/sdl3"
-import ttf "../vendor/sdl3/ttf"
+import clay "../../vendor/clay-odin"
+import sdl "../../vendor/sdl3"
+import ttf "../../vendor/sdl3/ttf"
 
-// Translates Clay render commands into SDL_Renderer / SDL_ttf calls.
-// Clay coordinates are logical; everything is multiplied by `scale` to get pixels.
+// Drawing primitives on the SDL renderer, in pixels.
+
+// The window's renderer, set by the app when it creates it.
+renderer: ^sdl.Renderer
 
 CORNER_SEGMENTS :: 8
 
@@ -18,7 +20,7 @@ clip_stack: [32]sdl.Rect
 @(private = "file")
 clip_depth: int
 
-push_clip :: proc(renderer: ^sdl.Renderer, r: sdl.Rect) {
+push_clip :: proc(r: sdl.Rect) {
 	r := r
 	if clip_depth > 0 && !sdl.GetRectIntersection(r, clip_stack[clip_depth - 1], &r) {
 		r = {} // no overlap: clip everything
@@ -30,7 +32,7 @@ push_clip :: proc(renderer: ^sdl.Renderer, r: sdl.Rect) {
 	_ = sdl.SetRenderClipRect(renderer, &r)
 }
 
-pop_clip :: proc(renderer: ^sdl.Renderer) {
+pop_clip :: proc() {
 	clip_depth = max(clip_depth - 1, 0)
 	if clip_depth == 0 {
 		_ = sdl.SetRenderClipRect(renderer, nil)
@@ -46,6 +48,21 @@ overlay_stack: [16]clay.Color
 @(private = "file")
 overlay_depth: int
 
+// Starts a frame: no clips or overlays.
+begin_frame :: proc() {
+	clip_depth = 0
+	overlay_depth = 0
+}
+
+push_overlay :: proc(c: clay.Color) {
+	if overlay_depth < len(overlay_stack) do overlay_stack[overlay_depth] = c
+	overlay_depth += 1
+}
+
+pop_overlay :: proc() {
+	overlay_depth = max(overlay_depth - 1, 0)
+}
+
 @(private = "file")
 apply_overlays :: proc(c: clay.Color) -> clay.Color {
 	c := c
@@ -56,73 +73,6 @@ apply_overlays :: proc(c: clay.Color) -> clay.Color {
 	return c
 }
 
-render_clay_commands :: proc(renderer: ^sdl.Renderer, commands: ^clay.ClayArray(clay.RenderCommand), scale: f32) {
-	clip_depth = 0
-	overlay_depth = 0
-	for i in 0 ..< commands.length {
-		cmd := clay.RenderCommandArray_Get(commands, i)
-		b := scale_box(cmd.boundingBox, scale)
-
-		#partial switch cmd.commandType {
-		case .Rectangle:
-			data := cmd.renderData.rectangle
-			fill_rounded_rect(renderer, b, scale_radius(data.cornerRadius, scale), data.backgroundColor)
-
-		case .Text:
-			data := cmd.renderData.text
-			s := string(data.stringContents.chars[:data.stringContents.length])
-			font := text_get_font(&g.text, Font_Id(data.fontId), data.fontSize)
-			if font == nil do continue
-			draw_text(text_get(&g.text, font, s), math.round(b.x), math.round(b.y), data.textColor)
-
-		case .Border:
-			data := cmd.renderData.border
-			draw_border(renderer, b, scale_radius(data.cornerRadius, scale), data.width, data.color, scale)
-
-		case .ScissorStart:
-			push_clip(renderer, {i32(math.round(b.x)), i32(math.round(b.y)), i32(math.round(b.width)), i32(math.round(b.height))})
-
-		case .ScissorEnd:
-			pop_clip(renderer)
-
-		case .OverlayColorStart:
-			if overlay_depth < len(overlay_stack) do overlay_stack[overlay_depth] = cmd.renderData.overlayColor.color
-			overlay_depth += 1
-
-		case .OverlayColorEnd:
-			overlay_depth = max(overlay_depth - 1, 0)
-
-		case .Custom:
-			data := cmd.renderData.custom
-			if data.customData == nil do continue
-			switch c in (^Custom_Data)(data.customData)^ {
-			case Icon_Data:
-				draw_icon(renderer, c, b)
-			case ^Editor:
-				draw_editor(renderer, c, b, scale)
-			case ^Terminal:
-				draw_terminal(renderer, c, b, scale)
-			}
-
-		case .Image:
-			texture := (^sdl.Texture)(cmd.renderData.image.imageData)
-			if texture == nil do continue
-			dst := sdl.FRect{b.x, b.y, b.width, b.height}
-			_ = sdl.RenderTexture(renderer, texture, nil, &dst)
-		}
-	}
-}
-
-@(private = "file")
-scale_box :: proc(b: clay.BoundingBox, s: f32) -> clay.BoundingBox {
-	return {b.x * s, b.y * s, b.width * s, b.height * s}
-}
-
-@(private = "file")
-scale_radius :: proc(r: clay.CornerRadius, s: f32) -> clay.CornerRadius {
-	return {r.topLeft * s, r.topRight * s, r.bottomLeft * s, r.bottomRight * s}
-}
-
 @(private = "file")
 to_fcolor :: proc(c: clay.Color) -> sdl.FColor {
 	c := apply_overlays(c)
@@ -130,14 +80,14 @@ to_fcolor :: proc(c: clay.Color) -> sdl.FColor {
 }
 
 @(private = "file")
-set_color :: proc(renderer: ^sdl.Renderer, c: clay.Color) {
+set_color :: proc(c: clay.Color) {
 	c := apply_overlays(c)
 	_ = sdl.SetRenderDrawColor(renderer, u8(c.r), u8(c.g), u8(c.b), u8(c.a))
 }
 
 // Clips to a custom element's bounds (pixels), rounded outward.
-push_clip_box :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox) {
-	push_clip(renderer, {i32(b.x), i32(b.y), i32(math.ceil(b.width)), i32(math.ceil(b.height))})
+push_clip_box :: proc(b: clay.BoundingBox) {
+	push_clip({i32(b.x), i32(b.y), i32(math.ceil(b.width)), i32(math.ceil(b.height))})
 }
 
 draw_text :: proc(text: ^ttf.Text, x, y: f32, c: clay.Color) {
@@ -147,18 +97,18 @@ draw_text :: proc(text: ^ttf.Text, x, y: f32, c: clay.Color) {
 	_ = ttf.DrawRendererText(text, x, y)
 }
 
-fill_rect :: proc(renderer: ^sdl.Renderer, x, y, w, h: f32, c: clay.Color) {
+fill_rect :: proc(x, y, w, h: f32, c: clay.Color) {
 	if w <= 0 || h <= 0 do return
-	set_color(renderer, c)
+	set_color(c)
 	r := sdl.FRect{x, y, w, h}
 	_ = sdl.RenderFillRect(renderer, &r)
 }
 
 // Rounded rectangles are convex, so a triangle fan from the centre covers them,
 // inset half a pixel; a ring fading out to half a pixel outside smooths the edge.
-fill_rounded_rect :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Color) {
+fill_rounded_rect :: proc(b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Color) {
 	if r.topLeft <= 0 && r.topRight <= 0 && r.bottomLeft <= 0 && r.bottomRight <= 0 {
-		fill_rect(renderer, b.x, b.y, b.width, b.height, c)
+		fill_rect(b.x, b.y, b.width, b.height, c)
 		return
 	}
 
@@ -200,25 +150,24 @@ fill_rounded_rect :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.
 	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
 }
 
-@(private = "file")
-draw_border :: proc(renderer: ^sdl.Renderer, b: clay.BoundingBox, r: clay.CornerRadius, w: clay.BorderWidth, c: clay.Color, scale: f32) {
+draw_border :: proc(b: clay.BoundingBox, r: clay.CornerRadius, w: clay.BorderWidth, c: clay.Color, scale: f32) {
 	left, right, top, bottom := f32(w.left) * scale, f32(w.right) * scale, f32(w.top) * scale, f32(w.bottom) * scale
 
-	if left > 0 do fill_rect(renderer, b.x, b.y + r.topLeft, left, b.height - r.topLeft - r.bottomLeft, c)
-	if right > 0 do fill_rect(renderer, b.x + b.width - right, b.y + r.topRight, right, b.height - r.topRight - r.bottomRight, c)
-	if top > 0 do fill_rect(renderer, b.x + r.topLeft, b.y, b.width - r.topLeft - r.topRight, top, c)
-	if bottom > 0 do fill_rect(renderer, b.x + r.bottomLeft, b.y + b.height - bottom, b.width - r.bottomLeft - r.bottomRight, bottom, c)
+	if left > 0 do fill_rect(b.x, b.y + r.topLeft, left, b.height - r.topLeft - r.bottomLeft, c)
+	if right > 0 do fill_rect(b.x + b.width - right, b.y + r.topRight, right, b.height - r.topRight - r.bottomRight, c)
+	if top > 0 do fill_rect(b.x + r.topLeft, b.y, b.width - r.topLeft - r.topRight, top, c)
+	if bottom > 0 do fill_rect(b.x + r.bottomLeft, b.y + b.height - bottom, b.width - r.bottomLeft - r.bottomRight, bottom, c)
 
-	if r.topLeft > 0 do draw_arc(renderer, b.x + r.topLeft, b.y + r.topLeft, r.topLeft, top, math.PI, c)
-	if r.topRight > 0 do draw_arc(renderer, b.x + b.width - r.topRight, b.y + r.topRight, r.topRight, top, -math.PI / 2, c)
-	if r.bottomRight > 0 do draw_arc(renderer, b.x + b.width - r.bottomRight, b.y + b.height - r.bottomRight, r.bottomRight, bottom, 0, c)
-	if r.bottomLeft > 0 do draw_arc(renderer, b.x + r.bottomLeft, b.y + b.height - r.bottomLeft, r.bottomLeft, bottom, math.PI / 2, c)
+	if r.topLeft > 0 do draw_arc(b.x + r.topLeft, b.y + r.topLeft, r.topLeft, top, math.PI, c)
+	if r.topRight > 0 do draw_arc(b.x + b.width - r.topRight, b.y + r.topRight, r.topRight, top, -math.PI / 2, c)
+	if r.bottomRight > 0 do draw_arc(b.x + b.width - r.bottomRight, b.y + b.height - r.bottomRight, r.bottomRight, bottom, 0, c)
+	if r.bottomLeft > 0 do draw_arc(b.x + r.bottomLeft, b.y + b.height - r.bottomLeft, r.bottomLeft, bottom, math.PI / 2, c)
 }
 
 // Quarter-circle ring of the given thickness, starting at angle `start` (radians,
 // clockwise in screen space), its edges fading out over a pixel.
 @(private = "file")
-draw_arc :: proc(renderer: ^sdl.Renderer, cx, cy, radius, thickness, start: f32, c: clay.Color) {
+draw_arc :: proc(cx, cy, radius, thickness, start: f32, c: clay.Color) {
 	if thickness <= 0 do return
 	inner := max(radius - thickness, 0)
 	fc := to_fcolor(c)
@@ -249,10 +198,10 @@ draw_arc :: proc(renderer: ^sdl.Renderer, cx, cy, radius, thickness, start: f32,
 }
 
 // Icons are Lucide glyphs, centred in the element's bounds.
-draw_icon :: proc(renderer: ^sdl.Renderer, data: Icon_Data, b: clay.BoundingBox) {
-	font := text_get_font(&g.text, .Icons, data.size)
+draw_icon :: proc(data: Icon_Data, b: clay.BoundingBox) {
+	font := text_get_font(&text_system, .Icons, data.size)
 	if font == nil do return
-	text := text_get(&g.text, font, ICON_GLYPHS[data.kind])
+	text := text_get(&text_system, font, ICON_GLYPHS[data.kind])
 	if text == nil do return
 	// Lucide draws each icon in the em square (baseline to ascent), so centre
 	// on the ascent rather than the text height, which includes the line gap.

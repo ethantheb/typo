@@ -10,6 +10,7 @@ import "core:time"
 
 import "toml"
 import sdl "../vendor/sdl3"
+import "gfx"
 
 // User settings, stored as TOML in the per-user config directory
 // (%APPDATA%\typo\settings.toml on Windows, or TYPO_SETTINGS if set). The file
@@ -108,7 +109,7 @@ SETTINGS := [Setting]Setting_Info {
 	.Theme = {
 		section = .Appearance, key = "theme", name = "Theme",
 		description = "Color scheme for the whole window.", keywords = "dark light mode colors color scheme",
-		default = DEFAULT_THEME, choices = THEME_NAMES[:], picker = true,
+		default = gfx.DEFAULT_THEME, choices = gfx.THEME_NAMES[:], picker = true,
 	},
 	.Smooth_Scroll = {
 		section = .Appearance, key = "smooth_scroll", name = "Smooth scrolling",
@@ -125,7 +126,7 @@ SETTINGS := [Setting]Setting_Info {
 		section = .Font, key = "family", name = "Font",
 		description = "Editor and terminal font: the bundled IBM Plex Mono or an installed monospace font.",
 		keywords = "font family typeface monospace",
-		default = BUNDLED_FAMILY, picker = true,
+		default = gfx.BUNDLED_FAMILY, picker = true,
 	},
 	.Font_Size = {
 		section = .Font, key = "size", name = "Font size",
@@ -180,7 +181,7 @@ SETTINGS := [Setting]Setting_Info {
 		section = .Markdown, key = "font", name = "Markdown font",
 		description = "Font for rendered Markdown text: the bundled IBM Plex Sans or an installed font. Code uses the editor font.",
 		keywords = "markdown font family typeface prose",
-		default = BUNDLED_MD_FAMILY, picker = true,
+		default = gfx.BUNDLED_MD_FAMILY, picker = true,
 	},
 	.Markdown_Font_Size = {
 		section = .Markdown, key = "font_size", name = "Markdown font size",
@@ -503,10 +504,10 @@ settings_changed :: proc() {
 }
 
 apply_settings :: proc() {
-	theme = theme_by_name(g.settings.theme)
+	gfx.theme = gfx.theme_by_name(g.settings.theme)
 	// Not for each theme the theme list previews: that re-rasterizes all text.
 	w := &g.settings_window
-	if !(w.picking && w.picker == .Theme) do text_set_contrast(&g.text, theme.text, f32(g.settings.text_contrast))
+	if !(w.picking && w.picker == .Theme) do gfx.text_set_contrast(&gfx.text_system, gfx.theme.text, f32(g.settings.text_contrast))
 	terminal_apply_theme(&g.terminal_panel.terminal)
 	apply_editor_font()
 	apply_markdown_font()
@@ -514,20 +515,20 @@ apply_settings :: proc() {
 
 // Points rendered Markdown at the configured family, like apply_editor_font.
 apply_markdown_font :: proc() {
-	if g.text.engine == nil do return
-	sources, found := markdown_family_sources(&g.fonts, g.settings.markdown_font)
-	if !found do fonts_scan(&g.fonts)
-	for src, face in sources do text_set_source(&g.text, MD_FONTS[face], src)
+	if gfx.text_system.engine == nil do return
+	sources, found := gfx.markdown_family_sources(&g.fonts, g.settings.markdown_font)
+	if !found do gfx.fonts_scan(&g.fonts, walk_files)
+	for src, face in sources do gfx.text_set_source(&gfx.text_system, gfx.MD_FONTS[face], src)
 }
 
 // Points the editor and terminal at the configured family. One that isn't
 // bundled needs the installed fonts scanned; this runs again once that is done
 // (see app_iterate).
 apply_editor_font :: proc() {
-	if g.text.engine == nil do return
-	regular, bold, italic, found := font_family_sources(&g.fonts, g.settings.font_family, g.settings.font_weight)
-	if !found do fonts_scan(&g.fonts)
-	text_set_source(&g.text, .Editor, regular)
-	text_set_source(&g.text, .Editor_Bold, bold)
-	text_set_source(&g.text, .Editor_Italic, italic)
+	if gfx.text_system.engine == nil do return
+	regular, bold, italic, found := gfx.font_family_sources(&g.fonts, g.settings.font_family, g.settings.font_weight)
+	if !found do gfx.fonts_scan(&g.fonts, walk_files)
+	gfx.text_set_source(&gfx.text_system, .Editor, regular)
+	gfx.text_set_source(&gfx.text_system, .Editor_Bold, bold)
+	gfx.text_set_source(&gfx.text_system, .Editor_Italic, italic)
 }

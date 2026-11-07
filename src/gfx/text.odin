@@ -1,4 +1,4 @@
-package editor
+package gfx
 
 import "core:hash"
 import "core:math"
@@ -6,9 +6,9 @@ import "core:os"
 import "core:strings"
 import "core:unicode/utf8"
 
-import clay "../vendor/clay-odin"
-import sdl "../vendor/sdl3"
-import ttf "../vendor/sdl3/ttf"
+import clay "../../vendor/clay-odin"
+import sdl "../../vendor/sdl3"
+import ttf "../../vendor/sdl3/ttf"
 
 // Fonts, glyph fallback and cached text objects. Clay works in logical
 // (DPI-independent) units; fonts are rasterized at size * scale so text stays
@@ -41,7 +41,7 @@ MD_FONTS := [Md_Face]Font_Id {
 	.Bold_Italic = .Md_Bold_Italic,
 }
 
-ICON_FONT_DATA := #load("../assets/fonts/lucide.ttf")
+ICON_FONT_DATA := #load("../../assets/fonts/lucide.ttf")
 
 // Snaps glyphs only vertically and positions them at fractional pixels.
 FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
@@ -117,7 +117,6 @@ Text_Entry :: struct {
 
 Text_System :: struct {
 	engine:         ^ttf.TextEngine,
-	scale:          f32,             // pixels per logical unit
 	fallback_paths: [dynamic]string, // FALLBACK_FONTS that exist on this system
 	found_paths:    bool,            // fallback_paths has been filled in
 	fonts:          map[Font_Key]^ttf.Font,
@@ -135,7 +134,18 @@ Text_System :: struct {
 	coverage_for:   [2]f32, // text brightness and contrast glyph coverage is mapped for (text_set_contrast)
 }
 
-text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool {
+// The app's fonts and text objects.
+text_system: Text_System
+
+// Pixels per logical unit.
+scale: f32
+
+// Called from background threads when something finished that the main loop
+// should draw (the installed font scan); set by the app.
+wake: proc "contextless" (userdata: rawptr)
+
+// Sets up text drawing on gfx.renderer, at gfx.scale.
+text_init :: proc(ts: ^Text_System) -> bool {
 	if !ttf.Init() {
 		sdl.Log("TTF_Init failed: %s", sdl.GetError())
 		return false
@@ -145,7 +155,6 @@ text_init :: proc(ts: ^Text_System, renderer: ^sdl.Renderer, scale: f32) -> bool
 		sdl.Log("TTF_CreateRendererTextEngine failed: %s", sdl.GetError())
 		return false
 	}
-	ts.scale = scale
 	ts.coverage_for = -1
 	ts.sources = {
 		.Body           = BUNDLED_FACES[3].source,
@@ -181,10 +190,10 @@ text_destroy :: proc(ts: ^Text_System) {
 }
 
 // Re-rasterizes everything at a new display scale.
-text_set_scale :: proc(ts: ^Text_System, scale: f32) {
-	if scale == ts.scale do return
-	ts.scale = scale
-	text_clear_caches(ts)
+set_scale :: proc(ts: ^Text_System, display_scale: f32) {
+	if display_scale == scale do return
+	scale = display_scale
+	if ts.engine != nil do text_clear_caches(ts)
 }
 
 // Drops every font and text object.
@@ -303,7 +312,7 @@ text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 	if ts.engine == nil do return nil
 	key := Font_Key{id, size}
 	if font, ok := ts.fonts[key]; ok do return font
-	font := open_font(ts.sources[id], f32(size) * ts.scale)
+	font := open_font(ts.sources[id], f32(size) * scale)
 	if font == nil {
 		sdl.Log("opening font %d failed: %s", i32(id), sdl.GetError())
 		return nil
@@ -314,7 +323,6 @@ text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 }
 
 // Attaches the fallback fonts to `font` if `s` has a character it lacks.
-@(private = "file")
 ensure_fallbacks :: proc(ts: ^Text_System, font: ^ttf.Font, s: string) {
 	if font in ts.fallbacks do return
 	for r in s {
@@ -404,7 +412,7 @@ text_char_width :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> f32 {
 	SAMPLE :: "0000000000000000000000000000000000000000000000000000000000000000"
 	w, h: i32
 	_ = ttf.GetStringSize(font, SAMPLE, len(SAMPLE), &w, &h)
-	width := f32(w) / len(SAMPLE) / ts.scale
+	width := f32(w) / len(SAMPLE) / scale
 	ts.char_widths[key] = width
 	return width
 }
@@ -434,7 +442,7 @@ font_metrics :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> Font_Metrics {
 	if m, ok := ts.metrics[key]; ok do return m
 	font := text_get_font(ts, id, size)
 	if font == nil do return {f32(size) * 0.8, f32(size) * 0.25, f32(size) * 1.05}
-	m := Font_Metrics{f32(ttf.GetFontAscent(font)) / ts.scale, f32(-ttf.GetFontDescent(font)) / ts.scale, f32(ttf.GetFontHeight(font)) / ts.scale}
+	m := Font_Metrics{f32(ttf.GetFontAscent(font)) / scale, f32(-ttf.GetFontDescent(font)) / scale, f32(ttf.GetFontHeight(font)) / scale}
 	ts.metrics[key] = m
 	return m
 }
@@ -451,7 +459,7 @@ text_width :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string) -> f32 {
 	w, h: i32
 	_ = ttf.GetStringSize(font, cstring(raw_data(s)), uint(len(s)), &w, &h)
 	if len(ts.widths) >= WIDTH_CACHE_MAX do clear(&ts.widths)
-	width := f32(w) / ts.scale
+	width := f32(w) / scale
 	ts.widths[key] = width
 	return width
 }
@@ -471,7 +479,7 @@ text_fit :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, max_w: f32
 	if font := text_get_font(ts, id, size); font != nil {
 		mw: i32
 		ml: uint
-		_ = ttf.MeasureString(font, cstring(raw_data(s)), uint(len(s)), i32(max_w * ts.scale), &mw, &ml)
+		_ = ttf.MeasureString(font, cstring(raw_data(s)), uint(len(s)), i32(max_w * scale), &mw, &ml)
 		n = int(ml)
 	}
 	return max(n, first_rune_len(s))
@@ -493,15 +501,4 @@ text_index_at :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, x: f3
 first_rune_len :: proc(s: string) -> int {
 	_, n := utf8.decode_rune_in_string(s)
 	return n
-}
-
-measure_text :: proc "c" (text: clay.StringSlice, config: ^clay.TextElementConfig, user_data: rawptr) -> clay.Dimensions {
-	context = g.ctx
-	ts := &g.text
-	font := text_get_font(ts, Font_Id(config.fontId), config.fontSize)
-	if font == nil || text.length == 0 do return {0, f32(config.fontSize)}
-	ensure_fallbacks(ts, font, string(text.chars[:text.length]))
-	w, h: i32
-	_ = ttf.GetStringSize(font, cstring(text.chars), uint(text.length), &w, &h)
-	return {f32(w) / ts.scale, f32(h) / ts.scale}
 }

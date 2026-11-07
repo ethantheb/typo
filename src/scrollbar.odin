@@ -3,6 +3,7 @@ package editor
 import "core:math"
 
 import clay "../vendor/clay-odin"
+import "gfx"
 
 // Scroll bars: a thumb along the right edge of a scrolling area. Dragging it
 // scrolls; clicking the track jumps there. The editor draws its own in
@@ -16,7 +17,7 @@ SCROLLBAR_GUTTER :: SCROLLBAR_WIDTH + 6
 
 // Track and thumb for `area` scrolled down by `scroll` out of `max_scroll`
 // (the content is max_scroll plus one area). ok = false when nothing scrolls.
-scrollbar_geometry :: proc(area: Rect, scroll, max_scroll: f64) -> (track, thumb: Rect, ok: bool) {
+scrollbar_geometry :: proc(area: gfx.Rect, scroll, max_scroll: f64) -> (track, thumb: gfx.Rect, ok: bool) {
 	if max_scroll <= 0 || area.h <= 0 do return
 	track = {area.x + area.w - SCROLLBAR_WIDTH, area.y, SCROLLBAR_WIDTH, area.h}
 	h := max(area.h * area.h / f32(max_scroll + f64(area.h)), min(SCROLLBAR_MIN_THUMB, area.h))
@@ -27,10 +28,10 @@ scrollbar_geometry :: proc(area: Rect, scroll, max_scroll: f64) -> (track, thumb
 
 // Pressing and dragging the bar. `drag` holds the grab offset within the thumb
 // while dragging. Returns the scroll position to show while it owns the mouse.
-scrollbar_mouse :: proc(drag: ^Maybe(f32), track, thumb: Rect, max_scroll: f64) -> (scroll: f64, active: bool) {
-	if g.mouse_pressed && rect_contains(track, g.mouse_pos) {
+scrollbar_mouse :: proc(drag: ^Maybe(f32), track, thumb: gfx.Rect, max_scroll: f64) -> (scroll: f64, active: bool) {
+	if g.mouse_pressed && gfx.rect_contains(track, g.mouse_pos) {
 		// Clicking the track centres the thumb there.
-		drag^ = rect_contains(thumb, g.mouse_pos) ? g.mouse_pos.y - thumb.y : thumb.h / 2
+		drag^ = gfx.rect_contains(thumb, g.mouse_pos) ? g.mouse_pos.y - thumb.y : thumb.h / 2
 	}
 	grab, dragging := drag.?
 	if !dragging do return
@@ -44,8 +45,8 @@ scrollbar_mouse :: proc(drag: ^Maybe(f32), track, thumb: Rect, max_scroll: f64) 
 }
 
 // The thumb as drawn: inset in its track, stronger while hovered or dragged.
-scrollbar_thumb_look :: proc(thumb: Rect, active: bool) -> (r: Rect, color: clay.Color) {
-	color = theme.text_dim
+scrollbar_thumb_look :: proc(thumb: gfx.Rect, active: bool) -> (r: gfx.Rect, color: clay.Color) {
+	color = gfx.theme.text_dim
 	color.a = active ? 150 : 70
 	inset: f32 = active ? 2 : 3
 	return {thumb.x + inset, thumb.y + 2, thumb.w - inset * 2, thumb.h - 4}, color
@@ -55,7 +56,7 @@ scrollbar_thumb_look :: proc(thumb: Rect, active: bool) -> (r: Rect, color: clay
 // leave SCROLLBAR_GUTTER of padding there for it. Declare it after the
 // container; `drag` is kept per container. Works from last frame's layout.
 list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
-	smooth_scroll_list(list)
+	wheel_scroll_list(list)
 	data := clay.GetScrollContainerData(list)
 	area, ok := element_rect(list)
 	if !data.found || !ok do return
@@ -72,7 +73,7 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 			_, thumb, _ = scrollbar_geometry(area, scroll, max_scroll)
 		}
 	}
-	r, color := scrollbar_thumb_look(thumb, drag^ != nil || (interactive && rect_contains(track, g.mouse_pos)))
+	r, color := scrollbar_thumb_look(thumb, drag^ != nil || (interactive && gfx.rect_contains(track, g.mouse_pos)))
 	if clay.UI()({
 		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
 		backgroundColor = color,
@@ -87,14 +88,18 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 	}) {}
 }
 
-// --- Smooth wheel scrolling ------------------------------------------------------
-// Clay scroll containers ease to where the wheel takes them, like the editor,
-// when smooth scrolling is on: Clay picks the container under the pointer and
-// applies the wheel as usual, and that jump becomes a target the shown position
-// moves toward. Lists opt in each frame with smooth_scroll_list.
+// --- Wheel scrolling --------------------------------------------------------------
+// The wheel scrolls the list under the pointer, out of the Clay scroll containers
+// declared with wheel_scroll_list. Clay's own wheel handling isn't used: it gives
+// the wheel to any clipping element under the pointer, such as a horizontally
+// clipped input box in a list, which then drops vertical scrolling. With smooth
+// scrolling on, the list eases to where the wheel takes it, like the editor.
 
 @(private = "file")
-MAX_SMOOTH_LISTS :: 16
+WHEEL_STEP :: 30 // pixels per wheel notch
+
+@(private = "file")
+MAX_WHEEL_LISTS :: 16
 
 @(private = "file")
 Smooth_Scroll :: struct {
@@ -105,16 +110,16 @@ Smooth_Scroll :: struct {
 
 @(private = "file")
 smooth: struct {
-	lists:      [MAX_SMOOTH_LISTS]u32, // declared this frame
+	lists:      [MAX_WHEEL_LISTS]u32, // declared this frame
 	n_lists:    int,
-	moving:     [MAX_SMOOTH_LISTS]Smooth_Scroll,
+	moving:     [MAX_WHEEL_LISTS]Smooth_Scroll,
 	n_moving:   int,
 }
 
-// Makes a Clay scroll container's wheel scrolling smooth; call while declaring it.
-smooth_scroll_list :: proc(id: clay.ElementId) {
+// Lets the wheel scroll a Clay scroll container; call while declaring it.
+wheel_scroll_list :: proc(id: clay.ElementId) {
 	for x in smooth.lists[:smooth.n_lists] do if x == id.id do return
-	if smooth.n_lists < MAX_SMOOTH_LISTS {
+	if smooth.n_lists < MAX_WHEEL_LISTS {
 		smooth.lists[smooth.n_lists] = id.id
 		smooth.n_lists += 1
 	}
@@ -147,36 +152,53 @@ update_scroll_containers :: proc() {
 		}
 	}
 
-	before: [MAX_SMOOTH_LISTS]f32
-	for id, i in lists[:n] {
-		if data := data_of(id); data.found do before[i] = data.scrollPosition.y
+	// Of the lists under the pointer, the last declared is the one on top.
+	target: u32
+	before: f32
+	if g.wheel != {} {
+		for i := n - 1; i >= 0; i -= 1 {
+			if !clay.PointerOver({id = lists[i]}) do continue
+			if data := data_of(lists[i]); data.found {
+				target, before = lists[i], data.scrollPosition.y
+				step := g.wheel * WHEEL_STEP
+				if data.config.vertical do data.scrollPosition.y += step.y
+				if data.config.horizontal do data.scrollPosition.x += step.x
+			}
+			break
+		}
 	}
-	clay.UpdateScrollContainers(false, g.wheel * 3, g.dt)
+	// Keeps every container's position within its content.
+	clay.UpdateScrollContainers(false, {}, g.dt)
 	if !g.settings.smooth_scroll {
 		smooth.n_moving = 0
 		return
 	}
 
-	for id, i in lists[:n] {
-		data := data_of(id)
-		if !data.found || data.scrollPosition.y == before[i] do continue
+	if data := data_of(target); target != 0 && data.found && data.scrollPosition.y != before {
 		m: ^Smooth_Scroll
-		for &x in smooth.moving[:smooth.n_moving] do if x.id == id do m = &x
-		if m == nil {
-			if smooth.n_moving >= MAX_SMOOTH_LISTS do continue
+		for &x in smooth.moving[:smooth.n_moving] do if x.id == target do m = &x
+		if m == nil && smooth.n_moving < MAX_WHEEL_LISTS {
 			m = &smooth.moving[smooth.n_moving]
 			smooth.n_moving += 1
-			m^ = {id = id, target = before[i]}
+			m^ = {id = target, target = before}
 		}
-		m.target += data.scrollPosition.y - before[i]
-		data.scrollPosition.y = before[i]
-		m.shown = before[i]
+		if m != nil {
+			m.target += data.scrollPosition.y - before
+			data.scrollPosition.y = before
+			m.shown = before
+		}
 	}
 
 	t := 1 - math.exp(-f32(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
 	for i := 0; i < smooth.n_moving; {
 		m := &smooth.moving[i]
 		data := data_of(m.id)
+		// UpdateScrollContainers drops a list that wasn't declared last frame.
+		if !data.found {
+			smooth.n_moving -= 1
+			smooth.moving[i] = smooth.moving[smooth.n_moving]
+			continue
+		}
 		lowest := -max(data.contentDimensions.height - data.scrollContainerDimensions.height, 0)
 		m.target = clamp(m.target, lowest, 0)
 		y := data.scrollPosition.y + (m.target - data.scrollPosition.y) * t

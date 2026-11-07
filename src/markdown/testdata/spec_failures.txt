@@ -1,0 +1,16 @@
+# Spec examples known to fail (see spec_test.odin): suite, example, why.
+cm 5 a tab partly consumed by a container: its remaining columns aren't kept as spaces
+cm 6 a tab partly consumed by a container: its remaining columns aren't kept as spaces
+cm 7 a tab partly consumed by a container: its remaining columns aren't kept as spaces
+cm 193 link reference definition over several lines
+cm 195 link reference definition over several lines
+cm 196 link reference definition over several lines
+cm 198 link reference definition over several lines
+cm 208 link reference definition over several lines
+cm 217 link reference definition over several lines
+cm 541 link reference definition over several lines
+cm 559 extension: [[...]] is a wikilink
+cm 608 extension: bare URLs are links (GFM autolinks)
+cm 611 extension: bare URLs are links (GFM autolinks)
+cm 612 extension: bare email addresses are links (GFM autolinks)
+gfm 200 "\|" in a table cell's code span keeps its backslash

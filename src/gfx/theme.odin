@@ -1,8 +1,8 @@
-package editor
+package gfx
 
-import clay "../vendor/clay-odin"
+import clay "../../vendor/clay-odin"
 
-import "syntax"
+import "../syntax"
 
 // Colors used by the UI, the text view and the terminal. Clay colors are
 // 0..255 floats. The active set is `theme`, chosen by name in the settings.

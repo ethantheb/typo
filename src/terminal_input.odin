@@ -6,6 +6,7 @@ import "core:strings"
 import clay "../vendor/clay-odin"
 import "term"
 import sdl "../vendor/sdl3"
+import "gfx"
 
 // Keyboard and mouse input for a terminal: SDL events mapped to what
 // libghostty-vt encodes for the running program.
@@ -129,7 +130,7 @@ term_key :: proc(sc: sdl.Scancode) -> (k: term.Key, printable: bool) {
 terminal_mouse :: proc(t: ^Terminal, element: clay.ElementId) {
 	s := &t.session
 	rel := g.mouse_pos - {t.view.x, t.view.y}
-	px := rel * g.ui_scale
+	px := rel * gfx.scale
 	col := int(math.floor(rel.x / t.cell_w))
 	row := int(math.floor(rel.y / t.cell_h))
 	inside := pointer_in(element)

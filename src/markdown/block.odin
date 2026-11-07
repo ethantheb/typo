@@ -1,35 +1,21 @@
 package markdown
 
 import "core:strings"
-import "core:time"
 
-import "../buffer"
 import "../syntax"
 
-// Block structure (CommonMark + GFM), parsed line by line. A line's info
-// depends only on the state at the end of the previous line and its own text,
-// so after an edit only the edited lines are reparsed, plus the lines after
-// them until one ends in the same state as before. States are interned; lines
-// store an id.
+// Block structure (CommonMark + GFM), classified line by line: a line's info
+// depends only on the state at the end of the previous line and its own text
+// (see doc.odin).
 //
 // Constructs that change how an earlier line reads are stored on the later line
 // only: a setext underline (making the paragraph above a heading) and a table
 // delimiter row (making the line above a header). Readers look ahead for them.
+// Front matter is the exception: a "---" first line opens it only if a closing
+// line follows, which doc_update checks in the text.
 
 MAX_DEPTH :: 12
 INVALID_STATE :: max(u32)
-// Per-frame time for parsing beyond what the view needs.
-PARSE_BUDGET :: 2 * time.Millisecond
-// Lines parsed past the end of the view right away, so blocks that end below it
-// (a table, a fence) are known.
-LOOKAHEAD_LINES :: 256
-// Bytes read from the buffer at a time while parsing.
-@(private = "file")
-PARSE_CHUNK :: 64 << 10
-// The state pool is compacted when it grows past this many states.
-@(private = "file")
-POOL_COMPACT :: 1 << 16
-
 Container_Kind :: enum u8 {
 	Quote,
 	Bullet,
@@ -67,6 +53,7 @@ State :: struct {
 	para_cells:   u8,   // table cells in the paragraph's last line, a header candidate
 	para_refdefs: bool, // the paragraph so far holds only link reference definitions
 	table_cols:   u8,
+	empty_item:   bool, // the innermost container is a list item with no content yet, which a blank line ends
 }
 
 Line_Kind :: enum u8 {
@@ -103,6 +90,9 @@ Line_Flags :: bit_set[Line_Flag;u8]
 Line_Info :: struct {
 	state: u32, // id in Doc.pool of the state at the end of the line
 	len:   u32, // bytes, without the line ending
+	// Lines back to the first line of the leaf block it is in (see block_first);
+	// 0 on a block's first line and on blank lines.
+	first: u32,
 	kind:  Line_Kind,
 	aux:   u8, // heading level; column count of a Table_Delim
 	flags: Line_Flags,
@@ -111,8 +101,9 @@ Line_Info :: struct {
 
 Mark :: struct {
 	kind:      Container_Kind,
-	container: u8, // index in the line's container stack
+	container: u8,  // index in the line's container stack
 	lo, hi:    i32,
+	col:       i32, // column where the container's content starts (tabs to multiples of 4)
 }
 
 // Byte ranges within one line, recomputed on demand by parse_line.
@@ -128,188 +119,9 @@ Line_Detail :: struct {
 	// Containers the line's own text continues or opens: fewer than its end
 	// state's on a lazy line, or a blank one indented less than an item's content.
 	reached: u8,
-}
-
-Doc :: struct {
-	lines:      [dynamic]Line_Info,
-	pool:       [dynamic]State,
-	pool_ids:   map[State]u32,
-	cursor:     int, // first line to (re)parse; len(lines) when up to date
-	// Parsing can't stop before this line: earlier ones were edited, or their
-	// stored info predates a reparse that was interrupted.
-	must_until: int,
-	version:    u64, // bumped when any line's info changes
-	refdef_gen: u64, // bumped when a link reference or footnote definition line changes
-	// Link reference labels, as of refdef generation labels_gen (see doc_labels).
-	labels:       Labels,
-	labels_gen:   u64,
-	labels_built: bool,
-}
-
-doc_open :: proc(doc: ^Doc, b: ^buffer.Buffer) {
-	doc_destroy(doc)
-	resize(&doc.lines, buffer.line_count(b))
-	for &l in doc.lines do l = {state = INVALID_STATE}
-	append(&doc.pool, State{})
-	doc.pool_ids[State{}] = 0
-	doc.version += 1
-}
-
-doc_destroy :: proc(doc: ^Doc) {
-	delete(doc.lines)
-	delete(doc.pool)
-	delete(doc.pool_ids)
-	delete(doc.labels)
-	doc^ = {}
-}
-
-doc_busy :: proc(doc: ^Doc) -> bool {
-	return doc.cursor < len(doc.lines)
-}
-
-// Follows the buffer's edits (buffer.take_changes): lines are inserted and
-// removed to match, and the edited ones are queued for doc_update.
-doc_edit :: proc(doc: ^Doc, changes: []buffer.Change) {
-	for c in changes {
-		row := c.start.row
-		removed := c.old_end.row - row
-		inserted := c.new_end.row - row
-		// The line after the edit was parsed after the old last edited line, so
-		// the new last edited line keeps that line's info to compare against.
-		last := doc.lines[c.old_end.row]
-		if removed > 0 do remove_range(&doc.lines, row + 1, row + 1 + removed)
-		if inserted > 0 do inject_at(&doc.lines, row + 1, ..make([]Line_Info, inserted, context.temp_allocator))
-		for &l in doc.lines[row:c.new_end.row] do l = {state = INVALID_STATE}
-		doc.lines[c.new_end.row] = last
-		// A line index after the edit shifts with it; one inside the replaced
-		// lines moves to the end of the new ones.
-		shift :: proc(x: int, c: buffer.Change) -> int {
-			if x > c.old_end.row do return x + (c.new_end.row - c.old_end.row)
-			if x > c.start.row do return c.new_end.row + 1
-			return x
-		}
-		doc.cursor = min(doc.cursor, row)
-		doc.must_until = max(shift(doc.must_until, c), c.new_end.row + 1)
-	}
-}
-
-// Parses queued lines: always through `need_line`, then until `budget` runs out.
-doc_update :: proc(doc: ^Doc, b: ^buffer.Buffer, need_line: int, budget: time.Duration) {
-	n := len(doc.lines)
-	if doc.cursor >= n do return
-	start := time.tick_now()
-	i := doc.cursor
-	prev, prev_id := State{}, u32(0)
-	if i > 0 {
-		prev_id = doc.lines[i - 1].state
-		prev = doc.pool[prev_id]
-	}
-	pos := buffer.line_start(b, i)
-	total := buffer.length(b)
-
-	for i < n {
-		hi := min(pos + PARSE_CHUNK, total)
-		data := buffer.read_alloc(b, pos, hi)
-		if hi < total {
-			// Whole lines only; a line longer than the chunk is read in one piece.
-			if nl := strings.last_index_byte(string(data), '\n'); nl >= 0 {
-				data = data[:nl + 1]
-			} else {
-				hi = i + 1 < n ? buffer.line_start(b, i + 1) : total
-				data = buffer.read_alloc(b, pos, hi)
-			}
-		}
-		last_chunk := pos + len(data) >= total
-		j := 0
-		synced := false
-		for i < n {
-			nl := strings.index_byte(string(data[j:]), '\n')
-			// Without a line feed, the rest is the last line or in the next chunk.
-			if nl < 0 && !last_chunk do break
-			end := nl < 0 ? len(data) : j + nl
-			line := string(data[j:end])
-			if len(line) > 0 && line[len(line) - 1] == '\r' do line = line[:len(line) - 1]
-
-			info, _, s := parse_line(prev, line, i == 0)
-			info.len = u32(len(line))
-			id := s == prev ? prev_id : intern(doc, s)
-			info.state = id
-			old := doc.lines[i]
-			if old != info {
-				doc.version += 1
-				if is_definition(old.kind) || is_definition(info.kind) do doc.refdef_gen += 1
-			}
-			doc.lines[i] = info
-			synced = i + 1 >= doc.must_until && old.state != INVALID_STATE && int(old.state) < len(doc.pool) && doc.pool[old.state] == s
-			prev, prev_id = s, id
-			i += 1
-			j = end + 1
-			if synced do break
-			if i > need_line && i % 32 == 0 && time.tick_since(start) > budget {
-				// Lines from here on were parsed after a different line i-1.
-				doc.cursor = i
-				doc.must_until = max(doc.must_until, i + 1)
-				return
-			}
-			if nl < 0 do break
-		}
-		if synced do break
-		pos += len(data)
-	}
-	doc.cursor = n
-	doc.must_until = 0
-	compact_pool(doc)
-}
-
-// The state at the end of line i (the empty state for unparsed lines).
-line_state :: proc(doc: ^Doc, i: int) -> State {
-	if i < 0 || i >= len(doc.lines) do return {}
-	id := doc.lines[i].state
-	return id == INVALID_STATE ? {} : doc.pool[id]
-}
-
-// Byte ranges within line i, whose text is `text`.
-line_detail :: proc(doc: ^Doc, i: int, text: string) -> Line_Detail {
-	_, d, _ := parse_line(line_state(doc, i - 1), text, i == 0)
-	return d
-}
-
-@(private = "file")
-is_definition :: proc(k: Line_Kind) -> bool {
-	return k == .Link_Ref_Def || k == .Footnote_Def
-}
-
-@(private = "file")
-intern :: proc(doc: ^Doc, s: State) -> u32 {
-	if id, ok := doc.pool_ids[s]; ok do return id
-	id := u32(len(doc.pool))
-	append(&doc.pool, s)
-	doc.pool_ids[s] = id
-	return id
-}
-
-// Drops states no line uses any more, once the pool is large.
-@(private = "file")
-compact_pool :: proc(doc: ^Doc) {
-	if len(doc.pool) < POOL_COMPACT do return
-	remap := make([]u32, len(doc.pool), context.temp_allocator)
-	for &r in remap do r = INVALID_STATE
-	remap[0] = 0
-	kept := make([dynamic]State, 0, len(doc.pool) / 2)
-	append(&kept, State{})
-	clear(&doc.pool_ids)
-	doc.pool_ids[State{}] = 0
-	for &l in doc.lines {
-		if l.state == INVALID_STATE do continue
-		if remap[l.state] == INVALID_STATE {
-			remap[l.state] = u32(len(kept))
-			doc.pool_ids[doc.pool[l.state]] = u32(len(kept))
-			append(&kept, doc.pool[l.state])
-		}
-		l.state = remap[l.state]
-	}
-	delete(doc.pool)
-	doc.pool = kept
+	// Containers of the previous line's state this line continues (a lazy line
+	// continues the rest too); marks for later containers open new ones.
+	matched: u8,
 }
 
 // --- Line classifier -------------------------------------------------------------
@@ -384,14 +196,14 @@ step_over :: proc(c: ^Cursor, p: int) {
 }
 
 @(private = "file")
-add_mark :: proc(d: ^Line_Detail, kind: Container_Kind, lo, hi, container: int) {
+add_mark :: proc(d: ^Line_Detail, kind: Container_Kind, lo, hi, container, col: int) {
 	if d.n_marks >= MAX_DEPTH do return
-	d.marks[d.n_marks] = {kind, u8(container), i32(lo), i32(hi)}
+	d.marks[d.n_marks] = {kind, u8(container), i32(lo), i32(hi), i32(col)}
 	d.n_marks += 1
 }
 
 // Classifies one line (no line ending) that follows a line ending in `prev`.
-// `first_line` allows front matter.
+// `first_line` makes a "---" line open front matter.
 parse_line :: proc(prev: State, text: string, first_line := false) -> (info: Line_Info, d: Line_Detail, next: State) {
 	c := Cursor{s = text}
 	info, d, next = classify(prev, &c, first_line)
@@ -408,6 +220,7 @@ parse_line :: proc(prev: State, text: string, first_line := false) -> (info: Lin
 	}
 	if next.leaf != .Table do next.table_cols = 0
 	if next.leaf != .Html do next.html_kind = 0
+	if info.kind != .Blank do next.empty_item = false
 	return
 }
 
@@ -427,12 +240,14 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 			ind := indent_of(c^)
 			p := after_indent(c^)
 			if ind > 3 || p >= n || text[p] != '>' do break match
-			add_mark(&d, .Quote, p, p + 1, matched)
 			step_over(c, p)
 			if c.pos < n && (text[c.pos] == ' ' || text[c.pos] == '\t') do consume_cols(c, 1)
+			add_mark(&d, .Quote, p, p + 1, matched, c.col)
 		case .Bullet, .Ordered:
-			// A blank line continues the item however little it is indented.
+			// A blank line continues the item however little it is indented,
+			// unless the item has no content yet.
 			switch {
+			case prev.empty_item && matched == int(prev.depth) - 1 && after_indent(c^) >= n: break match
 			case d.reached == MAX_DEPTH && indent_of(c^) >= int(k.indent): consume_cols(c, int(k.indent))
 			case after_indent(c^) < n:                                     break match
 			case:                                                           d.reached = min(d.reached, u8(matched))
@@ -441,6 +256,7 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 		matched += 1
 	}
 	all_matched := matched == int(prev.depth)
+	d.matched = u8(matched)
 
 	// Leaf blocks that take whole lines until their end condition.
 	if all_matched {
@@ -504,6 +320,7 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 	next.containers = {}
 	for k in 0 ..< matched do next.containers[k] = prev.containers[k]
 	next.depth = u8(matched)
+	next.empty_item = prev.empty_item && all_matched
 	leaf := prev.leaf
 	switch {
 	case leaf == .Paragraph:
@@ -541,11 +358,12 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 		}
 
 		if rest[0] == '>' && int(next.depth) < MAX_DEPTH {
-			add_mark(&d, .Quote, p, p + 1, int(next.depth))
 			step_over(c, p)
 			if c.pos < n && (text[c.pos] == ' ' || text[c.pos] == '\t') do consume_cols(c, 1)
+			add_mark(&d, .Quote, p, p + 1, int(next.depth), c.col)
 			next.containers[next.depth] = {.Quote, '>', 0}
 			next.depth += 1
+			next.empty_item = false
 			opened, item_opened = true, false
 			leaf = .None
 			continue
@@ -599,6 +417,7 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 			if interrupting && !new_item && (empty || (kind == .Ordered && number != 1)) do ok = false
 			if ok {
 				consume_cols(c, ind)
+				marker_col := c.col
 				c.pos, c.col, c.partial = after, c.col + width, 0
 				spaces := indent_of(c^)
 				if empty || spaces >= 5 {
@@ -609,8 +428,9 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 					consume_cols(c, spaces)
 				}
 				indent := ind + width + spaces
-				add_mark(&d, kind, p, after, int(next.depth))
+				add_mark(&d, kind, p, after, int(next.depth), marker_col + width + spaces)
 				next.containers[next.depth] = {kind, marker, u8(min(indent, 255))}
+				next.empty_item = empty
 				next.depth += 1
 				info.flags += {.Item_Start}
 				opened, item_opened = true, true
@@ -687,7 +507,6 @@ classify :: proc(prev: State, c: ^Cursor, first_line: bool) -> (info: Line_Info,
 			next = prev
 			d.reached = u8(matched)
 			info.flags += {.Lazy}
-			d.n_marks = 0
 		}
 		next.leaf = .Paragraph
 		lo, hi, is_footnote, is_def := definition(rest)
@@ -817,30 +636,67 @@ is_fence_close :: proc(s: string, ch: u8, length: u8) -> bool {
 	return i >= int(length) && i > 0 && is_blank(s[i:])
 }
 
-// Cells in a table row: '|'-separated, with optional outer pipes. 0 for a blank line.
-table_cells :: proc(s: string) -> int {
-	t := strings.trim_space(s)
-	if t == "" do return 0
-	if t[0] == '|' do t = t[1:]
-	n := 1
-	for i := 0; i < len(t); i += 1 {
-		switch t[i] {
-		case '\\': i += 1
-		case '|':  if i < len(t) - 1 do n += 1
+// The cells of a table row: '|'-separated, with optional outer pipes, "\|"
+// escaped. Use with row_next.
+Row_Iterator :: struct {
+	text: string,
+	pos:  int,
+	done: bool,
+	any:  bool,
+}
+
+// Iterates over the cells of the row in text[from:].
+row_iterator :: proc(text: string, from := 0) -> Row_Iterator {
+	it := Row_Iterator{text = text, pos = from, done = is_blank(text[from:])}
+	for it.pos < len(text) && (text[it.pos] == ' ' || text[it.pos] == '\t') do it.pos += 1
+	if it.pos < len(text) && text[it.pos] == '|' do it.pos += 1
+	return it
+}
+
+// The next cell's bytes, without its pipes (and with its spaces).
+row_next :: proc(it: ^Row_Iterator) -> (lo, hi: int, ok: bool) {
+	if it.done do return
+	lo = it.pos
+	for k := lo; ; k += 1 {
+		if k >= len(it.text) {
+			it.done = true
+			// Nothing after a closing pipe.
+			if it.any && is_blank(it.text[lo:]) do return
+			return lo, len(it.text), true
+		}
+		switch it.text[k] {
+		case '\\':
+			k += 1
+		case '|':
+			it.pos, it.any = k + 1, true
+			return lo, k, true
 		}
 	}
+}
+
+// The cells of the row in text[from:], as byte ranges.
+row_cells :: proc(text: string, from := 0, allocator := context.temp_allocator) -> [][2]int {
+	cells := make([dynamic][2]int, allocator)
+	it := row_iterator(text, from)
+	for lo, hi in row_next(&it) do append(&cells, [2]int{lo, hi})
+	return cells[:]
+}
+
+// Cells in a table row. 0 for a blank line.
+table_cells :: proc(s: string) -> int {
+	n := 0
+	it := row_iterator(s)
+	for _, _ in row_next(&it) do n += 1
 	return n
 }
 
 // Cells in a delimiter row ("| :-- | --: |"), or 0 if it isn't one.
 @(private = "file")
 delimiter_row_cells :: proc(s: string) -> int {
-	t := strings.trim_space(s)
-	if strings.has_prefix(t, "|") do t = t[1:]
-	if strings.has_suffix(t, "|") do t = t[:len(t) - 1]
 	n := 0
-	for cell in strings.split_iterator(&t, "|") {
-		c := strings.trim_space(cell)
+	it := row_iterator(s)
+	for lo, hi in row_next(&it) {
+		c := strings.trim_space(s[lo:hi])
 		if strings.has_prefix(c, ":") do c = c[1:]
 		if strings.has_suffix(c, ":") do c = c[:len(c) - 1]
 		if c == "" do return 0
@@ -850,16 +706,14 @@ delimiter_row_cells :: proc(s: string) -> int {
 	return n
 }
 
-// A task box "[ ]" / "[x]" followed by whitespace or the end of the line.
+// A task box "[ ]", "[x]" or another state ("[-]", "[>]") followed by
+// whitespace or the end of the line. Any state but a space is checked.
 @(private = "file")
 task_box :: proc(s: string) -> (checked, ok: bool) {
 	if len(s) < 3 || s[0] != '[' || s[2] != ']' do return
 	if len(s) > 3 && s[3] != ' ' && s[3] != '\t' do return
-	switch s[1] {
-	case ' ':      return false, true
-	case 'x', 'X': return true, true
-	}
-	return
+	if s[1] < ' ' || s[1] > '~' || s[1] == '[' || s[1] == ']' || s[1] == '\\' do return
+	return s[1] != ' ', true
 }
 
 // A link reference definition `[label]: dest "title"` or a footnote definition
@@ -902,41 +756,4 @@ definition :: proc(s: string) -> (lo, hi: int, footnote, ok: bool) {
 		}
 	}
 	return lo, hi, false, true
-}
-
-// --- Characters ---------------------------------------------------------------------
-
-@(private)
-is_space :: proc(c: u8) -> bool {
-	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'
-}
-
-@(private)
-is_blank :: proc(s: string) -> bool {
-	for c in transmute([]u8)s do if !is_space(c) do return false
-	return true
-}
-
-@(private)
-is_digit :: proc(c: u8) -> bool {
-	return c >= '0' && c <= '9'
-}
-
-@(private)
-is_alpha :: proc(c: u8) -> bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
-}
-
-@(private)
-is_alnum :: proc(c: u8) -> bool {
-	return is_alpha(c) || is_digit(c)
-}
-
-@(private)
-is_ascii_punct :: proc(c: u8) -> bool {
-	switch c {
-	case '!' ..= '/', ':' ..= '@', '[' ..= '`', '{' ..= '~':
-		return true
-	}
-	return false
 }

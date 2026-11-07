@@ -9,6 +9,7 @@ import clay "../vendor/clay-odin"
 import "term"
 import sdl "../vendor/sdl3"
 import ttf "../vendor/sdl3/ttf"
+import "gfx"
 
 // One terminal: a term.Session (libghostty-vt plus a shell on a pty) and the
 // view of it.
@@ -34,7 +35,7 @@ Terminal :: struct {
 	rows:        [dynamic]Term_Row,
 	cursor:      term.Render_Cursor,
 	colors:      term.Render_Colors,
-	view:        Rect, // cell grid area from the last layout
+	view:        gfx.Rect, // cell grid area from the last layout
 	cell_w:      f32,
 	cell_h:      f32,
 	selecting:   bool, // left button went down on the grid and selects text
@@ -130,8 +131,8 @@ terminal_apply_theme :: proc(t: ^Terminal) {
 	if !t.initialized do return
 	palette: [256]term.Color_Rgb
 	term.color_palette_default(&palette[0])
-	for c, i in theme.ansi do palette[i] = to_rgb(c)
-	fg, bg, cursor := to_rgb(theme.text), to_rgb(theme.bg), to_rgb(theme.caret)
+	for c, i in gfx.theme.ansi do palette[i] = to_rgb(c)
+	fg, bg, cursor := to_rgb(gfx.theme.text), to_rgb(gfx.theme.bg), to_rgb(gfx.theme.caret)
 	vt := t.session.vt
 	term.terminal_set(vt, .Color_Palette, &palette)
 	term.terminal_set(vt, .Color_Foreground, &fg)
@@ -171,7 +172,7 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 		t.view = {r.x + TERMINAL_PADDING, r.y + TERMINAL_PADDING / 2, r.w - TERMINAL_PADDING * 2, r.h - TERMINAL_PADDING}
 		cols := u16(max(t.view.w / t.cell_w, 2))
 		rows := u16(max(t.view.h / t.cell_h, 1))
-		term.session_resize(s, cols, rows, u32(t.cell_w * g.ui_scale), u32(t.cell_h * g.ui_scale))
+		term.session_resize(s, cols, rows, u32(t.cell_w * gfx.scale), u32(t.cell_h * gfx.scale))
 		// The shell starts once the real size is known, so it never sees 80x24.
 		if !t.spawned do terminal_start_shell(t)
 	}
@@ -299,7 +300,7 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		append(&row.cells, rune(cps[0]))
 
 		bold, underline, strike := style.bold, style.underline != 0, style.strikethrough
-		solo := cells == 2 || g.settings.letter_spacing != 0 || !font_has_own_glyph(&g.text, .Editor, rune(cps[0]))
+		solo := cells == 2 || g.settings.letter_spacing != 0 || !gfx.font_has_own_glyph(&gfx.text_system, .Editor, rune(cps[0]))
 		if open {
 			r := &row.runs[len(row.runs) - 1]
 			open = r.end_col == col && r.fg == fg && r.bold == bold && r.underline == underline && r.strike == strike && !solo
@@ -320,14 +321,14 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 
 // --- Drawing -----------------------------------------------------------------
 
-draw_terminal :: proc(renderer: ^sdl.Renderer, t: ^Terminal, b: clay.BoundingBox, scale: f32) {
+draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	if t.cell_w <= 0 do return
-	font := text_get_font(&g.text, .Editor, editor_font_size())
+	font := gfx.text_get_font(&gfx.text_system, .Editor, editor_font_size())
 	if font == nil do return
-	bold_font := text_get_font(&g.text, .Editor_Bold, editor_font_size())
+	bold_font := gfx.text_get_font(&gfx.text_system, .Editor_Bold, editor_font_size())
 	if bold_font == nil do bold_font = font
-	push_clip_box(renderer, b)
-	defer pop_clip(renderer)
+	gfx.push_clip_box(b)
+	defer gfx.pop_clip()
 
 	ox, oy := t.view.x * scale, t.view.y * scale
 	adv, lh := t.cell_w * scale, t.cell_h * scale
@@ -340,26 +341,26 @@ draw_terminal :: proc(renderer: ^sdl.Renderer, t: ^Terminal, b: clay.BoundingBox
 		ry2 := math.round(oy + f32(y + 1) * lh)
 		for bg in row.bgs {
 			x := cell_x(ox, adv, bg.col)
-			fill_rect(renderer, x, ry, cell_x(ox, adv, bg.col + bg.count) - x, ry2 - ry, bg.color)
+			gfx.fill_rect(x, ry, cell_x(ox, adv, bg.col + bg.count) - x, ry2 - ry, bg.color)
 		}
 		if row.sel[0] >= 0 {
 			x := cell_x(ox, adv, row.sel[0])
-			fill_rect(renderer, x, ry, cell_x(ox, adv, row.sel[1] + 1) - x, ry2 - ry, theme.selection)
+			gfx.fill_rect(x, ry, cell_x(ox, adv, row.sel[1] + 1) - x, ry2 - ry, gfx.theme.selection)
 		}
 		for run in row.runs {
 			x := cell_x(ox, adv, run.col)
-			draw_text(text_get(&g.text, run.bold ? bold_font : font, string(row.text[run.text[0]:run.text[1]])), x, ry + text_dy, run.fg)
+			gfx.draw_text(gfx.text_get(&gfx.text_system, run.bold ? bold_font : font, string(row.text[run.text[0]:run.text[1]])), x, ry + text_dy, run.fg)
 			w := cell_x(ox, adv, run.end_col) - x
-			if run.underline do fill_rect(renderer, x, ry2 - 2 * line_w, w, line_w, run.fg)
-			if run.strike do fill_rect(renderer, x, math.round((ry + ry2) / 2), w, line_w, run.fg)
+			if run.underline do gfx.fill_rect(x, ry2 - 2 * line_w, w, line_w, run.fg)
+			if run.strike do gfx.fill_rect(x, math.round((ry + ry2) / 2), w, line_w, run.fg)
 		}
 	}
 
-	draw_cursor(renderer, t, font, ox, oy, adv, lh, text_dy, line_w)
+	draw_cursor(t, font, ox, oy, adv, lh, text_dy, line_w)
 }
 
 @(private = "file")
-draw_cursor :: proc(renderer: ^sdl.Renderer, t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, line_w: f32) {
+draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, line_w: f32) {
 	c := t.cursor
 	if !c.visible || !c.viewport_has_value || int(c.viewport_y) >= len(t.rows) do return
 	col := int(c.viewport_x)
@@ -372,27 +373,27 @@ draw_cursor :: proc(renderer: ^sdl.Renderer, t: ^Terminal, font: ^ttf.Font, ox, 
 	y := math.round(oy + f32(c.viewport_y) * lh)
 	w := math.round(ox + f32(col + cells) * adv) - x
 	h := math.round(oy + f32(c.viewport_y + 1) * lh) - y
-	color := t.colors.cursor_has_value ? to_color(t.colors.cursor) : theme.caret
+	color := t.colors.cursor_has_value ? to_color(t.colors.cursor) : gfx.theme.caret
 
 	style := c.visual_style
 	if g.focus != .Terminal do style = .Block_Hollow
 	else if !terminal_cursor_on(t) do return
 	switch style {
 	case .Block:
-		fill_rect(renderer, x, y, w, h, color)
+		gfx.fill_rect(x, y, w, h, color)
 		if glyph != 0 {
 			buf, n := utf8.encode_rune(glyph)
-			draw_text(text_get(&g.text, font, string(buf[:n])), x, y + text_dy, to_color(t.colors.background))
+			gfx.draw_text(gfx.text_get(&gfx.text_system, font, string(buf[:n])), x, y + text_dy, to_color(t.colors.background))
 		}
 	case .Bar:
-		fill_rect(renderer, x, y, max(2 * line_w, 1), h, color)
+		gfx.fill_rect(x, y, max(2 * line_w, 1), h, color)
 	case .Underline:
-		fill_rect(renderer, x, y + h - 2 * line_w, w, 2 * line_w, color)
+		gfx.fill_rect(x, y + h - 2 * line_w, w, 2 * line_w, color)
 	case .Block_Hollow:
-		fill_rect(renderer, x, y, w, line_w, color)
-		fill_rect(renderer, x, y + h - line_w, w, line_w, color)
-		fill_rect(renderer, x, y, line_w, h, color)
-		fill_rect(renderer, x + w - line_w, y, line_w, h, color)
+		gfx.fill_rect(x, y, w, line_w, color)
+		gfx.fill_rect(x, y + h - line_w, w, line_w, color)
+		gfx.fill_rect(x, y, line_w, h, color)
+		gfx.fill_rect(x + w - line_w, y, line_w, h, color)
 	}
 }
 

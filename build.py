@@ -71,7 +71,7 @@ OBJ = OUT / "obj"
 IS_WINDOWS = platform.system() == "Windows"
 EXE = OUT / ("typo.exe" if IS_WINDOWS else "typo")
 PERF_EXE = OUT / ("typo-perf.exe" if IS_WINDOWS else "typo-perf")
-TEST_PACKAGES = ["src/buffer", "src/syntax", "src/markdown", "src/toml", "src/term", "src"]
+TEST_PACKAGES = ["src/buffer", "src/syntax", "src/markdown", "src/toml", "src/term", "src/gfx", "src/textedit", "src/mdview", "src"]
 TS_LIB = OBJ / ("tree_sitter.lib" if IS_WINDOWS else "libtree_sitter.a")
 
 TS_SOURCES = [

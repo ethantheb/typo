@@ -15,7 +15,7 @@ Text_Style :: enum u8 {
 
 Text_Styles :: bit_set[Text_Style;u8]
 
-// Lines lexed upward from a visible fence body line to find its lexer state.
+// Lines above a visible fence body line lexed at most to find its lexer state.
 @(private = "file")
 MAX_FENCE_LOOKBACK :: 2000
 
@@ -116,7 +116,7 @@ highlight_range :: proc(doc: ^Doc, b: ^buffer.Buffer, start: int, hl: []syntax.H
 		if !ok || info.kind == .Link_Ref_Def || i != min(hi, last) do continue
 		heading := info.kind == .Atx_Heading || setext_heading(doc, hi) || is_table_header(doc, i)
 		if info.kind == .Table_Row || is_table_header(doc, i) {
-			highlight_table_row(&p, text, line_lo, d, heading)
+			highlight_table_row(&p, text, line_lo, d, heading, labels)
 			continue
 		}
 		bt := block_text(doc, b, lo, hi)
@@ -132,24 +132,10 @@ highlight_range :: proc(doc: ^Doc, b: ^buffer.Buffer, start: int, hl: []syntax.H
 	}
 }
 
-// Whether the paragraph ending at line `last` is a setext heading.
-setext_heading :: proc(doc: ^Doc, last: int) -> bool {
-	return last + 1 < len(doc.lines) && doc.lines[last + 1].kind == .Setext_Underline
-}
-
-// Whether line i is inside a block quote.
-quoted :: proc(doc: ^Doc, i: int) -> bool {
-	s := line_state(doc, i)
-	if doc.lines[i].kind == .Blank do return false
-	for c in s.containers[:s.depth] do if c.kind == .Quote do return true
-	return false
-}
-
-// The lexer state at the start of fence body line i, lexing up from its fence.
-@(private = "file")
+// The lexer state at the start of fence body line i, lexing from its fence (or
+// MAX_FENCE_LOOKBACK lines up, in a longer block).
 fence_state_before :: proc(doc: ^Doc, b: ^buffer.Buffer, rules: ^syntax.Lang_Rules, i: int) -> syntax.Lex_State {
-	open := i - 1
-	for open > 0 && i - open < MAX_FENCE_LOOKBACK && doc.lines[open].kind == .Fence_Body do open -= 1
+	open := max(block_first(doc, i), i - MAX_FENCE_LOOKBACK)
 	state: syntax.Lex_State
 	for j in open + 1 ..< i {
 		lo := buffer.line_start(b, j)
@@ -161,26 +147,19 @@ fence_state_before :: proc(doc: ^Doc, b: ^buffer.Buffer, rules: ^syntax.Lang_Rul
 }
 
 @(private = "file")
-highlight_table_row :: proc(p: ^Painter, text: string, line_lo: int, d: Line_Detail, heading: bool) {
+highlight_table_row :: proc(p: ^Painter, text: string, line_lo: int, d: Line_Detail, heading: bool, labels: ^Labels) {
 	row := text[d.content[0]:]
 	base := line_lo + int(d.content[0])
-	spans := make([dynamic]Span, context.temp_allocator)
-	cell_lo := 0
-	for k := 0; k <= len(row); k += 1 {
-		if k < len(row) && row[k] == '\\' {
-			k += 1
-			continue
-		}
-		if k < len(row) && row[k] != '|' do continue
-		if k < len(row) do paint(p, base + k, base + k + 1, .Punctuation)
-		cell := row[cell_lo:k]
-		if heading do paint_style(p, base + cell_lo, base + k, {.Bold})
-		clear(&spans)
-		inline_parse(cell, nil, &spans)
-		bt := Block_Text{text = cell, segs = {{doc_lo = base + cell_lo, lo = 0, hi = len(cell)}}}
-		paint_spans(p, &bt, spans[:])
-		cell_lo = k + 1
+	it := row_iterator(row)
+	for lo, hi in row_next(&it) {
+		if lo > 0 && row[lo - 1] == '|' do paint(p, base + lo - 1, base + lo, .Punctuation)
+		if hi < len(row) && row[hi] == '|' do paint(p, base + hi, base + hi + 1, .Punctuation)
+		if heading do paint_style(p, base + lo, base + hi, {.Bold})
 	}
+	spans := make([dynamic]Span, context.temp_allocator)
+	inline_parse_row(row, labels, &spans)
+	bt := Block_Text{text = row, segs = {{doc_lo = base, lo = 0, hi = len(row)}}}
+	paint_spans(p, &bt, spans[:])
 }
 
 @(private = "file")
@@ -196,12 +175,14 @@ paint_spans :: proc(p: ^Painter, bt: ^Block_Text, spans: []Span) {
 		case .Code:      paint(p, open_hi, close_lo, .String)
 		case .Math:      paint(p, open_hi, close_lo, .Number)
 		case .Html:      paint(p, lo, hi, .Attribute)
-		case .Entity:    paint(p, lo, hi, .Escape)
+		case .Entity:
+			paint(p, lo, hi, .Escape)
+			continue
 		case .Escape, .Hard_Break:
 		case .Link, .Image, .Wikilink:
 			paint(p, open_hi, close_lo, .Function)
 			paint(p, close_lo, hi, .Punctuation)
-			if s.kind != .Wikilink && !s.reference do paint(p, doc(bt, s.url[0]), doc(bt, s.url[1]), .Attribute)
+			if s.kind != .Wikilink && !s.reference && !s.embed do paint(p, doc(bt, s.url[0]), doc(bt, s.url[1]), .Attribute)
 		case .Autolink, .Url:
 			paint(p, open_hi, close_lo, .Attribute)
 		case .Footnote_Ref:

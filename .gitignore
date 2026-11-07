@@ -3,3 +3,4 @@ build/
 *.exe
 *.res
 resume.txt
+__pycache__/

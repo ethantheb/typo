@@ -9,6 +9,7 @@ import "core:time"
 
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
+import "gfx"
 
 // Ctrl+E file finder: fuzzy-matches a query against every file under the
 // workspace root.
@@ -115,6 +116,11 @@ finder_frame :: proc() {
 finder_busy :: proc() -> bool {
 	f := &g.finder
 	return f.open && (f.indexing || f.scanned < len(f.files))
+}
+
+// Starts indexing the workspace's files, if it hasn't, for lookups by name.
+finder_ensure_index :: proc() {
+	if g.finder.shared == nil && g.workspace.root != "" do start_indexer()
 }
 
 finder_display_path :: proc(i: int) -> string {
@@ -323,13 +329,13 @@ finder_results :: proc() {
 			} else if file_count == 0 {
 				msg = "No files in this folder"
 			}
-			label(msg, theme.text_dim)
+			label(msg, gfx.theme.text_dim)
 		}
 		return
 	}
 
 	rows := min(len(f.results), FINDER_VISIBLE_ROWS)
-	smooth_scroll_list(clay.ID("FinderResults"))
+	wheel_scroll_list(clay.ID("FinderResults"))
 	if clay.UI(clay.ID("FinderResults"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(f32(rows) * FINDER_ROW_HEIGHT)}, layoutDirection = .TopToBottom},
 		clip = {vertical = true, horizontal = true, childOffset = clay.GetScrollOffset()},
@@ -351,7 +357,7 @@ finder_status_line :: proc(indexing, searching: bool, file_count: int, truncated
 	case:           return
 	}
 	if clay.UI()({layout = {padding = {left = 10, bottom = 2}}}) {
-		label(msg, theme.text_dim, 12)
+		label(msg, gfx.theme.text_dim, 12)
 	}
 }
 
@@ -364,16 +370,16 @@ finder_row :: proc(index: int, path: string, query: string, selected: bool) -> b
 			padding = {left = 10, right = 10},
 			childAlignment = {y = .Center},
 		},
-		backgroundColor = selected ? theme.selected : (clay.Hovered() ? theme.hover : {}),
+		backgroundColor = selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
 		cornerRadius = clay.CornerRadiusAll(3),
 	}) {
 		// File name first, then its directory, with matched characters highlighted.
 		slash := strings.last_index_any(path, "/\\")
 		matched := fuzzy_positions(query, path, context.temp_allocator)
-		highlighted_text(path, slash + 1, len(path), matched, theme.text_bright)
+		highlighted_text(path, slash + 1, len(path), matched, gfx.theme.text_bright)
 		if slash > 0 {
 			spacer_x(10)
-			highlighted_text(path, 0, slash, matched, theme.text_dim)
+			highlighted_text(path, 0, slash, matched, gfx.theme.text_dim)
 		}
 	}
 	return clicked(id, clay.ID("FinderResults"))
@@ -387,7 +393,7 @@ highlighted_text :: proc(s: string, lo, hi: int, matched: []bool, color: clay.Co
 		hl := len(matched) > 0 && matched[i]
 		j := i + 1
 		for j < hi && (len(matched) > 0 && matched[j]) == hl do j += 1
-		label(s[i:j], hl ? theme.accent : color, FONT_SIZE_UI, hl ? .Bold : .Body)
+		label(s[i:j], hl ? gfx.theme.accent : color, FONT_SIZE_UI, hl ? .Bold : .Body)
 		i = j
 	}
 }

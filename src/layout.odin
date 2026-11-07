@@ -6,6 +6,8 @@ import "core:strings"
 import clay "../vendor/clay-odin"
 import "buffer"
 import sdl "../vendor/sdl3"
+import "gfx"
+import "textedit"
 
 // The window layout: sidebar, editor pane, terminal panel and status bar, plus
 // which pane has focus and the mouse cursor shape.
@@ -38,7 +40,7 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 	clay.BeginLayout()
 	if clay.UI(clay.ID("Root"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
-		backgroundColor = theme.bg,
+		backgroundColor = gfx.theme.bg,
 	}) {
 		if clay.UI(clay.ID("Main"))({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}}}) {
 			maximized := terminal_maximized()
@@ -73,22 +75,22 @@ update_focus :: proc() {
 sidebar :: proc() {
 	if clay.UI(clay.ID("Sidebar"))({
 		layout = {sizing = {clay.SizingFixed(SIDEBAR_WIDTH), clay.SizingGrow()}, layoutDirection = .TopToBottom, padding = {top = 8}},
-		backgroundColor = theme.panel,
-		border = {color = theme.border, width = {right = 1}},
+		backgroundColor = gfx.theme.panel,
+		border = {color = gfx.theme.border, width = {right = 1}},
 	}) {
 		if clay.UI()({
 			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(24)}, padding = {left = 12, right = 6}, childGap = 2, childAlignment = {y = .Center}},
 		}) {
 			name_id := clay.ID("FolderName")
 			if clay.UI(name_id)({}) {
-				label(strings.to_upper(folder_name(g.workspace.root), context.temp_allocator), theme.text_dim, FONT_SIZE_SMALL, .Bold)
+				label(strings.to_upper(folder_name(g.workspace.root), context.temp_allocator), gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
 			}
 			tooltip(name_id, g.workspace.root)
 			push_right()
 			if button(clay.ID("OpenButton"), "Open…", "Open a folder") do show_open_folder_dialog()
 		}
 		files_id := clay.ID("SidebarFiles")
-		smooth_scroll_list(files_id)
+		wheel_scroll_list(files_id)
 		if clay.UI(files_id)({
 			layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
 			clip = {horizontal = true, vertical = true, childOffset = clay.GetScrollOffset()},
@@ -114,14 +116,14 @@ tree_row :: proc(index: int, node: Node, selected: bool, list: clay.ElementId) -
 			childGap = 2,
 			childAlignment = {y = .Center},
 		},
-		backgroundColor = selected ? theme.selected : (clay.Hovered() ? theme.hover : {}),
+		backgroundColor = selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
 	}) {
 		if node.is_dir {
-			icon(node.expanded ? .Chevron_Down : .Chevron_Right, theme.text_dim)
+			icon(node.expanded ? .Chevron_Down : .Chevron_Right, gfx.theme.text_dim)
 		} else {
 			spacer_x(16)
 		}
-		label(node.name, selected ? theme.text : theme.text_dim, FONT_SIZE_SIDEBAR)
+		label(node.name, selected ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
 	}
 	return clicked(id, list)
 }
@@ -132,7 +134,7 @@ tree_row :: proc(index: int, node: Node, selected: bool, list: clay.ElementId) -
 editor_pane :: proc() {
 	if clay.UI(clay.ID("EditorPane"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
-		backgroundColor = theme.bg,
+		backgroundColor = gfx.theme.bg,
 	}) {
 		switch g.editor.status {
 		case .None:   centered_message(fmt.tprintf("Select a file in the explorer, or press %s", first_chord_label(.Find_File)))
@@ -146,7 +148,7 @@ editor_pane :: proc() {
 @(private = "file")
 centered_message :: proc(s: string) {
 	if clay.UI()({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, childAlignment = {x = .Center, y = .Center}}}) {
-		label(s, theme.text_dim)
+		label(s, gfx.theme.text_dim)
 	}
 }
 
@@ -210,12 +212,12 @@ terminal_pane :: proc() {
 	p := &g.terminal_panel
 	if clay.UI(clay.ID("TerminalPane"))({
 		layout = {sizing = {clay.SizingGrow(), p.maximized ? clay.SizingGrow() : clay.SizingFixed(p.height)}, layoutDirection = .TopToBottom},
-		backgroundColor = theme.bg,
+		backgroundColor = gfx.theme.bg,
 	}) {
 		if clay.UI()({
 			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(TERMINAL_HEADER_HEIGHT)}, padding = {left = 12, right = 6}, childGap = 8, childAlignment = {y = .Center}},
 		}) {
-			label(terminal_title(&p.terminal), g.focus == .Terminal ? theme.text : theme.text_dim, FONT_SIZE_SMALL, .Bold)
+			label(terminal_title(&p.terminal), g.focus == .Terminal ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
 			push_right()
 			max_tip := p.maximized ? "Restore terminal" : "Maximize terminal"
 			if icon_button(clay.ID("TerminalMaximize"), p.maximized ? .Restore : .Maximize, 22, 15, max_tip, first_chord_label(.Maximize_Terminal)) {
@@ -238,7 +240,7 @@ terminal_pane :: proc() {
 terminal_splitter :: proc() {
 	if clay.UI(clay.ID("TerminalSplitter"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(1)}},
-		backgroundColor = g.terminal_panel.split_drag ? theme.accent : theme.border,
+		backgroundColor = g.terminal_panel.split_drag ? gfx.theme.accent : gfx.theme.border,
 	}) {}
 }
 
@@ -263,7 +265,7 @@ splitter_mouse :: proc(p: ^Terminal_Panel) {
 splitter_hit :: proc(pos: [2]f32) -> bool {
 	if !g.terminal_panel.visible || g.terminal_panel.maximized do return false
 	r, ok := element_rect(clay.ID("TerminalSplitter"))
-	return ok && rect_contains({r.x, r.y - SPLITTER_GRAB / 2 - 1, r.w, SPLITTER_GRAB + 2}, pos)
+	return ok && gfx.rect_contains({r.x, r.y - SPLITTER_GRAB / 2 - 1, r.w, SPLITTER_GRAB + 2}, pos)
 }
 
 // --- Status bar --------------------------------------------------------------------
@@ -272,8 +274,8 @@ splitter_hit :: proc(pos: [2]f32) -> bool {
 status_bar :: proc() {
 	if clay.UI(clay.ID("StatusBar"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(STATUSBAR_HEIGHT)}, padding = {left = 3, right = 12}, childGap = 16, childAlignment = {y = .Center}},
-		backgroundColor = theme.statusbar,
-		border = {color = theme.border, width = {top = 1}},
+		backgroundColor = gfx.theme.statusbar,
+		border = {color = gfx.theme.border, width = {top = 1}},
 	}) {
 		if clay.UI()({layout = {childGap = 2}}) {
 			if icon_button(clay.ID("SidebarToggle"), .Sidebar, 20, 15, "Toggle sidebar", first_chord_label(.Toggle_Sidebar)) {
@@ -290,12 +292,12 @@ status_bar :: proc() {
 		if e.status != .None {
 			name := relative_to_root(e.path)
 			if e.new_file do name = fmt.tprintf("%s (new)", name)
-			label(editor_is_modified(e) ? fmt.tprintf("%s •", name) : name, theme.text, FONT_SIZE_SMALL)
+			label(editor_is_modified(e) ? fmt.tprintf("%s •", name) : name, gfx.theme.text, FONT_SIZE_SMALL)
 		}
 		if e.status == .Text {
-			if !md_caret_hidden(e) do label(cursor_status(e), theme.text_dim, FONT_SIZE_SMALL)
-			label(fmt.tprintf("%d lines", buffer.line_count(&e.buf)), theme.text_dim, FONT_SIZE_SMALL)
-			label(e.buf.crlf ? "CRLF" : "LF", theme.text_dim, FONT_SIZE_SMALL)
+			if !textedit.caret_hidden(e) do label(cursor_status(e), gfx.theme.text_dim, FONT_SIZE_SMALL)
+			label(fmt.tprintf("%d lines", buffer.line_count(&e.buf)), gfx.theme.text_dim, FONT_SIZE_SMALL)
+			label(e.buf.crlf ? "CRLF" : "LF", gfx.theme.text_dim, FONT_SIZE_SMALL)
 			if e.md != nil {
 				rendered := md_rendered(e)
 				if icon_button(clay.ID("MarkdownView"), rendered ? .Code : .Eye, 20, 15, rendered ? "Show Markdown source" : "Show rendered Markdown", first_chord_label(.Toggle_Markdown_View)) {
@@ -304,8 +306,8 @@ status_bar :: proc() {
 			}
 		}
 		push_right()
-		label(fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, g.ui_scale), theme.text_dim, FONT_SIZE_SMALL)
-		if g.settings.show_fps do label(fmt.tprintf("%.0f fps", g.fps), theme.text_dim, FONT_SIZE_SMALL)
+		label(fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, gfx.scale), gfx.theme.text_dim, FONT_SIZE_SMALL)
+		if g.settings.show_fps do label(fmt.tprintf("%.0f fps", g.fps), gfx.theme.text_dim, FONT_SIZE_SMALL)
 	}
 }
 
@@ -315,7 +317,7 @@ cursor_status :: proc(e: ^Editor) -> string {
 	line, col := caret_line_col(e)
 	status := fmt.tprintf("Ln %d, Col %d", line + 1, col + 1)
 	selected := 0
-	for s in e.sels do selected += sel_hi(s) - sel_lo(s)
+	for s in e.sels do selected += textedit.sel_hi(s) - textedit.sel_lo(s)
 	if len(e.sels) > 1 do status = fmt.tprintf("%s  (%d carets)", status, len(e.sels))
 	if selected > 0 do status = fmt.tprintf("%s  (%d selected)", status, selected)
 	return status
@@ -343,12 +345,15 @@ update_mouse_cursor :: proc() {
 	case e.status != .Text || terminal_maximized():
 	case e.dragging && g.mouse_down:
 		want = .TEXT // keep the I-beam while drag-selecting, wherever the mouse goes
-	case md_rendered(e) && (e.mdv.code_drag.active || code_bar_under_pointer(e)):
-		want = .DEFAULT
-	case md_rendered(e) && md_pointer_target(e):
-		want = .POINTER
-	case e.scrollbar_drag == nil && editor_text_hit(e, g.mouse_pos):
-		want = .TEXT
+	case:
+		over_text := editor_text_hit(e, g.mouse_pos)
+		look := textedit.Pointer.Text
+		if e.kind.pointer != nil do look = e.kind.pointer(e, g.mouse_pos, over_text)
+		switch look {
+		case .Arrow: want = .DEFAULT
+		case .Hand:  want = .POINTER
+		case .Text:  if over_text && e.scrollbar_drag == nil do want = .TEXT
+		}
 	}
 	if want == current_cursor do return
 	cursor := sdl.GetDefaultCursor()
@@ -357,12 +362,6 @@ update_mouse_cursor :: proc() {
 		cursor = cursors[want]
 	}
 	if cursor != nil && sdl.SetCursor(cursor) do current_cursor = want
-}
-
-@(private = "file")
-code_bar_under_pointer :: proc(e: ^Editor) -> bool {
-	_, _, _, _, ok := md_code_bar_at(e, g.mouse_pos)
-	return ok
 }
 
 destroy_mouse_cursors :: proc() {

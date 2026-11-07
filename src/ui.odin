@@ -5,6 +5,7 @@ import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
+import "gfx"
 
 // Small component layer on top of Clay: labels, buttons, icons, text fields,
 // tooltips, modal popups and message boxes.
@@ -14,17 +15,8 @@ FONT_SIZE_SMALL       :: 12
 UI_LINE_HEIGHT        :: 20
 PARAGRAPH_LINE_HEIGHT :: 17
 
-// A rectangle in logical pixels.
-Rect :: struct {
-	x, y, w, h: f32,
-}
-
-rect_contains :: proc(r: Rect, p: [2]f32) -> bool {
-	return p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h
-}
-
 // An element's bounds from the last layout.
-element_rect :: proc(id: clay.ElementId) -> (r: Rect, ok: bool) {
+element_rect :: proc(id: clay.ElementId) -> (r: gfx.Rect, ok: bool) {
 	data := clay.GetElementData(id)
 	b := data.boundingBox
 	return {b.x, b.y, b.width, b.height}, bool(data.found)
@@ -34,7 +26,7 @@ element_rect :: proc(id: clay.ElementId) -> (r: Rect, ok: bool) {
 // Unlike clay.Hovered() this sees a click that arrives together with a move.
 pointer_in :: proc(id: clay.ElementId) -> bool {
 	r, ok := element_rect(id)
-	return ok && rect_contains(r, g.mouse_pos)
+	return ok && gfx.rect_contains(r, g.mouse_pos)
 }
 
 // Whether UI may react to the pointer: a popup's own controls always may
@@ -57,16 +49,16 @@ clicked :: proc(id: clay.ElementId, within := clay.ElementId{}) -> bool {
 	return g.mouse_pressed && ui_interactive() && pointer_in(id) && (within.id == 0 || pointer_in(within))
 }
 
-text_config :: proc(color := theme.text, size: u16 = FONT_SIZE_UI, font := Font_Id.Body) -> clay.TextElementConfig {
+text_config :: proc(color := gfx.theme.text, size: u16 = FONT_SIZE_UI, font := gfx.Font_Id.Body) -> clay.TextElementConfig {
 	return {textColor = color, fontId = u16(font), fontSize = size, lineHeight = UI_LINE_HEIGHT, wrapMode = .None}
 }
 
-label :: proc(s: string, color := theme.text, size: u16 = FONT_SIZE_UI, font := Font_Id.Body) {
+label :: proc(s: string, color := gfx.theme.text, size: u16 = FONT_SIZE_UI, font := gfx.Font_Id.Body) {
 	clay.TextDynamic(s, text_config(color, size, font))
 }
 
 // Small text that wraps at word boundaries to fit its container.
-paragraph :: proc(s: string, color := theme.text) {
+paragraph :: proc(s: string, color := gfx.theme.text) {
 	config := text_config(color, FONT_SIZE_SMALL)
 	config.lineHeight = PARAGRAPH_LINE_HEIGHT
 	config.wrapMode = .Words
@@ -88,23 +80,23 @@ push_right :: proc() {
 button :: proc(id: clay.ElementId, s: string, tip := "", shortcut := "") -> bool {
 	if clay.UI(id)({
 		layout = {padding = {left = 6, right = 6, top = 2, bottom = 2}, childAlignment = {y = .Center}},
-		backgroundColor = clay.Hovered() ? theme.hover : {},
+		backgroundColor = clay.Hovered() ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(3),
 	}) {
-		label(s, clay.Hovered() ? theme.text_bright : theme.text_dim, FONT_SIZE_SMALL)
+		label(s, clay.Hovered() ? gfx.theme.text_bright : gfx.theme.text_dim, FONT_SIZE_SMALL)
 	}
 	if tip != "" do tooltip(id, tip, shortcut)
 	return clicked(id)
 }
 
 // Square button showing an icon, brightened on hover.
-icon_button :: proc(id: clay.ElementId, kind: Icon, size: f32 = 24, icon_size: u16 = 16, tip := "", shortcut := "") -> bool {
+icon_button :: proc(id: clay.ElementId, kind: gfx.Icon, size: f32 = 24, icon_size: u16 = 16, tip := "", shortcut := "") -> bool {
 	if clay.UI(id)({
 		layout = {sizing = {clay.SizingFixed(size), clay.SizingFixed(size)}, childAlignment = {x = .Center, y = .Center}},
-		backgroundColor = clay.Hovered() ? theme.hover : {},
+		backgroundColor = clay.Hovered() ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(size / 4),
 	}) {
-		icon(kind, clay.Hovered() ? theme.text : theme.text_dim, icon_size)
+		icon(kind, clay.Hovered() ? gfx.theme.text : gfx.theme.text_dim, icon_size)
 	}
 	if tip != "" do tooltip(id, tip, shortcut)
 	return clicked(id)
@@ -112,58 +104,15 @@ icon_button :: proc(id: clay.ElementId, kind: Icon, size: f32 = 24, icon_size: u
 
 // --- Icons -----------------------------------------------------------------------
 
-Icon :: enum u8 {
-	Chevron_Left,
-	Chevron_Right,
-	Chevron_Down,
-	Sidebar,
-	Settings,
-	Close,
-	Restart,
-	Terminal,
-	Maximize,
-	Restore,
-	Eye,
-	Code,
-	Check,
-	Image_Off,
-}
-
-// Codepoints in assets/fonts/lucide.ttf (see lucide-static's font/codepoints.json).
-ICON_GLYPHS := [Icon]string {
-	.Chevron_Left  = "",
-	.Chevron_Right = "",
-	.Chevron_Down  = "",
-	.Sidebar       = "", // panel-left
-	.Settings      = "",
-	.Close         = "", // x
-	.Restart       = "", // rotate-ccw
-	.Terminal      = "", // square-terminal
-	.Maximize      = "", // maximize-2
-	.Restore       = "", // minimize-2
-	.Eye           = "",
-	.Code          = "",
-	.Check         = "",
-	.Image_Off     = "",
-}
-
 // What a Clay custom element asks the renderer to draw.
 Custom_Data :: union {
-	Icon_Data,
+	gfx.Icon_Data,
 	^Editor,
 	^Terminal,
 }
 
-// The color lives here rather than in backgroundColor, which Clay would draw
-// as a filled rectangle.
-Icon_Data :: struct {
-	kind:  Icon,
-	color: clay.Color,
-	size:  u16,
-}
-
-icon :: proc(kind: Icon, color: clay.Color, size: u16 = 16) {
-	custom_element({}, Icon_Data{kind, color, size}, f32(size))
+icon :: proc(kind: gfx.Icon, color: clay.Color, size: u16 = 16) {
+	custom_element({}, gfx.Icon_Data{kind, color, size}, f32(size))
 }
 
 // An element the renderer draws itself (see render_clay_commands): a square of
@@ -217,17 +166,17 @@ text_field_event :: proc(buf: ^[dynamic]u8, event: ^sdl.Event) -> (handled, chan
 input_box :: proc(id: clay.ElementId, text, placeholder: string, focused: bool, width: f32 = 0, height: f32 = 32, size: u16 = FONT_SIZE_UI) {
 	if clay.UI(id)({
 		layout = {sizing = {width > 0 ? clay.SizingFixed(width) : clay.SizingGrow(), clay.SizingFixed(height)}, padding = {left = 10, right = 10}, childAlignment = {y = .Center}},
-		backgroundColor = theme.bg,
+		backgroundColor = gfx.theme.bg,
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = focused ? theme.accent : theme.border, width = clay.BorderOutside(1)},
+		border = {color = focused ? gfx.theme.accent : gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
 		// Clipped inside the field so the clip doesn't cut off the outline.
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}}, clip = {horizontal = true}}) {
 			if text == "" {
 				if focused do text_caret()
-				label(placeholder, theme.text_dim, size)
+				label(placeholder, gfx.theme.text_dim, size)
 			} else {
-				label(text, theme.text_bright, size)
+				label(text, gfx.theme.text_bright, size)
 				if focused do text_caret()
 			}
 		}
@@ -236,7 +185,7 @@ input_box :: proc(id: clay.ElementId, text, placeholder: string, focused: bool, 
 
 @(private = "file")
 text_caret :: proc() {
-	if clay.UI()({layout = {sizing = {clay.SizingFixed(1.5), clay.SizingFixed(16)}}, backgroundColor = theme.text_bright}) {}
+	if clay.UI()({layout = {sizing = {clay.SizingFixed(1.5), clay.SizingFixed(16)}}, backgroundColor = gfx.theme.text_bright}) {}
 }
 
 // --- Modal popups -----------------------------------------------------------------
@@ -252,7 +201,7 @@ modal :: proc(id: clay.ElementId, width: f32, height: clay.SizingAxis, top: u16,
 			childAlignment = {x = .Center},
 			padding = {top = top},
 		},
-		backgroundColor = theme.backdrop,
+		backgroundColor = gfx.theme.backdrop,
 		floating = {attachTo = .Root, zIndex = 100},
 	})
 	clay._OpenElementWithId(id)
@@ -263,9 +212,9 @@ modal :: proc(id: clay.ElementId, width: f32, height: clay.SizingAxis, top: u16,
 			padding = padding,
 			childGap = gap,
 		},
-		backgroundColor = theme.panel,
+		backgroundColor = gfx.theme.panel,
 		cornerRadius = clay.CornerRadiusAll(8),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	})
 	return true
 }
@@ -278,7 +227,7 @@ modal :: proc(id: clay.ElementId, width: f32, height: clay.SizingAxis, top: u16,
 // the pointer from the window behind it; otherwise the pointer passes through
 // and ui_interactive decides what may react.
 @(deferred_none = end_modal)
-modal_at :: proc(id: clay.ElementId, r: Rect, backdrop: clay.Color, clip, modal: bool) -> bool {
+modal_at :: proc(id: clay.ElementId, r: gfx.Rect, backdrop: clay.Color, clip, modal: bool) -> bool {
 	g.in_modal = true
 	clay._OpenElementWithId(clay.ID("Backdrop", id.id))
 	clay.ConfigureOpenElement({
@@ -293,9 +242,9 @@ modal_at :: proc(id: clay.ElementId, r: Rect, backdrop: clay.Color, clip, modal:
 	clay._OpenElementWithId(id)
 	clay.ConfigureOpenElement({
 		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
-		backgroundColor = theme.panel,
+		backgroundColor = gfx.theme.panel,
 		cornerRadius = clay.CornerRadiusAll(8),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 		clip = {horizontal = clip, vertical = clip},
 		transition = transition(clay.TransitionPropertyBoundingBox),
 	})
@@ -372,9 +321,9 @@ tooltip :: proc(id: clay.ElementId, text: string, shortcut := "") {
 	}
 	if clay.UI(clay.ID("Tooltip"))({
 		layout = {padding = {left = 8, right = 8, top = 4, bottom = 4}, childGap = 10, childAlignment = {y = .Center}},
-		backgroundColor = theme.panel,
+		backgroundColor = gfx.theme.panel,
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 		floating = {
 			attachTo = .ElementWithId,
 			parentId = id.id,
@@ -384,8 +333,8 @@ tooltip :: proc(id: clay.ElementId, text: string, shortcut := "") {
 			pointerCaptureMode = .Passthrough,
 		},
 	}) {
-		label(text, theme.text, FONT_SIZE_SMALL)
-		if shortcut != "" do label(shortcut, theme.text_dim, FONT_SIZE_SMALL)
+		label(text, gfx.theme.text, FONT_SIZE_SMALL)
+		if shortcut != "" do label(shortcut, gfx.theme.text_dim, FONT_SIZE_SMALL)
 	}
 }
 
@@ -446,7 +395,7 @@ clear_overlay :: proc(background: clay.Color) -> clay.Color {
 }
 
 // Whether an element's last layout put it at `r`: an animation toward r is done.
-element_at :: proc(id: clay.ElementId, r: Rect) -> bool {
+element_at :: proc(id: clay.ElementId, r: gfx.Rect) -> bool {
 	e, ok := element_rect(id)
 	return ok && abs(e.x - r.x) < 0.5 && abs(e.y - r.y) < 0.5 && abs(e.w - r.w) < 0.5 && abs(e.h - r.h) < 0.5
 }

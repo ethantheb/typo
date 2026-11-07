@@ -94,7 +94,6 @@ is_path_prefix :: proc(dir, path: string) -> bool {
 	return len(path) > len(dir) && strings.has_prefix(path, dir) && is_separator(path[len(dir)])
 }
 
-@(private = "file")
 is_separator :: proc(c: u8) -> bool {
 	return c == '/' || c == '\\'
 }

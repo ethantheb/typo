@@ -7,6 +7,7 @@ import clay "../vendor/clay-odin"
 import "syntax"
 import "term"
 import sdl "../vendor/sdl3"
+import "gfx"
 
 // The settings window: a modal with a search field, then the settings grouped
 // into sections. Every change is applied immediately and written to
@@ -351,8 +352,8 @@ open_picker :: proc(x: Setting) {
 	clear(&w.filter)
 	w.picker_reveal = true
 	w.extra_focus = -1
-	if i, ok := theme_index(g.settings.theme); ok do w.dark_themes = THEMES[i].dark
-	if x == .Font_Family || x == .Markdown_Font do fonts_scan(&g.fonts, again = true)
+	if i, ok := gfx.theme_index(g.settings.theme); ok do w.dark_themes = gfx.THEMES[i].dark
+	if x == .Font_Family || x == .Markdown_Font do gfx.fonts_scan(&g.fonts, walk_files, again = true)
 }
 
 // Leaves the list, keeping what is now applied or restoring the old values.
@@ -411,15 +412,15 @@ show_dark_themes :: proc(dark: bool) {
 	w := &g.settings_window
 	if w.dark_themes == dark do return
 	w.dark_themes = dark
-	i, _ := theme_index(g.settings.theme)
+	i, _ := gfx.theme_index(g.settings.theme)
 	next := -1
-	for spec, j in THEMES {
+	for spec, j in gfx.THEMES {
 		if spec.dark != dark do continue
-		if next < 0 || spec.family == THEMES[i].family do next = j
-		if spec.family == THEMES[i].family do break
+		if next < 0 || spec.family == gfx.THEMES[i].family do next = j
+		if spec.family == gfx.THEMES[i].family do break
 	}
 	clear(&w.filter)
-	preview_option(THEMES[next].key)
+	preview_option(gfx.THEMES[next].key)
 	w.picker_reveal = true
 }
 
@@ -487,11 +488,11 @@ picker_options :: proc(x: Setting, filter: string) -> []Picker_Option {
 	case .Theme:
 		// Dark and light themes are listed apart, so moving through the list
 		// doesn't flash between them.
-		for spec in THEMES do if spec.dark == g.settings_window.dark_themes do append(&all, Picker_Option{spec.key, spec.name, ""})
+		for spec in gfx.THEMES do if spec.dark == g.settings_window.dark_themes do append(&all, Picker_Option{spec.key, spec.name, ""})
 	case .Font_Family:
-		for name in font_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
+		for name in gfx.font_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
 	case .Markdown_Font:
-		for name in markdown_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
+		for name in gfx.markdown_family_names(&g.fonts) do append(&all, Picker_Option{name, name, ""})
 	}
 	if filter == "" do return all[:]
 	query := strings.to_lower(filter, context.temp_allocator)
@@ -543,7 +544,7 @@ settings_window_ui :: proc() {
 	w := &g.settings_window
 	if !w.open do return
 	r := w.picking ? picker_rect() : settings_rect()
-	backdrop := theme.backdrop
+	backdrop := gfx.theme.backdrop
 	if w.picking do backdrop.a = 0 // leave the editor undimmed for previewing
 	// The panel moves and resizes to the new page, which fades in; it clips the
 	// page until it has arrived.
@@ -563,14 +564,14 @@ settings_window_docked :: proc() -> bool {
 }
 
 @(private = "file")
-settings_rect :: proc() -> Rect {
+settings_rect :: proc() -> gfx.Rect {
 	w := min(SETTINGS_WIDTH, f32(g.window_w) - 32)
 	return {(f32(g.window_w) - w) / 2, 48, w, max(f32(g.window_h) - 96, 200)}
 }
 
 // At the right edge, above the status bar.
 @(private = "file")
-picker_rect :: proc() -> Rect {
+picker_rect :: proc() -> gfx.Rect {
 	w := min(PICKER_WIDTH, f32(g.window_w) - 2 * PICKER_MARGIN)
 	h := max(f32(g.window_h) - STATUSBAR_HEIGHT - 2 * PICKER_MARGIN, 200)
 	return {f32(g.window_w) - w - PICKER_MARGIN, PICKER_MARGIN, w, h}
@@ -582,8 +583,8 @@ settings_page :: proc(width: f32) {
 	reveal_focus()
 	clear(&w.items)
 	if clay.UI(clay.ID("SettingsPage"))({
-		backgroundColor = theme.panel,
-		overlayColor = clear_overlay(theme.panel),
+		backgroundColor = gfx.theme.panel,
+		overlayColor = clear_overlay(gfx.theme.panel),
 		cornerRadius = clay.CornerRadiusAll(8),
 		transition = transition({.OverlayColor}, enter = .Fade),
 		layout = {
@@ -594,7 +595,7 @@ settings_page :: proc(width: f32) {
 		},
 	}) {
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}}}) {
-			label("Settings", theme.text_bright, 16, .SemiBold)
+			label("Settings", gfx.theme.text_bright, 16, .SemiBold)
 			push_right()
 			if icon_button(clay.ID("SettingsClose"), .Close, 26, 18, "Close", "Esc") do settings_window_toggle()
 		}
@@ -622,9 +623,9 @@ search_field :: proc() {
 error_banner :: proc(msg: string) {
 	if clay.UI()({
 		layout = {sizing = {width = clay.SizingGrow()}, padding = clay.PaddingAll(10)},
-		backgroundColor = theme.hover,
+		backgroundColor = gfx.theme.hover,
 		cornerRadius = clay.CornerRadiusAll(6),
-		border = {color = theme.error, width = {left = 3}},
+		border = {color = gfx.theme.error, width = {left = 3}},
 	}) {
 		paragraph(msg)
 	}
@@ -665,7 +666,7 @@ settings_list :: proc() {
 		}
 		if shown == 0 {
 			if clay.UI()({layout = {padding = {left = 4, top = 8}}}) {
-				label("No settings match your search", theme.text_dim)
+				label("No settings match your search", gfx.theme.text_dim)
 			}
 		}
 	}
@@ -687,7 +688,7 @@ section_header :: proc(title: string) -> bool {
 	clay._OpenElement()
 	clay.ConfigureOpenElement({layout = {sizing = {width = clay.SizingGrow()}, layoutDirection = .TopToBottom, childGap = 2}})
 	if clay.UI()({layout = {padding = {left = 4, bottom = 6}}}) {
-		label(strings.to_upper(title, context.temp_allocator), theme.text_dim, FONT_SIZE_SMALL, .Bold)
+		label(strings.to_upper(title, context.temp_allocator), gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
 	}
 	return true
 }
@@ -710,13 +711,13 @@ setting_row :: proc(item: Setting_Item, name, description: string, list: clay.El
 			childAlignment = {y = .Center},
 			childGap = 12,
 		},
-		backgroundColor = focused || clay.Hovered() ? theme.hover : {},
+		backgroundColor = focused || clay.Hovered() ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(6),
-		border = {color = focused ? theme.accent : {}, width = focused ? clay.BorderOutside(1) : {}},
+		border = {color = focused ? gfx.theme.accent : {}, width = focused ? clay.BorderOutside(1) : {}},
 	})
 	if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, layoutDirection = .TopToBottom, childGap = 2}}) {
-		label(name, theme.text)
-		if description != "" do paragraph(description, theme.text_dim)
+		label(name, gfx.theme.text)
+		if description != "" do paragraph(description, gfx.theme.text_dim)
 	}
 	return true
 }
@@ -767,19 +768,19 @@ setting_control :: proc(x: Setting) {
 segmented :: proc(x: Setting, options: []string, selected: int, within := clay.ElementId{}) -> (choice: int, changed: bool) {
 	if clay.UI()({
 		layout = {padding = clay.PaddingAll(2), childGap = 2},
-		backgroundColor = theme.bg,
+		backgroundColor = gfx.theme.bg,
 		cornerRadius = clay.CornerRadiusAll(6),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
 		for option, i in options {
 			id := clay.ID("SettingOption", u32(x) * 64 + u32(i))
 			is_selected := i == selected
 			if clay.UI(id)({
 				layout = {sizing = {width = clay.SizingFit({min = 64}), height = clay.SizingFixed(26)}, padding = {left = 10, right = 10}, childAlignment = {x = .Center, y = .Center}},
-				backgroundColor = is_selected ? theme.selected : (clay.Hovered() ? theme.hover : {}),
+				backgroundColor = is_selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
 				cornerRadius = clay.CornerRadiusAll(4),
 			}) {
-				label(option, is_selected ? theme.text_bright : theme.text_dim)
+				label(option, is_selected ? gfx.theme.text_bright : gfx.theme.text_dim)
 			}
 			if clicked(id, within) && !is_selected do choice, changed = i, true
 		}
@@ -799,7 +800,7 @@ stepper :: proc(x: Setting, within: clay.ElementId) -> (dir: int) {
 	if clay.UI()({layout = {childGap = 6, childAlignment = {y = .Center}}}) {
 		if stepper_button(clay.ID("Decrease", u32(x)), "-", within) do dir = -1
 		if clay.UI()({layout = {sizing = {width = clay.SizingFixed(44)}, childAlignment = {x = .Center}}}) {
-			label(value, theme.text_bright)
+			label(value, gfx.theme.text_bright)
 		}
 		if stepper_button(clay.ID("Increase", u32(x)), "+", within) do dir = +1
 	}
@@ -810,11 +811,11 @@ stepper :: proc(x: Setting, within: clay.ElementId) -> (dir: int) {
 stepper_button :: proc(id: clay.ElementId, text: string, within: clay.ElementId) -> bool {
 	if clay.UI(id)({
 		layout = {sizing = {clay.SizingFixed(28), clay.SizingFixed(26)}, childAlignment = {x = .Center, y = .Center}},
-		backgroundColor = clay.Hovered() ? theme.hover : theme.bg,
+		backgroundColor = clay.Hovered() ? gfx.theme.hover : gfx.theme.bg,
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
-		label(text, theme.text)
+		label(text, gfx.theme.text)
 	}
 	return clicked(id, within)
 }
@@ -827,9 +828,9 @@ picker_button :: proc(x: Setting, value: string) {
 	missing := false
 	#partial switch x {
 	case .Theme:
-		if i, ok := theme_index(value); ok do text = THEMES[i].name
+		if i, ok := gfx.theme_index(value); ok do text = gfx.THEMES[i].name
 	case .Font_Family, .Markdown_Font:
-		missing = font_family_missing(&g.fonts, value)
+		missing = gfx.font_family_missing(&g.fonts, value)
 	}
 	if clay.UI(id)({
 		layout = {
@@ -838,17 +839,17 @@ picker_button :: proc(x: Setting, value: string) {
 			childGap = 6,
 			childAlignment = {y = .Center},
 		},
-		backgroundColor = clay.Hovered() ? theme.hover : theme.bg,
+		backgroundColor = clay.Hovered() ? gfx.theme.hover : gfx.theme.bg,
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}}, clip = {horizontal = true}}) {
-			label(text, missing ? theme.error : theme.text_bright, 13)
+			label(text, missing ? gfx.theme.error : gfx.theme.text_bright, 13)
 		}
-		icon(.Chevron_Right, theme.text_dim, 15)
+		icon(.Chevron_Right, gfx.theme.text_dim, 15)
 	}
 	if clicked(id, clay.ID("SettingsList")) do open_picker(x)
-	tooltip(id, missing ? (x == .Markdown_Font ? "Not installed; showing " + BUNDLED_MD_FAMILY : "Not installed; showing " + BUNDLED_FAMILY) : "Choose", "Enter")
+	tooltip(id, missing ? (x == .Markdown_Font ? "Not installed; showing " + gfx.BUNDLED_MD_FAMILY : "Not installed; showing " + gfx.BUNDLED_FAMILY) : "Choose", "Enter")
 }
 
 // A one-line text field; click or Enter to edit. Shows the default, dimmed, when empty.
@@ -885,15 +886,15 @@ keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 				padding = {left = 8, right = 8},
 				childAlignment = {x = .Center, y = .Center},
 			},
-			backgroundColor = clay.Hovered() || recording ? theme.hover : theme.bg,
+			backgroundColor = clay.Hovered() || recording ? gfx.theme.hover : gfx.theme.bg,
 			cornerRadius = clay.CornerRadiusAll(5),
-			border = {color = recording ? theme.accent : theme.border, width = clay.BorderOutside(1)},
+			border = {color = recording ? gfx.theme.accent : gfx.theme.border, width = clay.BorderOutside(1)},
 		}) {
 			bound := bindings_label(g.settings.bindings[cmd], " / ")
 			switch {
-			case recording:  label("Press keys…  (Esc cancels)", theme.accent, FONT_SIZE_SMALL)
-			case bound == "": label("Unbound", theme.text_dim, FONT_SIZE_SMALL)
-			case:            label(bound, theme.text, FONT_SIZE_SMALL)
+			case recording:  label("Press keys…  (Esc cancels)", gfx.theme.accent, FONT_SIZE_SMALL)
+			case bound == "": label("Unbound", gfx.theme.text_dim, FONT_SIZE_SMALL)
+			case:            label(bound, gfx.theme.text, FONT_SIZE_SMALL)
 			}
 		}
 		if clicked(id, list) do w.recording = recording ? nil : cmd
@@ -926,7 +927,7 @@ footer_hint :: proc() -> string {
 footer :: proc() {
 	if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}, childGap = 8}}) {
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}}, clip = {horizontal = true}}) {
-			label(footer_hint(), theme.text_dim, FONT_SIZE_SMALL)
+			label(footer_hint(), gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}
 		if button(clay.ID("SettingsResetAll"), "Reset all", "Reset every setting to its default") do confirm_reset_all()
 		if g.settings.path != "" {
@@ -955,8 +956,8 @@ picker_page :: proc(width: f32) {
 	}
 
 	if clay.UI(clay.ID("PickerPage"))({
-		backgroundColor = theme.panel,
-		overlayColor = clear_overlay(theme.panel),
+		backgroundColor = gfx.theme.panel,
+		overlayColor = clear_overlay(gfx.theme.panel),
 		cornerRadius = clay.CornerRadiusAll(8),
 		transition = transition({.OverlayColor}, enter = .Fade),
 		layout = {
@@ -968,7 +969,7 @@ picker_page :: proc(width: f32) {
 	}) {
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}, childGap = 4}}) {
 			if icon_button(clay.ID("PickerBack"), .Chevron_Left, 26, 18, "Back to settings", "Esc") do close_picker(commit = false)
-			label(SETTINGS[x].name, theme.text_bright, 16, .SemiBold)
+			label(SETTINGS[x].name, gfx.theme.text_bright, 16, .SemiBold)
 		}
 		if x == .Theme {
 			if choice, changed := segmented(.Theme, {"Dark", "Light"}, w.dark_themes ? 0 : 1); changed do show_dark_themes(choice == 0)
@@ -986,7 +987,7 @@ picker_page :: proc(width: f32) {
 			}
 			if note != "" {
 				if clay.UI()({layout = {padding = {left = 8, top = 8}}}) {
-					label(note, theme.text_dim, FONT_SIZE_SMALL)
+					label(note, gfx.theme.text_dim, FONT_SIZE_SMALL)
 				}
 			}
 		}
@@ -995,7 +996,7 @@ picker_page :: proc(width: f32) {
 		if len(extras) > 0 {
 			if clay.UI()({
 				layout = {sizing = {width = clay.SizingGrow()}, layoutDirection = .TopToBottom, padding = {top = 8}, childGap = 2},
-				border = {color = theme.border, width = {top = 1}},
+				border = {color = gfx.theme.border, width = {top = 1}},
 			}) {
 				for e, i in extras do extra_row(e, i)
 			}
@@ -1008,7 +1009,7 @@ picker_page :: proc(width: f32) {
 		case:                    hint = "↑↓ preview  Enter apply  Esc back"
 		}
 		if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}}, clip = {horizontal = true}}) {
-			label(hint, theme.text_dim, FONT_SIZE_SMALL)
+			label(hint, gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}
 	}
 }
@@ -1026,11 +1027,11 @@ extra_row :: proc(x: Setting, index: int) {
 			padding = {left = 8, right = 4},
 			childAlignment = {y = .Center},
 		},
-		backgroundColor = focused || clay.Hovered() ? theme.hover : {},
+		backgroundColor = focused || clay.Hovered() ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = focused ? theme.accent : {}, width = focused ? clay.BorderOutside(1) : {}},
+		border = {color = focused ? gfx.theme.accent : {}, width = focused ? clay.BorderOutside(1) : {}},
 	}) {
-		label(SETTINGS[x].name, theme.text)
+		label(SETTINGS[x].name, gfx.theme.text)
 		push_right()
 		if dir := stepper(x, {}); dir != 0 do step_extra(x, dir)
 	}
@@ -1056,33 +1057,33 @@ option_row :: proc(x: Setting, o: Picker_Option, index: int, selected: bool, lis
 			childGap = 10,
 			childAlignment = {y = .Center},
 		},
-		backgroundColor = selected ? theme.selected : (clay.Hovered() ? theme.hover : {}),
+		backgroundColor = selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
 		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = selected ? theme.accent : {}, width = selected ? clay.BorderOutside(1) : {}},
+		border = {color = selected ? gfx.theme.accent : {}, width = selected ? clay.BorderOutside(1) : {}},
 	}) {
 		if x == .Theme {
-			if i, ok := theme_index(o.value); ok do theme_swatch(THEMES[i])
+			if i, ok := gfx.theme_index(o.value); ok do theme_swatch(gfx.THEMES[i])
 		}
-		label(o.label, selected ? theme.text_bright : theme.text)
-		if (x == .Font_Family && o.value == BUNDLED_FAMILY) || (x == .Markdown_Font && (o.value == BUNDLED_MD_FAMILY || o.value == BUNDLED_FAMILY)) {
+		label(o.label, selected ? gfx.theme.text_bright : gfx.theme.text)
+		if (x == .Font_Family && o.value == gfx.BUNDLED_FAMILY) || (x == .Markdown_Font && (o.value == gfx.BUNDLED_MD_FAMILY || o.value == gfx.BUNDLED_FAMILY)) {
 			push_right()
-			label("bundled", theme.text_dim, FONT_SIZE_SMALL)
+			label("bundled", gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}
 	}
 }
 
 // A small sample of a theme: its background with a few of its syntax colors.
 @(private = "file")
-theme_swatch :: proc(spec: Theme_Spec) {
+theme_swatch :: proc(spec: gfx.Theme_Spec) {
 	SAMPLE :: [?]syntax.Highlight{.Keyword, .String, .Function, .Type}
 	if clay.UI()({
 		layout = {sizing = {clay.SizingFixed(44), clay.SizingFixed(20)}, padding = {left = 6, right = 6}, childGap = 3, childAlignment = {y = .Center}},
-		backgroundColor = rgb(spec.bg),
+		backgroundColor = gfx.rgb(spec.bg),
 		cornerRadius = clay.CornerRadiusAll(4),
-		border = {color = theme.border, width = clay.BorderOutside(1)},
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
 		for h in SAMPLE {
-			if clay.UI()({layout = {sizing = {clay.SizingFixed(5), clay.SizingFixed(10)}}, backgroundColor = rgb(spec.syntax[h]), cornerRadius = clay.CornerRadiusAll(1)}) {}
+			if clay.UI()({layout = {sizing = {clay.SizingFixed(5), clay.SizingFixed(10)}}, backgroundColor = gfx.rgb(spec.syntax[h]), cornerRadius = clay.CornerRadiusAll(1)}) {}
 		}
 	}
 }
