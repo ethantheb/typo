@@ -194,13 +194,12 @@ draw_line :: proc(e: ^View, line: int, L: ^Line_Layout, text: string, start: int
 	}
 
 	if caret_on {
-		caret_w := max(math.round(2 * scale), 1)
 		for j := textedit.first_selection_at(e, start); j < len(e.sels); j += 1 {
 			h := e.sels[j].head
 			if textedit.sel_lo(e.sels[j]) > end do break
 			if h < start || h > end do continue
 			_, x, top, ch := caret_box(L, text, h - start)
-			gfx.fill_rect(px(left, x, scale), math.round(y + top * scale), caret_w, math.ceil(ch * scale), gfx.theme.caret)
+			gfx.draw_caret(px(left, x, scale), math.round(y + top * scale), math.ceil(ch * scale), scale, gfx.theme.caret)
 		}
 	}
 }

@@ -285,10 +285,7 @@ reset_item :: proc(item: Setting_Item) {
 
 @(private = "file")
 confirm_reset_all :: proc() {
-	if ask("Reset settings", "Reset all settings, including keybindings, to their defaults?", {"Reset all", "Cancel"}, default = 1, cancel = 1) == 0 {
-		settings_reset_all(&g.settings)
-		settings_changed()
-	}
+	ask_reset_settings()
 }
 
 // Binds a single chord to cmd, taking it away from any other command.
@@ -1065,7 +1062,7 @@ option_row :: proc(x: Setting, o: Picker_Option, index: int, selected: bool, lis
 			if i, ok := gfx.theme_index(o.value); ok do theme_swatch(gfx.THEMES[i])
 		}
 		label(o.label, selected ? gfx.theme.text_bright : gfx.theme.text)
-		if (x == .Font_Family && o.value == gfx.BUNDLED_FAMILY) || (x == .Markdown_Font && (o.value == gfx.BUNDLED_MD_FAMILY || o.value == gfx.BUNDLED_FAMILY)) {
+		if (x == .Font_Family && o.value == gfx.BUNDLED_FAMILY) || (x == .Markdown_Font && gfx.is_bundled_family(o.value)) {
 			push_right()
 			label("bundled", gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}

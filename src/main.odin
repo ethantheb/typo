@@ -8,8 +8,6 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "gfx"
-import "markdown"
-import "syntax"
 import sdl "../vendor/sdl3"
 import "mdview"
 
@@ -21,6 +19,7 @@ App :: struct {
 	// Logical window size and pixels-per-logical-unit.
 	window_w:        i32,
 	window_h:        i32,
+	window_size:     [2]i32, // the size while not maximized, for the session
 
 	// Input collected from events, consumed once per frame.
 	mouse_pos:       [2]f32,
@@ -41,14 +40,19 @@ App :: struct {
 	// Frames are only drawn while something changes (see schedule_next_frame).
 	wake_frames:     int,  // frames still to draw after input
 	sleeping:        bool, // the frame being built is the last before sleeping
-	wake_timer:      sdl.TimerID,
 
 	workspace:       Workspace,
-	editor:          Editor,
+	panes:           Panes,
 	md_modes:        map[string]mdview.Mode, // Markdown files toggled this session, by path
-	terminal_panel:  Terminal_Panel,
-	focus:           Focus,
 	sidebar_visible: bool,
+	sidebar_gone:    bool, // hidden, and done sliding out
+	dialog:          Dialog,
+	unsaved:         Unsaved_Flow,
+	menu:            Context_Menu,
+	rename:          Inline_Rename,
+	in_popup:        bool, // building the dialog's or context menu's UI (see ui_interactive)
+	right_pressed:   bool, // the right button went down this frame
+	quit:            bool, // set once quitting was confirmed
 	finder:          Finder,
 	settings:        Settings,
 	fonts:           gfx.System_Fonts,
@@ -77,7 +81,7 @@ main :: proc() {
 
 Args :: struct {
 	path:     string, // folder to open, or a file; the working directory if empty
-	terminal: bool,   // start with the terminal filling the window (folders only)
+	terminal: bool,   // start with a terminal filling the window (folders only)
 	perf:     bool,   // run the performance suite (perf.odin) and exit
 }
 
@@ -129,7 +133,10 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	clay.Initialize(arena, {f32(g.window_w), f32(g.window_h)}, {handler = clay_error_handler})
 	clay.SetMeasureTextFunction(measure_text, nil)
 
-	open_path(args.path, args.terminal)
+	// With no arguments, the last session if there is one (session.odin).
+	if !(len(os.args) == 1 && g.perf == nil && g.settings.restore_session && session_restore()) {
+		open_path(args.path, args.terminal)
+	}
 	// Text input stays on; the focused pane or popup consumes TEXT_INPUT events.
 	_ = sdl.StartTextInput(g.window)
 	g.last_ticks = sdl.GetTicksNS()
@@ -168,7 +175,7 @@ open_path :: proc(path: string, terminal: bool) {
 	if os.is_dir(root) {
 		open_folder(root)
 		g.sidebar_visible = true
-		if terminal do terminal_toggle_maximized()
+		if terminal do panes_new_terminal()
 		return
 	}
 	file := os.get_absolute_path(root, context.temp_allocator) or_else root
@@ -198,8 +205,10 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	if g.perf != nil {
 		if done, ok := perf_frame(); done do return ok ? .SUCCESS : .FAILURE
 	}
+	if g.quit do return .SUCCESS
 
 	update_window_metrics()
+	track_window_size()
 	clay.SetLayoutDimensions({f32(g.window_w), f32(g.window_h)})
 	clay.SetPointerState(g.mouse_pos, g.mouse_down)
 	update_scroll_containers()
@@ -210,12 +219,12 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		apply_markdown_font()
 	}
 	apply_pending_action()
+	dialog_frame()
+	context_menu_frame()
+	rename_frame()
 	update_focus()
 	finder_frame()
-	terminal_panel_frame()
-	// Not while the editor is hidden (its last layout is stale) or the splitter,
-	// whose grab area overlaps it, is being dragged.
-	editor_frame(&g.editor, ui_interactive() && !terminal_maximized() && !g.terminal_panel.split_drag)
+	panes_frame()
 	g.wake_frames = max(g.wake_frames - 1, 0)
 	g.sleeping = g.wake_frames == 0 && !needs_continuous_frames()
 	tooltip_begin_frame()
@@ -224,12 +233,12 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_mouse_cursor()
 	if g.perf != nil do perf_mark(.Update)
 
-	_ = sdl.SetRenderDrawColor(gfx.renderer, u8(gfx.theme.bg.r), u8(gfx.theme.bg.g), u8(gfx.theme.bg.b), 255)
+	_ = sdl.SetRenderDrawColor(gfx.renderer, u8(gfx.theme.panel.r), u8(gfx.theme.panel.g), u8(gfx.theme.panel.b), 255)
 	_ = sdl.RenderClear(gfx.renderer)
 	render_clay_commands(&commands, gfx.scale)
 	if g.perf != nil do perf_mark(.Render)
 	_ = sdl.RenderPresent(gfx.renderer)
-	if !g.window_shown && (g.editor.status != .Text || g.editor.shown) {
+	if !g.window_shown && panes_ready() {
 		_ = sdl.ShowWindow(g.window)
 		g.window_shown = true
 	}
@@ -237,6 +246,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 	g.wheel = {}
 	g.mouse_pressed = false
+	g.right_pressed = false
 	g.frame += 1
 	gfx.text_end_frame(&gfx.text_system)
 	schedule_next_frame()
@@ -246,20 +256,14 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 // Whether the next frame should follow immediately even without input.
 needs_continuous_frames :: proc() -> bool {
-	e := &g.editor
 	switch {
 	case g.pending != nil,
 	     finder_busy(),
-	     e.status == .Text && !e.shown, // waiting for it to be ready
-	     e.dragging && g.mouse_down, // edge auto-scroll
-	     e.status == .Text && syntax.highlighter_busy(&e.hl, &e.buf),
-	     e.md != nil && markdown.doc_busy(e.md),
-	     editor_scrolling(e) || e.scrollbar_drag != nil,
+	     panes_busy(),
 	     smooth_scrolling(),
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
 	     g.animating,
-	     terminal_panel_busy(),
 	     g.perf != nil && perf_running():
 		return true
 	}
@@ -267,37 +271,9 @@ needs_continuous_frames :: proc() -> bool {
 }
 
 // Draws continuously while something is changing; otherwise sleeps until the
-// next event, with a timer to wake for the next cursor blink.
+// next event.
 schedule_next_frame :: proc() {
-	if !g.sleeping {
-		_ = sdl.SetHint(sdl.HINT_MAIN_CALLBACK_RATE, "0")
-		return
-	}
-	_ = sdl.SetHint(sdl.HINT_MAIN_CALLBACK_RATE, "waitevent")
-	if g.wake_timer != 0 do _ = sdl.RemoveTimer(g.wake_timer)
-	g.wake_timer = 0
-
-	delay: u64
-	blinks: bool
-	switch g.focus {
-	case .Editor:
-		if g.editor.status == .Text {
-			since := sdl.GetTicksNS() - g.editor.blink_t0
-			delay, blinks = CARET_BLINK_NS - since % CARET_BLINK_NS, true
-		}
-	case .Terminal:
-		if g.terminal_panel.visible do delay, blinks = terminal_blink_delay(&g.terminal_panel.terminal)
-	}
-	if !blinks do return
-	delay += 1_000_000 // land just after the blink toggles
-	g.wake_timer = sdl.AddTimer(u32(delay / 1_000_000), wake_callback, nil)
-}
-
-// Runs on SDL's timer thread.
-@(private = "file")
-wake_callback :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) -> u32 {
-	wake_main_loop(nil)
-	return 0 // one-shot
+	_ = sdl.SetHint(sdl.HINT_MAIN_CALLBACK_RATE, g.sleeping ? "waitevent" : "0")
 }
 
 // Makes an idle main loop run a frame. Safe to call from any thread.
@@ -327,12 +303,14 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 
 	#partial switch event.type {
 	case .QUIT:
-		if editor_confirm_discard(&g.editor) do return .SUCCESS
+		if !panes_unsaved() do return .SUCCESS
+		resolve_unsaved(g.panes.open[:], Quit{})
 	case .KEY_DOWN, .TEXT_INPUT:
 		handle_key_event(event)
 	case .MOUSE_MOTION:
 		g.mouse_pos = {event.motion.x, event.motion.y}
 	case .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
+		if event.button.button == sdl.BUTTON_RIGHT && event.button.down do g.right_pressed = true
 		if event.button.button == sdl.BUTTON_LEFT {
 			g.mouse_down = event.button.down
 			if event.button.down {
@@ -358,12 +336,22 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 // Keyboard input goes to the open popup, else the focused pane; keys nobody
 // uses are tried as command shortcuts.
 handle_key_event :: proc(event: ^sdl.Event) {
+	if event.type == .KEY_DOWN && event.key.key == sdl.K_ESCAPE && g.panes.drag.active {
+		drag_clear()
+		return
+	}
+	if dialog_handle_event(event) do return
+	if rename_handle_event(event) do return
+	if g.menu.open {
+		if event.type == .KEY_DOWN && event.key.key == sdl.K_ESCAPE do menu_close()
+		return
+	}
 	if settings_window_handle_event(event) do return
 	if finder_handle_event(event) do return
-	p := &g.terminal_panel
-	if g.focus == .Terminal && p.visible && p.terminal.initialized && terminal_handle_event(&p.terminal, event) do return
+	if t := focused_terminal(); t != nil && t.initialized && terminal_handle_event(t, event) do return
+	e := focused_editor()
 	if event.type == .TEXT_INPUT {
-		editor_text_input(&g.editor, string(event.text.text))
+		if e != nil do editor_text_input(e, string(event.text.text))
 		return
 	}
 	if event.key.key == sdl.K_F12 {
@@ -371,20 +359,23 @@ handle_key_event :: proc(event: ^sdl.Event) {
 		return
 	}
 	if cmd, ok := command_for_key(event.key); ok && run_command(cmd) do return
-	editor_handle_key(&g.editor, event.key)
+	if e != nil do editor_handle_key(e, event.key)
 }
 
 app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	context = g.ctx
+	session_save()
 	finder_destroy()
-	terminal_destroy(&g.terminal_panel.terminal)
+	menu_close()
+	rename_destroy()
+	dialog_destroy()
+	panes_destroy()
 	settings_window_destroy()
 	settings_destroy(&g.settings)
 	gfx.fonts_destroy(&g.fonts)
 	mdview.images_destroy()
 	delete(g.open_heading)
 	destroy_mouse_cursors()
-	editor_destroy(&g.editor)
 	for path in g.md_modes do delete(path)
 	delete(g.md_modes)
 	workspace_destroy(&g.workspace)
@@ -437,40 +428,69 @@ set_window_icon :: proc() {
 }
 
 // --- Actions --------------------------------------------------------------------
-// UI actions that replace the tree or the buffer. They are applied at the start
-// of the next frame, because this frame's render commands still point at the
-// strings they would free.
+// UI actions that replace the tree, a buffer or the panes. They are applied at
+// the start of the next frame, because this frame's render commands still point
+// at the strings they would free.
 
 Toggle_Node :: distinct int
 Open_File :: distinct string   // owned, full path
 Open_Folder :: distinct string // owned
+Run_Command :: distinct Command
+
+Pane_Op :: struct {
+	pane: ^Pane,
+	op:   enum {
+		Close,
+		Hide,
+		Maximize,
+	},
+}
 
 Action :: union {
 	Toggle_Node,
 	Open_File,
 	Open_Folder,
+	Run_Command,
+	Pane_Op,
+}
+
+// Sets the pending action, unless one is already waiting.
+defer_action :: proc(a: Action) {
+	if g.pending == nil do g.pending = a
 }
 
 @(private = "file")
 apply_pending_action :: proc() {
-	if path, ok := take_picked_folder(); ok do g.pending = Open_Folder(path)
+	if path, ok := take_picked_folder(); ok {
+		if g.pending == nil do g.pending = Open_Folder(path)
+		else do delete(path)
+	}
 
 	switch a in g.pending {
 	case Toggle_Node:
 		workspace_toggle(&g.workspace, int(a))
 	case Open_File:
-		if string(a) != g.editor.path && editor_confirm_discard(&g.editor) {
-			editor_open(&g.editor, string(a))
-			workspace_reveal(&g.workspace, string(a))
-			g.focus = .Editor
-			if g.open_heading != "" do mdview.jump_to_heading(&g.editor.md_view, g.open_heading)
+		p := panes_open_file(string(a))
+		if e, ok := p.content.(^Editor); ok && e.md != nil && g.open_heading != "" {
+			mdview.jump_to_heading(&e.md_view, g.open_heading)
 		}
 		delete(string(a))
 		delete(g.open_heading)
 		g.open_heading = ""
 	case Open_Folder:
-		if editor_confirm_discard(&g.editor) do open_folder(string(a))
-		delete(string(a))
+		files := make([dynamic]^Pane, context.temp_allocator)
+		for p in g.panes.open do if _, ok := p.content.(^Editor); ok do append(&files, p)
+		resolve_unsaved(files[:], a) // takes the string
+	case Run_Command:
+		run_command(Command(a))
+	case Pane_Op:
+		switch a.op {
+		case .Close: pane_close(a.pane)
+		case .Hide:  pane_hide(a.pane)
+		case .Maximize:
+			pane_focus(a.pane)
+			pane_toggle_maximized()
+		}
 	}
 	g.pending = nil
 }
@@ -481,7 +501,6 @@ open_folder :: proc(path: string) {
 	workspace_open(&g.workspace, path)
 	title := fmt.ctprintf("%s - typo", folder_name(path))
 	_ = sdl.SetWindowTitle(g.window, title)
-	editor_close(&g.editor)
 	finder_invalidate()
 	scroll := clay.GetScrollContainerData(clay.ID("SidebarFiles"))
 	if scroll.found do scroll.scrollPosition^ = {}

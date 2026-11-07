@@ -14,9 +14,9 @@ import ttf "../../vendor/sdl3/ttf"
 // (DPI-independent) units; fonts are rasterized at size * scale so text stays
 // crisp on high-DPI displays, and measurements are divided back by scale.
 
-// Clay passes these back in measure/render. The UI uses the bundled fonts; the
-// editor and terminal use the configured family, rendered Markdown its own
-// (see text_set_source).
+// Clay passes these back in measure/render. The UI uses bundled Instrument
+// Sans (and Icons); the editor and terminal use the configured family, rendered
+// Markdown its own (see text_set_source).
 Font_Id :: enum u16 {
 	Body,
 	SemiBold,
@@ -43,12 +43,9 @@ MD_FONTS := [Md_Face]Font_Id {
 
 ICON_FONT_DATA := #load("../../assets/fonts/lucide.ttf")
 
-// Snaps glyphs only vertically and positions them at fractional pixels.
+// Every font, every weight: snaps glyphs only vertically and places them at
+// quarter pixels along the font's own (unrounded) advances.
 FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
-// For semibold and heavier proportional fonts: the font's own hinting, which
-// keeps their small gaps (the dot of an i) a whole pixel wide. Monospace keeps
-// FONT_HINTING, whose advances match the regular weight's columns.
-FONT_HINTING_HEAVY :: ttf.Hinting.NORMAL
 
 // Cached ttf.Text objects not drawn for this many frames are destroyed.
 TEXT_CACHE_EVICT_FRAMES :: 120
@@ -156,19 +153,26 @@ text_init :: proc(ts: ^Text_System) -> bool {
 		return false
 	}
 	ts.coverage_for = -1
+	// A bundled face by weight and style.
+	face :: proc(faces: []Font_Face, weight: int, italic: bool) -> Font_Source {
+		for f in faces do if f.weight == weight && f.italic == italic do return f.source
+		panic("no such bundled face")
+	}
+	sans :: proc(weight: int, italic := false) -> Font_Source {return face(BUNDLED_MD_FACES[:], weight, italic)}
+	mono :: proc(weight: int, italic := false) -> Font_Source {return face(BUNDLED_FACES[:], weight, italic)}
 	ts.sources = {
-		.Body           = BUNDLED_FACES[3].source,
-		.SemiBold       = BUNDLED_FACES[4].source,
-		.Bold           = BUNDLED_FACES[5].source,
+		.Body           = sans(500),
+		.SemiBold       = sans(600),
+		.Bold           = sans(700),
 		.Icons          = {data = ICON_FONT_DATA},
-		.Editor         = BUNDLED_FACES[3].source,
-		.Editor_Bold    = BUNDLED_FACES[5].source,
-		.Editor_Italic  = BUNDLED_FACES[7].source,
-		.Md_Regular     = BUNDLED_MD_FACES[0].source,
-		.Md_SemiBold    = BUNDLED_MD_FACES[1].source,
-		.Md_Bold        = BUNDLED_MD_FACES[2].source,
-		.Md_Italic      = BUNDLED_MD_FACES[3].source,
-		.Md_Bold_Italic = BUNDLED_MD_FACES[4].source,
+		.Editor         = mono(500),
+		.Editor_Bold    = mono(700),
+		.Editor_Italic  = mono(500, italic = true),
+		.Md_Regular     = sans(400),
+		.Md_SemiBold    = sans(600),
+		.Md_Bold        = sans(700),
+		.Md_Italic      = sans(400, italic = true),
+		.Md_Bold_Italic = sans(700, italic = true),
 	}
 	return true
 }
@@ -263,8 +267,7 @@ open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	_ = sdl.SetNumberProperty(props, ttf.PROP_FONT_CREATE_FACE_NUMBER, src.face)
 	font := ttf.OpenFontWithProperties(props)
 	if font != nil {
-		heavy := ttf.GetFontWeight(font) >= ttf.FONT_WEIGHT_SEMI_BOLD && !ttf.FontIsFixedWidth(font)
-		ttf.SetFontHinting(font, heavy ? FONT_HINTING_HEAVY : FONT_HINTING)
+		ttf.SetFontHinting(font, FONT_HINTING)
 		if src.synthetic_italic do ttf.SetFontStyle(font, {.ITALIC})
 	}
 	return font

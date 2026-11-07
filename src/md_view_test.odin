@@ -81,17 +81,20 @@ test_md_text_view_plain_keys :: proc(t: ^testing.T) {
 	testing.expect(t, e.kind == &mdview.KIND)
 }
 
-// No caret is drawn while a selection is being dragged.
+// No caret is drawn while a selection is being dragged, but one is while the
+// button is still down after a press that hasn't moved.
 @(test)
 test_md_no_caret_while_dragging :: proc(t: ^testing.T) {
 	e := md_editor_at("Some **bold** |text.")
 	defer destroy_md_editor(e)
 	sync.guard(&mouse_lock)
-	focus := g.focus
-	defer g.focus, g.mouse_down = focus, false
-	g.focus = .Editor
+	pane := Pane{content = e}
+	focused := g.panes.focused
+	defer g.panes.focused, g.mouse_down = focused, false
+	g.panes.focused = &pane
 	e.dragging, g.mouse_down = true, true
-	e.blink_t0 = sdl.GetTicksNS()
+	testing.expect(t, editor_caret_on(e))
+	e.drag_moved = true
 	testing.expect(t, !editor_caret_on(e))
 	g.mouse_down = false
 	testing.expect(t, editor_caret_on(e))

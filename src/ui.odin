@@ -35,6 +35,7 @@ pointer_in :: proc(id: clay.ElementId) -> bool {
 // window usable outside it.
 ui_interactive :: proc() -> bool {
 	switch {
+	case g.dialog.open, g.menu.open: return g.in_popup
 	case g.in_modal:               return true
 	case g.finder.open:            return false
 	case settings_window_docked(): return !pointer_in(clay.ID("Settings"))
@@ -100,6 +101,32 @@ icon_button :: proc(id: clay.ElementId, kind: gfx.Icon, size: f32 = 24, icon_siz
 	}
 	if tip != "" do tooltip(id, tip, shortcut)
 	return clicked(id)
+}
+
+// A row of a sidebar list, inset from the list's sides, with a rounded
+// highlight while selected or hovered. Use as: if list_row(...) { contents }
+@(deferred_none = end_list_row)
+list_row :: proc(id: clay.ElementId, selected: bool, height: f32, left: u16, gap: u16 = 2) -> bool {
+	clay._OpenElement()
+	clay.ConfigureOpenElement({layout = {sizing = {width = clay.SizingGrow()}, padding = {left = 6, right = 6}}})
+	clay._OpenElementWithId(id)
+	clay.ConfigureOpenElement({
+		layout = {
+			sizing = {clay.SizingGrow(), clay.SizingFixed(height)},
+			padding = {left = left, right = 4},
+			childGap = gap,
+			childAlignment = {y = .Center},
+		},
+		backgroundColor = selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
+		cornerRadius = clay.CornerRadiusAll(5),
+	})
+	return true
+}
+
+@(private = "file")
+end_list_row :: proc() {
+	clay._CloseElement()
+	clay._CloseElement()
 }
 
 // --- Icons -----------------------------------------------------------------------
@@ -264,28 +291,6 @@ clicked_outside :: proc(panel: clay.ElementId, opened_frame: u64) -> bool {
 	return g.mouse_pressed && opened_frame != g.frame && !pointer_in(panel)
 }
 
-// Shows a modal message box and returns the index of the chosen button.
-// Enter picks `default`; Esc (or a failure to show the box) gives `cancel`.
-ask :: proc(title, message: string, buttons: []string, default, cancel: int) -> int {
-	data := make([]sdl.MessageBoxButtonData, len(buttons), context.temp_allocator)
-	for text, i in buttons {
-		data[i] = {buttonID = i32(i), text = strings.clone_to_cstring(text, context.temp_allocator)}
-		if i == default do data[i].flags += {.RETURNKEY_DEFAULT}
-		if i == cancel do data[i].flags += {.ESCAPEKEY_DEFAULT}
-	}
-	box := sdl.MessageBoxData {
-		flags      = {.WARNING},
-		window     = g.window,
-		title      = strings.clone_to_cstring(title, context.temp_allocator),
-		message    = strings.clone_to_cstring(message, context.temp_allocator),
-		numbuttons = i32(len(data)),
-		buttons    = raw_data(data),
-	}
-	choice := i32(cancel)
-	if !sdl.ShowMessageBox(box, &choice) do return cancel
-	return int(choice)
-}
-
 // --- Tooltips ------------------------------------------------------------------
 // tooltip() goes right after the element it describes. When the pointer has
 // rested on it for TOOLTIP_DELAY the tip appears beside it, on whichever side
@@ -368,11 +373,13 @@ TRANSITION_SECONDS :: 0.2
 // How an element appears (an enter transition):
 //   Fade: from its background color. Needs .OverlayColor in the properties, a
 //         background, and overlayColor = clear_overlay(background).
+//   Clear: from a transparent background. Needs .BackgroundColor.
 //   From_Left/From_Right: offset by its own width to that side. Positions are
 //         on screen, so this suits elements whose parent stays put.
 Enter :: enum {
 	None,
 	Fade,
+	Clear,
 	From_Left,
 	From_Right,
 }
@@ -382,6 +389,7 @@ transition :: proc(properties: clay.TransitionPropertyFlags, enter := Enter.None
 	switch enter {
 	case .None:
 	case .Fade:       config.enter.setInitialState = enter_fade
+	case .Clear:      config.enter.setInitialState = enter_clear
 	case .From_Left:  config.enter.setInitialState = enter_from_left
 	case .From_Right: config.enter.setInitialState = enter_from_right
 	}
@@ -414,6 +422,13 @@ enter_fade :: proc "c" (target: clay.TransitionData, properties: clay.Transition
 	start := target
 	start.overlayColor = target.backgroundColor
 	start.overlayColor.a = 255
+	return start
+}
+
+@(private = "file")
+enter_clear :: proc "c" (target: clay.TransitionData, properties: clay.TransitionPropertyFlags) -> clay.TransitionData {
+	start := target
+	start.backgroundColor.a = 0
 	return start
 }
 

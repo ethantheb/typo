@@ -13,8 +13,9 @@ Steps:
      library, only when a C source is newer than the library. Always optimized,
      so parsing speed doesn't depend on the build mode.
   2. Build libghostty-vt (terminal emulation) from a pinned ghostty commit with
-     a pinned Zig, both downloaded into build/ on first use. Rebuilt only when
-     GHOSTTY_COMMIT changes.
+     patches/ghostty.patch applied (reflow trims trailing spaces when scrollback
+     isn't pulled, as ConPTY does), with a pinned Zig, both downloaded into
+     build/ on first use. Rebuilt only when GHOSTTY_COMMIT or the patch changes.
   3. Build SDL3 and SDL3_ttf (with FreeType, HarfBuzz and plutosvg) with CMake
      from pinned releases, downloaded into build/ on first use, SDL3_ttf with
      patches/sdl_ttf.patch applied (glyphs at quarter-pixel positions, and a
@@ -98,6 +99,7 @@ SDL_TTF_SUBMODULES = ["external/freetype", "external/harfbuzz", "external/plutos
 SDL_SRC = OUT / "deps" / "SDL"
 SDL_TTF_SRC = OUT / "deps" / "SDL_ttf"
 SDL_TTF_PATCH = ROOT / "patches" / "sdl_ttf.patch"
+GHOSTTY_PATCH = ROOT / "patches" / "ghostty.patch"
 SDL_OUT = OBJ / "sdl"  # install prefix; vendor/sdl3 links the libraries in lib/
 if IS_WINDOWS:
     SDL_LIBS = [SDL_OUT / "lib" / "SDL3-static.lib", SDL_OUT / "lib" / "SDL3_ttf-static.lib"]
@@ -201,16 +203,19 @@ def git_checkout(src, repo, ref, submodules=()):
 
 def build_ghostty():
     stamp = GHOSTTY_OUT / "commit.txt"
-    if GHOSTTY_LIB.exists() and stamp.exists() and stamp.read_text().strip() == GHOSTTY_COMMIT:
+    patch = hashlib.sha256(GHOSTTY_PATCH.read_bytes()).hexdigest()[:12]
+    version = f"{GHOSTTY_COMMIT} {patch}"
+    if GHOSTTY_LIB.exists() and stamp.exists() and stamp.read_text().strip() == version:
         return
     print("Building libghostty-vt...", flush=True)
     git_checkout(GHOSTTY_SRC, GHOSTTY_REPO, GHOSTTY_COMMIT)
+    check(["git", "-C", GHOSTTY_SRC, "apply", GHOSTTY_PATCH])
     zig = zig_exe()
     cmd = [zig, "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "--prefix", GHOSTTY_OUT]
     print("+", " ".join(str(c) for c in cmd), flush=True)
     if subprocess.run(cmd, cwd=GHOSTTY_SRC).returncode != 0:
         sys.exit(1)
-    stamp.write_text(GHOSTTY_COMMIT)
+    stamp.write_text(version)
 
 
 def cmake_build(src, build_dir, options):

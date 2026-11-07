@@ -12,7 +12,11 @@ Command :: enum {
 	Find,
 	Toggle_Sidebar,
 	Toggle_Terminal,
-	Maximize_Terminal,
+	New_Terminal,
+	Maximize_Pane,
+	Close_Pane,
+	Rename,
+	Focus_Next_Pane,
 	Open_Settings,
 	Save,
 	Undo,
@@ -37,7 +41,11 @@ COMMANDS := [Command]Command_Info {
 	.Find              = {"find", "Find", {"Ctrl+F"}},
 	.Toggle_Sidebar    = {"toggle_sidebar", "Toggle sidebar", {"Ctrl+B"}},
 	.Toggle_Terminal   = {"toggle_terminal", "Toggle terminal", {"Ctrl+`"}},
-	.Maximize_Terminal = {"maximize_terminal", "Maximize terminal", {"Ctrl+Shift+`"}},
+	.New_Terminal      = {"new_terminal", "New terminal", {"Ctrl+Shift+`"}},
+	.Maximize_Pane     = {"maximize_pane", "Maximize pane", {"Ctrl+Shift+Return"}},
+	.Close_Pane        = {"close_pane", "Close pane", {"Ctrl+W"}},
+	.Rename            = {"rename", "Rename pane", {"F2"}},
+	.Focus_Next_Pane   = {"focus_next_pane", "Focus next pane", {"Ctrl+Tab"}},
 	.Open_Settings     = {"open_settings", "Open settings", {"Ctrl+,"}},
 	.Save              = {"save", "Save file", {"Ctrl+S"}},
 	.Undo              = {"undo", "Undo", {"Ctrl+Z"}},
@@ -53,7 +61,7 @@ COMMANDS := [Command]Command_Info {
 
 // App commands that still work while the terminal has focus; every other chord
 // goes to the shell.
-TERMINAL_COMMANDS :: bit_set[Command]{.Toggle_Terminal, .Maximize_Terminal, .Open_Settings}
+TERMINAL_COMMANDS :: bit_set[Command]{.Toggle_Terminal, .New_Terminal, .Maximize_Pane, .Focus_Next_Pane, .Open_Settings}
 
 Chord :: struct {
 	key:   sdl.Keycode,
@@ -70,12 +78,23 @@ Bindings :: [Command][MAX_CHORDS]Chord
 // Runs a command. Returns false if it doesn't apply (e.g. Save with no file open).
 run_command :: proc(cmd: Command) -> bool {
 	#partial switch cmd {
-	case .Find_File:         finder_toggle()
-	case .Toggle_Sidebar:    g.sidebar_visible = !g.sidebar_visible
-	case .Toggle_Terminal:   terminal_toggle()
-	case .Maximize_Terminal: terminal_toggle_maximized()
-	case .Open_Settings:     settings_window_toggle()
-	case:                    return editor_run_command(&g.editor, cmd)
+	case .Find_File:       finder_toggle()
+	case .Toggle_Sidebar:  g.sidebar_visible = !g.sidebar_visible
+	case .Toggle_Terminal: terminal_toggle()
+	case .New_Terminal:    panes_new_terminal()
+	case .Focus_Next_Pane: pane_focus_next()
+	case .Open_Settings:   settings_window_toggle()
+	case .Maximize_Pane:
+		if g.panes.focused == nil do return false
+		pane_toggle_maximized()
+	case .Close_Pane:
+		if g.panes.focused == nil do return false
+		pane_close(g.panes.focused)
+	case .Rename:
+		return rename_focused_pane()
+	case:
+		e := focused_editor()
+		return e != nil && editor_run_command(e, cmd)
 	}
 	return true
 }

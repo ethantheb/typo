@@ -14,7 +14,6 @@ import "gfx"
 // Keyboard and text input while the terminal has focus. Returns true if used.
 terminal_handle_event :: proc(t: ^Terminal, event: ^sdl.Event) -> bool {
 	s := &t.session
-	t.blink_t0 = sdl.GetTicksNS()
 
 	if event.type == .TEXT_INPUT {
 		term.session_input(s, transmute([]u8)string(event.text.text))

@@ -10,12 +10,11 @@ import sdl "../vendor/sdl3"
 import "gfx"
 import "textedit"
 
-// The editor pane: one Clay custom element. Per frame, editor_frame updates the
-// view from the last layout and handles the mouse and scrolling; draw_editor
-// then draws it. What differs between the plain text view (text_view.odin) and
+// An editor in its pane: one Clay custom element. Per frame, editor_frame
+// updates the view from the last layout and handles the mouse and scrolling;
+// draw_editor then draws it. What differs between the plain text view (text_view.odin) and
 // the rendered Markdown view goes through the view's kind (textedit.Kind).
 
-CARET_BLINK_NS :: 530_000_000
 SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
 // How long an opened file waits for images in view to load before it is drawn anyway.
 EDITOR_SHOW_WAIT :: 500_000_000 // ns
@@ -39,10 +38,11 @@ editor_char_width :: proc() -> f32 {
 }
 
 // Per-frame update before layout: syntax, view metrics, mouse, scrolling.
-editor_frame :: proc(e: ^Editor, interactive: bool) {
+// `element` is the custom element showing it.
+editor_frame :: proc(e: ^Editor, element: clay.ElementId, interactive: bool) {
 	if e.status != .Text do return
 	textedit.take_changes(e)
-	r, placed := element_rect(clay.ID("EditorText"))
+	r, placed := element_rect(element)
 	if placed do e.view = r
 	e.char_w = editor_char_width()
 	e.kind.frame_begin(e)
@@ -59,11 +59,22 @@ editor_ready :: proc(e: ^Editor) -> bool {
 	return e.kind.ready == nil || e.kind.ready(e)
 }
 
-// Whether carets are drawn now: in the blink's on phase, and not while a
-// selection is being dragged.
+// Whether the editor still has work for the coming frames: waiting to be shown,
+// highlighting, parsing, scrolling or drag-selecting past an edge.
+editor_busy :: proc(e: ^Editor) -> bool {
+	if e.status != .Text do return false
+	return !e.shown ||
+		e.dragging && g.mouse_down ||
+		syntax.highlighter_busy(&e.hl, &e.buf) ||
+		e.md != nil && markdown.doc_busy(e.md) ||
+		editor_scrolling(e) || e.scrollbar_drag != nil
+}
+
+// Whether carets are drawn: in the focused editor, except while a selection is
+// being dragged (a press shows the caret at once; it hides when the pointer
+// moves). They don't blink.
 editor_caret_on :: proc(e: ^Editor) -> bool {
-	if g.focus != .Editor || (e.dragging && g.mouse_down) do return false
-	return ((sdl.GetTicksNS() - e.blink_t0) / CARET_BLINK_NS) % 2 == 0
+	return focused_editor() == e && !(e.dragging && e.drag_moved && g.mouse_down)
 }
 
 // textedit.visible_runs for the editor font.
@@ -72,11 +83,6 @@ editor_runs :: proc(text: string, line_hl: []syntax.Highlight, line_style: []mar
 		return gfx.font_has_own_glyph(&gfx.text_system, .Editor, r)
 	}
 	return textedit.visible_runs(text, line_hl, line_style, first_col, count, g.settings.letter_spacing != 0, has_glyph)
-}
-
-// The Clay element hosting the text view.
-editor_text_element :: proc(e: ^Editor) {
-	custom_element(clay.ID("EditorText"), e)
 }
 
 // --- Mouse ---------------------------------------------------------------------
@@ -114,7 +120,6 @@ editor_mouse :: proc(e: ^Editor) {
 			return
 		}
 		offset := k.offset_at(e, p)
-		e.blink_t0 = sdl.GetTicksNS()
 		e.dragging = true
 		e.drag_mode = .Char
 
@@ -145,12 +150,14 @@ editor_mouse :: proc(e: ^Editor) {
 		}
 		e.drag_origin = e.sels[e.primary]
 		e.drag_from = p
+		e.drag_moved = false
 		textedit.normalize(e)
 	} else if e.dragging && g.mouse_down && abs(p.x - e.drag_from.x) + abs(p.y - e.drag_from.y) < 3 {
 		// Not dragging yet: the click can reveal syntax, which moves the text
 		// under a pointer that hasn't moved.
 	} else if e.dragging && g.mouse_down {
 		// Extend the primary selection; scroll when dragging past the edges.
+		e.drag_moved = true
 		step := k.scroll_step(e)
 		if p.y < e.view.y do textedit.scroll_to(e, e.scroll_y - step * 0.5)
 		if p.y > e.view.y + e.view.h do textedit.scroll_to(e, e.scroll_y + step * 0.5)
@@ -177,10 +184,7 @@ editor_mouse :: proc(e: ^Editor) {
 		}
 		textedit.normalize(e)
 	} else if !g.mouse_down {
-		if e.dragging {
-			if k.release != nil do k.release(e)
-			e.blink_t0 = sdl.GetTicksNS()
-		}
+		if e.dragging && k.release != nil do k.release(e)
 		e.dragging = false
 	}
 

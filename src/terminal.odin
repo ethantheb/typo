@@ -7,7 +7,6 @@ import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import "term"
-import sdl "../vendor/sdl3"
 import ttf "../vendor/sdl3/ttf"
 import "gfx"
 
@@ -26,7 +25,7 @@ Terminal :: struct {
 	session:     term.Session,
 	initialized: bool,
 	spawned:     bool, // a shell has been started at least once
-	// Shown in the header, e.g. "POWERSHELL". A fixed buffer: restarting sets it
+	// Shown in titles, e.g. "PowerShell". A fixed buffer: restarting sets it
 	// while this frame's render commands may still point at it.
 	shell_name:  [32]u8,
 	shell_len:   int,
@@ -41,8 +40,6 @@ Terminal :: struct {
 	selecting:   bool, // left button went down on the grid and selects text
 	reporting:   bool, // left button went down on the grid and is sent to the program
 	last_cell:   [2]int, // cell under the pointer at the last mouse report
-	blink_t0:    u64,    // cursor blink phase starts here; reset by output and typing
-	last_parsed: u64,
 }
 
 Term_Run :: struct {
@@ -102,11 +99,11 @@ terminal_restart :: proc(t: ^Terminal) {
 }
 
 terminal_title :: proc(t: ^Terminal) -> string {
-	return t.shell_len > 0 ? string(t.shell_name[:t.shell_len]) : "TERMINAL"
+	return t.shell_len > 0 ? string(t.shell_name[:t.shell_len]) : "Terminal"
 }
 
-// The program a shell command line runs, for the header: its first word (or
-// quoted path) without directory or extension, uppercased.
+// The program a shell command line runs, for titles: its first word (or quoted
+// path) without directory or extension.
 shell_display_name :: proc(command: string) -> string {
 	cmd := strings.trim_space(command)
 	program := cmd
@@ -118,12 +115,11 @@ shell_display_name :: proc(command: string) -> string {
 	}
 	if slash := strings.last_index_any(program, `/\`); slash >= 0 do program = program[slash + 1:]
 	if dot := strings.last_index_byte(program, '.'); dot > 0 do program = program[:dot]
-	name := strings.to_upper(program, context.temp_allocator)
-	switch name {
-	case "PWSH": return "POWERSHELL"
-	case "":     return "TERMINAL"
+	switch strings.to_lower(program, context.temp_allocator) {
+	case "pwsh", "powershell": return "PowerShell"
+	case "":                   return "Terminal"
 	}
-	return name
+	return program
 }
 
 // Terminal colors follow the editor theme.
@@ -159,10 +155,6 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 	s := &t.session
 	busy, exited := term.session_pump(s, TERMINAL_PUMP_BUDGET)
 	t.busy = busy
-	if s.parsed != t.last_parsed {
-		t.last_parsed = s.parsed
-		t.blink_t0 = sdl.GetTicksNS()
-	}
 	if exited do term.session_print_notice(s, "Process exited. Press Enter to restart.")
 	if !visible do return
 
@@ -170,9 +162,13 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 	t.cell_h = f32(editor_line_height())
 	if r, ok := element_rect(element); ok {
 		t.view = {r.x + TERMINAL_PADDING, r.y + TERMINAL_PADDING / 2, r.w - TERMINAL_PADDING * 2, r.h - TERMINAL_PADDING}
-		cols := u16(max(t.view.w / t.cell_w, 2))
-		rows := u16(max(t.view.h / t.cell_h, 1))
-		term.session_resize(s, cols, rows, u32(t.cell_w * gfx.scale), u32(t.cell_h * gfx.scale))
+		// While panes move, the grid keeps its size until they settle, so the
+		// shell isn't sent a resize every frame.
+		if !g.animating || !t.spawned {
+			cols := u16(max(t.view.w / t.cell_w, 2))
+			rows := u16(max(t.view.h / t.cell_h, 1))
+			term.session_resize(s, cols, rows, u32(t.cell_w * gfx.scale), u32(t.cell_h * gfx.scale))
+		}
 		// The shell starts once the real size is known, so it never sees 80x24.
 		if !t.spawned do terminal_start_shell(t)
 	}
@@ -375,9 +371,9 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 	h := math.round(oy + f32(c.viewport_y + 1) * lh) - y
 	color := t.colors.cursor_has_value ? to_color(t.colors.cursor) : gfx.theme.caret
 
+	// Steady: programs asking for a blinking cursor get it shown always.
 	style := c.visual_style
-	if g.focus != .Terminal do style = .Block_Hollow
-	else if !terminal_cursor_on(t) do return
+	if focused_terminal() != t do style = .Block_Hollow
 	switch style {
 	case .Block:
 		gfx.fill_rect(x, y, w, h, color)
@@ -386,7 +382,7 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 			gfx.draw_text(gfx.text_get(&gfx.text_system, font, string(buf[:n])), x, y + text_dy, to_color(t.colors.background))
 		}
 	case .Bar:
-		gfx.fill_rect(x, y, max(2 * line_w, 1), h, color)
+		gfx.draw_caret(x, y, h, gfx.scale, color)
 	case .Underline:
 		gfx.fill_rect(x, y + h - 2 * line_w, w, 2 * line_w, color)
 	case .Block_Hollow:
@@ -395,19 +391,6 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 		gfx.fill_rect(x, y, line_w, h, color)
 		gfx.fill_rect(x + w - line_w, y, line_w, h, color)
 	}
-}
-
-// The blink phase: the cursor shows for CARET_BLINK_NS, hides for as long.
-@(private = "file")
-terminal_cursor_on :: proc(t: ^Terminal) -> bool {
-	return !t.cursor.blinking || ((sdl.GetTicksNS() - t.blink_t0) / CARET_BLINK_NS) % 2 == 0
-}
-
-// Nanoseconds until the focused terminal's cursor next blinks, if it blinks.
-terminal_blink_delay :: proc(t: ^Terminal) -> (ns: u64, ok: bool) {
-	if !t.cursor.blinking || !t.cursor.visible do return 0, false
-	since := sdl.GetTicksNS() - t.blink_t0
-	return CARET_BLINK_NS - since % CARET_BLINK_NS, true
 }
 
 // Rough East Asian Wide / emoji test, used only to size the block cursor.

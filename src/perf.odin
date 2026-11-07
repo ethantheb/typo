@@ -86,11 +86,13 @@ PHASES := [?]Phase {
 	{name = "open code file (tree-sitter)", step = phase_open_code, frame_limit = 8},
 	{name = "idle with a file open", step = phase_idle, idle = true},
 	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8},
+	{name = "clicking places the caret", step = phase_click_caret},
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
 	{name = "resizing the window (tree-sitter)", step = phase_resize, frame_limit = 8},
 	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
+	{name = "clicking places the caret (rendered)", step = phase_click_caret},
 	{name = "moving through a table and code block (rendered)", step = phase_move_markdown, frame_limit = 8},
 	{name = "typing above a long table (rendered)", step = phase_type_above_table, frame_limit = 8},
 	{name = "typing in a long table's cell (rendered)", step = phase_type_in_table, frame_limit = 8},
@@ -98,6 +100,7 @@ PHASES := [?]Phase {
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
+	{name = "context menu and dialogs", step = phase_menu_dialogs},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
 	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},
@@ -107,6 +110,8 @@ PHASES := [?]Phase {
 	{name = "8 MB single-line file", step = phase_long_line, frame_limit = 25},
 	{name = "terminal full-screen redraws", step = phase_terminal_redraw, frame_limit = 12},
 	{name = "terminal shell output (4 MB)", step = phase_terminal_output, frame_limit = 16},
+	{name = "typing beside other panes (tree-sitter)", step = phase_panes_typing, frame_limit = 8},
+	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
 	{name = "idle with the terminal focused", step = phase_idle, idle = true},
 }
 
@@ -546,12 +551,21 @@ phase_vt :: proc(p: ^Perf, frame: int) -> bool {
 
 // --- UI phases ----------------------------------------------------------------------
 
+// Opens a file as the only one open.
 @(private = "file")
 open_timed :: proc(p: ^Perf, name: string) {
+	close_files()
 	t := time.tick_now()
-	editor_open(&g.editor, path_in_dir(p, name))
-	g.focus = .Editor
+	panes_open_file(path_in_dir(p, name))
 	result(p, "open", ms_since(t), "ms", name == "large.odin" ? 1500 : 250)
+}
+
+// Closes every file without asking about changes.
+@(private = "file")
+close_files :: proc() {
+	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
+		if _, ok := g.panes.open[i].content.(^Editor); ok do pane_close(g.panes.open[i], ask = false)
+	}
 }
 
 @(private = "file")
@@ -564,7 +578,7 @@ phase_open_code :: proc(p: ^Perf, frame: int) -> bool {
 phase_open_markdown :: proc(p: ^Perf, frame: int) -> bool {
 	if frame == 0 {
 		open_timed(p, "notes.md")
-		check(p, "opens rendered", md_rendered(&g.editor))
+		check(p, "opens rendered", md_rendered(focused_editor()))
 	}
 	return frame == 30
 }
@@ -572,9 +586,9 @@ phase_open_markdown :: proc(p: ^Perf, frame: int) -> bool {
 // Moves the caret down a line per frame, from a long table into a long code block.
 @(private = "file")
 phase_move_markdown :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
+	if frame == 0 do open_timed(p, "blocks.md")
+	e := focused_editor()
 	if frame == 0 {
-		open_timed(p, "blocks.md")
 		textedit.show_caret(e, true)
 		at := buffer.line_start(&e.buf, 252)
 		textedit.set_single_selection(e, {at, at, -1})
@@ -589,7 +603,7 @@ phase_move_markdown :: proc(p: ^Perf, frame: int) -> bool {
 // edit drops the caches of the document, the table's measured columns too.
 @(private = "file")
 phase_type_above_table :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
+	e := focused_editor()
 	if frame == 0 {
 		at := buffer.line_end(&e.buf, 2)
 		textedit.set_single_selection(e, {at, at, -1})
@@ -606,7 +620,7 @@ phase_type_above_table :: proc(p: ^Perf, frame: int) -> bool {
 // measures the table's columns again, and the caret is kept in the cell.
 @(private = "file")
 phase_type_in_table :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
+	e := focused_editor()
 	if frame == 0 {
 		at := buffer.line_start(&e.buf, 8) + 3
 		textedit.set_single_selection(e, {at, at, -1})
@@ -627,7 +641,7 @@ phase_type_in_table :: proc(p: ^Perf, frame: int) -> bool {
 @(private = "file")
 phase_md_whitespace :: proc(p: ^Perf, frame: int) -> bool {
 	if frame > 0 do return true
-	e := &g.editor
+	e := focused_editor()
 	moves :: proc(e: ^Editor, line: int, key: sdl.Keycode) -> bool {
 		settle :: proc(e: ^Editor) {
 			textedit.take_changes(e)
@@ -664,6 +678,8 @@ phase_open_large :: proc(p: ^Perf, frame: int) -> bool {
 
 @(private = "file")
 phase_idle :: proc(p: ^Perf, frame: int) -> bool {
+	// Nothing else wakes an idle app, so a timer ends the phase.
+	if frame == 0 do _ = sdl.AddTimer(u32(PERF_IDLE_NS / time.Millisecond) + 20, idle_over, nil)
 	elapsed := time.tick_since(p.phase_t0)
 	if elapsed < PERF_IDLE_NS do return false
 	secs := time.duration_seconds(elapsed)
@@ -678,10 +694,16 @@ phase_idle :: proc(p: ^Perf, frame: int) -> bool {
 	return true
 }
 
+@(private = "file")
+idle_over :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) -> u32 {
+	wake_main_loop(nil)
+	return 0 // one-shot
+}
+
 // Types 120 characters, one per frame, in the middle of the open file.
 @(private = "file")
 phase_type :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
+	e := focused_editor()
 	if frame == 0 {
 		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
 		textedit.show_caret(e, true)
@@ -696,7 +718,7 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 
 @(private = "file")
 phase_scroll :: proc(p: ^Perf, frame: int) -> bool {
-	textedit.move(&g.editor, .Page_Down, false)
+	textedit.move(focused_editor(), .Page_Down, false)
 	return frame == 120
 }
 
@@ -813,6 +835,204 @@ clipped_point :: proc(r: gfx.Rect) -> (at: [2]f32, found: bool) {
 	return
 }
 
+// Right-clicks a file in the tree, picks Rename, types a new name in place of
+// the selected one (the name before the extension) and presses Enter; then
+// edits that file and closes it, answering "Don't save"; then makes a new file
+// from the menu under the files. The menu, the fields and the dialog stay up
+// for a moment so the window can be looked at.
+@(private = "file")
+phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
+	SHOW :: 700 * time.Millisecond
+	@(static) step: int
+	@(static) since: time.Tick
+	@(static) mouse: [2]f32
+	@(static) before: string // the file open before, reopened at the end
+	old, renamed, created := path_in_dir(p, "rename_me.txt"), path_in_dir(p, "renamed.txt"), path_in_dir(p, "created.txt")
+	moved, never := path_in_dir(p, "zzz_created.txt"), path_in_dir(p, "never.txt")
+	wait :: proc(since: time.Tick) -> bool {return time.tick_since(since) < SHOW}
+	center :: proc(id: clay.ElementId) -> (c: [2]f32, ok: bool) {
+		r := element_rect(id) or_return
+		return {r.x + r.w / 2, r.y + r.h / 2}, true
+	}
+	if frame == 0 {
+		step, mouse = 0, g.mouse_pos
+		if e := focused_editor(); e != nil do before = strings.clone(e.path)
+		g.sidebar_visible = true
+		_ = os.write_entire_file(old, transmute([]u8)string("before"))
+		_ = os.remove(renamed)
+		_ = os.remove(moved)
+		workspace_refresh(&g.workspace)
+		return false
+	}
+	d := &g.dialog
+	switch step {
+	case 0: // right-click the file's row
+		for index in g.workspace.visible {
+			if g.workspace.nodes[index].path != old do continue
+			at, ok := center(tree_row_id(old))
+			if !ok do return false
+			g.mouse_pos, g.right_pressed = at, true
+			step, since = 1, time.tick_now()
+		}
+		if step == 0 && frame > 10 {
+			check(p, "the file is in the tree", false)
+			return true
+		}
+	case 1: // the menu is open; click Rename
+		if wait(since) do return false
+		check(p, "right-click opens the menu", g.menu.open && g.menu.items[0].cmd == .Rename_File)
+		at, _ := center(clay.ID("MenuItem", 0))
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, since = 2, time.tick_now()
+	case 2: // the name is editable in the tree, without its extension selected
+		if wait(since) do return false
+		r := &g.rename
+		lo, hi := min(r.edit.caret, r.edit.anchor), max(r.edit.caret, r.edit.anchor)
+		check(p, "Rename edits the name in the tree", r.active && r.place == .Tree && r.shown && line_edit_string(&r.edit) == "rename_me.txt" && lo == 0 && hi == len("rename_me"))
+		event: sdl.Event
+		event.type = .TEXT_INPUT
+		event.text.text = "renamed"
+		handle_key_event(&event)
+		press(sdl.K_RETURN)
+		step = 3
+	case 3: // renamed; now leave unsaved changes in it and close it
+		check(p, "typing replaces the name and Enter renames", !g.rename.active && os.exists(renamed) && !os.exists(old))
+		pane := panes_open_file(renamed)
+		editor_text_input(focused_editor(), "x")
+		run_command(.Close_Pane)
+		_, asking := d.purpose.(Unsaved_Step)
+		check(p, "closing unsaved changes asks", d.open && asking && pane_shown(pane))
+		step, since = 4, time.tick_now()
+	case 4: // Tab to "Don't save", Enter
+		if wait(since) do return false
+		press(sdl.K_TAB)
+		press(sdl.K_RETURN)
+		step = 5
+	case 5: // right-click under the files
+		data, _ := os.read_entire_file(renamed, context.temp_allocator)
+		check(p, "\"Don't save\" closes without saving", !d.open && pane_with_file(renamed) == nil && string(data) == "before")
+		_ = os.remove(created)
+		r, _ := element_rect(clay.ID("SidebarFiles"))
+		g.mouse_pos, g.right_pressed = {r.x + 40, r.y + r.h - 10}, true
+		step = 6
+	case 6: // New file
+		check(p, "right-click under the files offers New file", g.menu.open && g.menu.items[0].cmd == .New_File && g.menu.path == g.workspace.root)
+		at, _ := center(clay.ID("MenuItem", 0))
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, since = 7, time.tick_now()
+	case 7: // name it in the new row
+		if wait(since) do return false
+		check(p, "New file adds a row to name it in", g.rename.active && g.rename.create == .File && g.rename.shown)
+		event: sdl.Event
+		event.type = .TEXT_INPUT
+		event.text.text = "created.txt"
+		handle_key_event(&event)
+		press(sdl.K_RETURN)
+		step = 8
+	case 8: // rename it so that it sorts after renamed.txt, and click that row
+		check(p, "Enter creates the file and opens it", !g.rename.active && os.exists(created) && pane_with_file(created) != nil)
+		rename_start_file(created, .Tree)
+		line_edit_set(&g.rename.edit, "zzz_created.txt", 0, 0)
+		step, since = 9, time.tick_now()
+	case 9:
+		if wait(since) do return false
+		at, _ := center(tree_row_id(renamed))
+		g.mouse_pos, g.mouse_pressed, g.mouse_down, g.mouse_clicks = at, true, true, 1
+		step = 10
+	case 10:
+		g.mouse_down = false
+		step, since = 11, time.tick_now()
+	case 11: // with the rename open, right-click a row, then a dialog comes up
+		if wait(since) do return false
+		e := focused_editor()
+		check(p, "a click that ends a rename opens the row clicked", os.exists(moved) && e != nil && e.path == renamed)
+		at, _ := center(tree_row_id(renamed))
+		g.mouse_pos, g.right_pressed = at, true
+		step = 12
+	case 12:
+		check(p, "right-click opens the menu again", g.menu.open)
+		rename_start_file(renamed, .Tree)
+		line_edit_set(&g.rename.edit, "never.txt", 0, 0)
+		ask_reset_settings()
+		check(p, "a dialog closes the context menu", d.open && !g.menu.open)
+		// The pointer over text, where it would be an I-beam.
+		if e := focused_editor(); e != nil {
+			for y := e.view.y; y < e.view.y + e.view.h; y += 4 {
+				for x := e.view.x; x < e.view.x + e.view.w; x += 4 {
+					if editor_text_hit(e, {x, y}) {
+						g.mouse_pos = {x, y}
+						break
+					}
+				}
+				if editor_text_hit(e, g.mouse_pos) do break
+			}
+			check(p, "the pointer is over text", editor_text_hit(e, g.mouse_pos))
+		}
+		step, since = 13, time.tick_now()
+	case 13: // click Cancel
+		if wait(since) do return false
+		check(p, "the pointer is an arrow over the dialog", current_cursor == .DEFAULT)
+		at, _ := center(clay.ID("DialogButton", 1))
+		g.mouse_pos, g.mouse_pressed = at, true
+		step = 14
+	case 14:
+		if d.open do return false
+		check(p, "a click on the dialog doesn't end the rename", g.rename.active && os.exists(renamed) && !os.exists(never))
+		press(sdl.K_ESCAPE)
+		check(p, "Esc ends the rename", !g.rename.active && os.exists(renamed))
+		check(p, "a name Windows can't use is refused", ODIN_OS != .Windows || (rename_path(renamed, "a:b") != "" && rename_path(renamed, "nul.txt") != "" && os.exists(renamed)))
+
+		// A maximized pane gives way to a pane that is focused.
+		ps := &g.panes
+		a := ps.focused // renamed.txt
+		b := pane_for_file(moved)
+		pane_move(b, {kind = .Split, target = a, side = .Right})
+		pane_focus(b)
+		pane_toggle_maximized()
+		pane_focus(a)
+		check(p, "focusing another pane restores the maximized one", ps.maximized == nil && ps.focused == a)
+		pane_toggle_maximized()
+		pane_focus_next()
+		check(p, "focusing the next pane keeps it maximized", ps.maximized == b && ps.focused == b)
+		ps.maximized = nil
+		pane_close(b, ask = false)
+
+		g.mouse_pos = mouse
+		if before != "" do panes_open_file(before)
+		delete(before)
+		before = ""
+		return true
+	}
+	return false
+}
+
+// Presses in the text with the caret at the start, holds the button, drags,
+// and lets go: the caret moves and shows on the press itself, hides while
+// dragging, and shows again on release.
+@(private = "file")
+phase_click_caret :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) mouse: [2]f32
+	e := focused_editor()
+	switch frame {
+	case 0:
+		mouse = g.mouse_pos
+		textedit.set_single_selection(e, {0, 0, -1})
+		g.mouse_pos = {e.view.x + e.view.w * 0.4, e.view.y + e.view.h * 0.4}
+		g.mouse_down, g.mouse_pressed, g.mouse_clicks = true, true, 1
+	case 1:
+		check(p, "a press moves the caret and shows it", e.sels[e.primary].head != 0 && editor_caret_on(e))
+		g.mouse_pos += {40, 30}
+	case 2:
+		check(p, "dragging hides the caret", !editor_caret_on(e))
+		g.mouse_down = false
+	case 3:
+		check(p, "letting go shows it again", editor_caret_on(e))
+		g.mouse_pos = mouse
+		return true
+	}
+	return false
+}
+
 // A key press, as if typed.
 @(private = "file")
 press :: proc(key: sdl.Keycode) {
@@ -914,12 +1134,12 @@ phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
 	switch frame {
 	case 0:
 		g.settings.letter_spacing = 1
-		textedit.move(&g.editor, .Doc_Start, false)
+		textedit.move(focused_editor(), .Doc_Start, false)
 	case 120:
 		g.settings.letter_spacing = 0
 		return true
 	case:
-		textedit.move(&g.editor, .Page_Down, false)
+		textedit.move(focused_editor(), .Page_Down, false)
 	}
 	return false
 }
@@ -927,17 +1147,19 @@ phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
 // Jumps to 120 places spread over the file, one per frame.
 @(private = "file")
 phase_jump_large :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
+	e := focused_editor()
 	textedit.scroll_to(e, max_scroll_y(e) * f64(frame) / 120)
 	return frame == 120
 }
 
 @(private = "file")
 phase_long_line :: proc(p: ^Perf, frame: int) -> bool {
-	e := &g.editor
-	switch frame {
-	case 0:
+	if frame == 0 {
 		open_timed(p, "long.js")
+		return false
+	}
+	e := focused_editor()
+	switch frame {
 	case 1:
 		textedit.move(e, .Doc_End, false)
 	case:
@@ -948,16 +1170,17 @@ phase_long_line :: proc(p: ^Perf, frame: int) -> bool {
 
 @(private = "file")
 phase_terminal_redraw :: proc(p: ^Perf, frame: int) -> bool {
-	t := &g.terminal_panel.terminal
 	if frame == 0 {
 		when ODIN_OS == .Windows {
 			set_string(&g.settings.terminal_shell, "cmd.exe /q /k prompt $G")
 		} else {
 			set_string(&g.settings.terminal_shell, "/bin/sh")
 		}
-		terminal_toggle_maximized()
+		terminal_toggle()
+		pane_toggle_maximized()
 		return false
 	}
+	t := focused_terminal()
 	// Repaint every cell in a new color each frame, like a full-screen program.
 	s := &t.session
 	sb := strings.builder_make(context.temp_allocator)
@@ -977,7 +1200,7 @@ phase_terminal_redraw :: proc(p: ^Perf, frame: int) -> bool {
 // waits until the output has stopped for a second.
 @(private = "file")
 phase_terminal_output :: proc(p: ^Perf, frame: int) -> bool {
-	s := &g.terminal_panel.terminal.session
+	s := &focused_terminal().session
 	if frame == 0 {
 		when ODIN_OS == .Windows {
 			command := "cls & type flood.txt\r"
@@ -998,4 +1221,81 @@ phase_terminal_output :: proc(p: ^Perf, frame: int) -> bool {
 	result(p, "time until output stops", secs * 1000, "ms", 10_000)
 	result(p, "throughput", 4 / secs, "MB/s")
 	return true
+}
+
+// Code and Markdown side by side above the terminal; types in the code once
+// the panes have settled.
+@(private = "file")
+phase_panes_typing :: proc(p: ^Perf, frame: int) -> bool {
+	ps := &g.panes
+	if frame == 0 {
+		ps.maximized = nil
+		perf_panes.terminal = ps.focused
+		close_files()
+		perf_panes.code = panes_open_file(path_in_dir(p, "code.odin"))
+		perf_panes.notes = pane_for_file(path_in_dir(p, "notes.md"))
+		pane_move(perf_panes.notes, {kind = .Split, target = perf_panes.code, side = .Right})
+		pane_focus(perf_panes.code)
+		e := focused_editor()
+		textedit.show_caret(e, true)
+		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
+		textedit.set_single_selection(e, {mid, mid, -1})
+		e.reveal = true
+		p.mark_frame = -1
+		return false
+	}
+	if p.mark_frame < 0 {
+		if g.animating do return false
+		p.mark_frame = frame
+		clear(&p.frames)
+	}
+	text := "the quick brown fox "
+	editor_text_input(focused_editor(), text[frame % len(text):][:1])
+	return frame == p.mark_frame + 120
+}
+
+@(private = "file")
+perf_panes: struct {
+	code, notes, terminal: ^Pane,
+	step:     int,
+	animated: int, // steps that animated
+}
+
+// Moves the panes of phase_panes_typing, each move once the last has settled:
+// the terminal docks at the right, the sidebar hides and comes back, the files
+// swap, one is maximized and restored, one leaves the layout and comes back,
+// and the focus moves.
+@(private = "file")
+phase_panes_moving :: proc(p: ^Perf, frame: int) -> bool {
+	pp := &perf_panes
+	if frame == 0 {
+		pp.step, pp.animated = 0, 0
+		p.mark_frame = 0
+		return false
+	}
+	if g.animating {
+		if frame == p.mark_frame + 1 do pp.animated += 1
+		return false
+	}
+	STEPS :: 9
+	switch pp.step {
+	case 0: pane_move(pp.terminal, {kind = .Edge, side = .Right, share = 0.3})
+	case 1: g.sidebar_visible = false
+	case 2: g.sidebar_visible = true
+	case 3: pane_move(pp.code, {kind = .Swap, target = pp.notes})
+	case 4:
+		pane_focus(pp.code)
+		pane_toggle_maximized()
+	case 5: pane_toggle_maximized()
+	case 6: pane_hide(pp.notes)
+	case 7: pane_move(pp.notes, {kind = .Split, target = pp.code, side = .Right})
+	case 8: pane_focus(pp.terminal)
+	case STEPS:
+		check(p, "three panes shown", pane_shown(pp.code) && pane_shown(pp.notes) && pane_shown(pp.terminal))
+		check(p, "every move animates", pp.animated == STEPS)
+		return true
+	}
+	pp.step += 1
+	p.mark_frame = frame
+	return false
 }

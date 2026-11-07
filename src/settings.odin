@@ -21,6 +21,7 @@ import "gfx"
 // the settings window all work from that table.
 
 Settings :: struct {
+	restore_session: bool,
 	theme:          string,
 	font_family:    string,
 	font_size:      int,
@@ -51,6 +52,7 @@ Settings :: struct {
 }
 
 Setting :: enum {
+	Restore_Session,
 	Theme,
 	Smooth_Scroll,
 	Text_Contrast,
@@ -72,6 +74,7 @@ Setting :: enum {
 
 // Sections of settings.toml and the settings window, in order.
 Section :: enum {
+	General,
 	Appearance,
 	Font,
 	Markdown,
@@ -81,6 +84,7 @@ Section :: enum {
 }
 
 SECTION_KEYS := [Section]string {
+	.General     = "general",
 	.Appearance  = "appearance",
 	.Font        = "font",
 	.Markdown    = "markdown",
@@ -110,6 +114,12 @@ SETTINGS := [Setting]Setting_Info {
 		section = .Appearance, key = "theme", name = "Theme",
 		description = "Color scheme for the whole window.", keywords = "dark light mode colors color scheme",
 		default = gfx.DEFAULT_THEME, choices = gfx.THEME_NAMES[:], picker = true,
+	},
+	.Restore_Session = {
+		section = .General, key = "restore_session", name = "Restore last session",
+		description = "Started without a folder or file, reopen the last folder with its files and terminals where they were.",
+		keywords = "startup reopen workspace panes",
+		default = true,
 	},
 	.Smooth_Scroll = {
 		section = .Appearance, key = "smooth_scroll", name = "Smooth scrolling",
@@ -213,6 +223,7 @@ Setting_Value :: union {
 
 setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	switch x {
+	case .Restore_Session: return &s.restore_session
 	case .Theme:          return &s.theme
 	case .Font_Family:    return &s.font_family
 	case .Font_Size:      return &s.font_size
@@ -508,7 +519,7 @@ apply_settings :: proc() {
 	// Not for each theme the theme list previews: that re-rasterizes all text.
 	w := &g.settings_window
 	if !(w.picking && w.picker == .Theme) do gfx.text_set_contrast(&gfx.text_system, gfx.theme.text, f32(g.settings.text_contrast))
-	terminal_apply_theme(&g.terminal_panel.terminal)
+	for p in g.panes.open do if t, ok := p.content.(^Terminal); ok do terminal_apply_theme(t)
 	apply_editor_font()
 	apply_markdown_font()
 }

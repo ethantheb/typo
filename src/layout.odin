@@ -1,6 +1,8 @@
 package editor
 
 import "core:fmt"
+import "core:hash"
+import "core:slice"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
@@ -9,77 +11,62 @@ import sdl "../vendor/sdl3"
 import "gfx"
 import "textedit"
 
-// The window layout: sidebar, editor pane, terminal panel and status bar, plus
-// which pane has focus and the mouse cursor shape.
+// The window layout: the sidebar and the panes (panes.odin) float over "Main"
+// at rects computed from the window size, with the status bar under them; and
+// the mouse cursor shape.
 
 FONT_SIZE_SIDEBAR :: 13
 STATUSBAR_HEIGHT :: 24
 SIDEBAR_WIDTH :: 240
-TERMINAL_HEADER_HEIGHT :: 28
-TERMINAL_DEFAULT_HEIGHT :: 280
-TERMINAL_MIN_HEIGHT :: 90
-SPLITTER_GRAB :: 5 // grab area of the editor/terminal divider
-
-// The pane that receives keyboard input.
-Focus :: enum {
-	Editor,
-	Terminal,
-}
-
-// The terminal area under the editor.
-Terminal_Panel :: struct {
-	terminal:   Terminal,
-	visible:    bool,
-	maximized:  bool, // fills the window in place of the sidebar and editor
-	height:     f32,
-	split_drag: bool,
-	split_grab: f32, // mouse y minus the splitter's top when the drag began
-}
 
 build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 	clay.BeginLayout()
 	if clay.UI(clay.ID("Root"))({
 		layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
-		backgroundColor = gfx.theme.bg,
+		backgroundColor = gfx.theme.panel,
 	}) {
 		if clay.UI(clay.ID("Main"))({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}}}) {
-			maximized := terminal_maximized()
-			if g.sidebar_visible && !maximized do sidebar()
-			if clay.UI(clay.ID("Work"))({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom}}) {
-				if !maximized do editor_pane()
-				if g.terminal_panel.visible {
-					if !maximized do terminal_splitter()
-					terminal_pane()
-				}
-			}
+			sidebar()
+			panes_ui()
 		}
 		status_bar()
 		finder_ui()
 		settings_window_ui()
+		context_menu_ui()
+		dialog_ui()
 	}
 	g.animating = false // set again by any transition still running (see transition)
 	return clay.EndLayout(g.dt)
 }
 
-// A press in a pane gives it keyboard focus.
-update_focus :: proc() {
-	if !g.mouse_pressed || !ui_interactive() do return
-	// Hidden panes keep their last bounds in Clay, so check visibility first.
-	if g.terminal_panel.visible && pointer_in(clay.ID("TerminalPane")) do g.focus = .Terminal
-	else if !terminal_maximized() && pointer_in(clay.ID("EditorPane")) do g.focus = .Editor
-}
-
 // --- Sidebar ---------------------------------------------------------------------
 
+// A pane at the left: the file tree, and the shelf under it. Hiding it slides it
+// out of the window; it is declared until it gets there.
 @(private = "file")
 sidebar :: proc() {
-	if clay.UI(clay.ID("Sidebar"))({
-		layout = {sizing = {clay.SizingFixed(SIDEBAR_WIDTH), clay.SizingGrow()}, layoutDirection = .TopToBottom, padding = {top = 8}},
-		backgroundColor = gfx.theme.panel,
-		border = {color = gfx.theme.border, width = {right = 1}},
+	id := clay.ID("Sidebar")
+	work := work_rect()
+	r := gfx.Rect{PANE_GAP, PANE_GAP, SIDEBAR_WIDTH, work.h}
+	if !g.sidebar_visible {
+		r.x = -SIDEBAR_WIDTH - PANE_GAP
+		if g.sidebar_gone || element_at(id, r) {
+			g.sidebar_gone = true
+			return
+		}
+	}
+	g.sidebar_gone = false
+	if clay.UI(id)({
+		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}, layoutDirection = .TopToBottom, padding = {bottom = 4}},
+		backgroundColor = gfx.theme.bg,
+		cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
+		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
+		floating = {attachTo = .Parent, offset = {r.x, r.y}, zIndex = 2},
+		transition = transition(clay.TransitionPropertyBoundingBox, .From_Left),
 	}) {
+		// Laid out like a pane's header, level with the panes' titles.
 		if clay.UI()({
-			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(24)}, padding = {left = 12, right = 6}, childGap = 2, childAlignment = {y = .Center}},
+			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(PANE_HEADER_HEIGHT)}, padding = {left = 12, right = 4}, childGap = 2, childAlignment = {y = .Center}},
 		}) {
 			name_id := clay.ID("FolderName")
 			if clay.UI(name_id)({}) {
@@ -87,185 +74,81 @@ sidebar :: proc() {
 			}
 			tooltip(name_id, g.workspace.root)
 			push_right()
-			if button(clay.ID("OpenButton"), "Open…", "Open a folder") do show_open_folder_dialog()
+			if icon_button(clay.ID("OpenButton"), .Folder_Open, 22, 14, "Open folder") do show_open_folder_dialog()
 		}
 		files_id := clay.ID("SidebarFiles")
 		wheel_scroll_list(files_id)
+		active := active_editor()
+		// Open files with unsaved changes, marked in the tree.
+		modified := make([dynamic]string, context.temp_allocator)
+		for p in g.panes.open {
+			if e, ok := p.content.(^Editor); ok && editor_is_modified(e) do append(&modified, e.path)
+		}
 		if clay.UI(files_id)({
-			layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
+			layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom, padding = {bottom = 4}},
 			clip = {horizontal = true, vertical = true, childOffset = clay.GetScrollOffset()},
 		}) {
+			if creating_in(g.workspace.root) do new_entry_row(0)
 			for index in g.workspace.visible {
 				node := g.workspace.nodes[index]
-				if tree_row(index, node, node.path == g.editor.path, files_id) {
-					g.pending = node.is_dir ? Toggle_Node(index) : Open_File(strings.clone(node.path))
+				changed := !node.is_dir && slice.contains(modified[:], node.path)
+				// Files open on release, or drag into a pane (see drag_mouse).
+				if tree_row(index, node, active != nil && node.path == active.path, changed, files_id) && node.is_dir && !renaming(.Tree, node.path) {
+					g.pending = Toggle_Node(index)
 				}
+				if node.is_dir && creating_in(node.path) do new_entry_row(node.depth + 1)
 			}
 		}
+		shelf(r.h * 0.45)
 	}
 }
 
-// One explorer row: indent, chevron for directories, name. Returns true when clicked.
+// A tree row's element id. It follows the path, not the row's place, so a
+// press matched against last frame's layout finds the same file after the tree
+// changed (a rename re-sorts it).
+tree_row_id :: proc(path: string) -> clay.ElementId {
+	return clay.ID("TreeRow", hash.fnv32a(transmute([]u8)path))
+}
+
+// The node of the tree row under the pointer, if any.
+tree_row_under_pointer :: proc() -> (index: int, ok: bool) {
+	if !g.sidebar_visible || !pointer_in(clay.ID("SidebarFiles")) do return
+	for i in g.workspace.visible do if pointer_in(tree_row_id(g.workspace.nodes[i].path)) do return i, true
+	return
+}
+
+// One explorer row: indent, chevron for directories, name, and a dot for an
+// open file with unsaved changes. Returns true when pressed.
 @(private = "file")
-tree_row :: proc(index: int, node: Node, selected: bool, list: clay.ElementId) -> bool {
-	id := clay.ID("TreeRow", u32(index))
-	if clay.UI(id)({
-		layout = {
-			sizing = {width = clay.SizingGrow(), height = clay.SizingFixed(22)},
-			padding = {left = u16(8 + node.depth * 12), right = 8},
-			childGap = 2,
-			childAlignment = {y = .Center},
-		},
-		backgroundColor = selected ? gfx.theme.selected : (clay.Hovered() ? gfx.theme.hover : {}),
-	}) {
+tree_row :: proc(index: int, node: Node, selected, modified: bool, list: clay.ElementId) -> bool {
+	id := tree_row_id(node.path)
+	if list_row(id, selected, 22, u16(2 + node.depth * 12)) {
 		if node.is_dir {
 			icon(node.expanded ? .Chevron_Down : .Chevron_Right, gfx.theme.text_dim)
 		} else {
 			spacer_x(16)
 		}
-		label(node.name, selected ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
+		if renaming(.Tree, node.path) {
+			rename_field(FONT_SIZE_SIDEBAR)
+		} else {
+			label(node.name, selected ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
+			if modified do label(" •", gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
+		}
 	}
 	return clicked(id, list)
 }
 
-// --- Editor pane -----------------------------------------------------------------
-
+// The row a new file or folder is named in, at the top of its folder.
 @(private = "file")
-editor_pane :: proc() {
-	if clay.UI(clay.ID("EditorPane"))({
-		layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, layoutDirection = .TopToBottom},
-		backgroundColor = gfx.theme.bg,
-	}) {
-		switch g.editor.status {
-		case .None:   centered_message(fmt.tprintf("Select a file in the explorer, or press %s", first_chord_label(.Find_File)))
-		case .Error:  centered_message("Could not read file")
-		case .Binary: centered_message("Binary file not shown")
-		case .Text:   editor_text_element(&g.editor)
+new_entry_row :: proc(depth: int) {
+	if list_row(clay.ID("NewEntryRow"), false, 22, u16(2 + depth * 12)) {
+		if g.rename.create == .Folder {
+			icon(.Chevron_Right, gfx.theme.text_dim)
+		} else {
+			spacer_x(16)
 		}
+		rename_field(FONT_SIZE_SIDEBAR)
 	}
-}
-
-@(private = "file")
-centered_message :: proc(s: string) {
-	if clay.UI()({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}, childAlignment = {x = .Center, y = .Center}}}) {
-		label(s, gfx.theme.text_dim)
-	}
-}
-
-// --- Terminal panel ----------------------------------------------------------------
-
-// Shows (and focuses) the terminal, focuses it if shown but unfocused, or hides it.
-terminal_toggle :: proc() {
-	p := &g.terminal_panel
-	if p.visible && g.focus != .Terminal {
-		g.focus = .Terminal
-		return
-	}
-	if p.visible {
-		terminal_hide()
-	} else {
-		terminal_show(maximized = false)
-	}
-}
-
-// Expands the terminal to fill the window, or puts it back under the editor.
-terminal_toggle_maximized :: proc() {
-	p := &g.terminal_panel
-	terminal_show(maximized = !p.maximized || !p.visible)
-}
-
-terminal_maximized :: proc() -> bool {
-	return g.terminal_panel.visible && g.terminal_panel.maximized
-}
-
-@(private = "file")
-terminal_show :: proc(maximized: bool) {
-	p := &g.terminal_panel
-	if p.height == 0 do p.height = TERMINAL_DEFAULT_HEIGHT
-	p.visible, p.maximized = true, maximized
-	g.focus = .Terminal
-	terminal_init(&p.terminal)
-}
-
-@(private = "file")
-terminal_hide :: proc() {
-	p := &g.terminal_panel
-	p.visible, p.maximized = false, false
-	g.focus = .Editor
-}
-
-// Per frame, before layout: the divider drag, then the terminal itself.
-terminal_panel_frame :: proc() {
-	p := &g.terminal_panel
-	if !p.terminal.initialized do return
-	if p.visible && ui_interactive() do splitter_mouse(p)
-	terminal_frame(&p.terminal, clay.ID("TerminalText"), p.visible, ui_interactive() && !p.split_drag)
-}
-
-terminal_panel_busy :: proc() -> bool {
-	p := &g.terminal_panel
-	return p.split_drag || (p.terminal.initialized && p.terminal.busy)
-}
-
-@(private = "file")
-terminal_pane :: proc() {
-	p := &g.terminal_panel
-	if clay.UI(clay.ID("TerminalPane"))({
-		layout = {sizing = {clay.SizingGrow(), p.maximized ? clay.SizingGrow() : clay.SizingFixed(p.height)}, layoutDirection = .TopToBottom},
-		backgroundColor = gfx.theme.bg,
-	}) {
-		if clay.UI()({
-			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(TERMINAL_HEADER_HEIGHT)}, padding = {left = 12, right = 6}, childGap = 8, childAlignment = {y = .Center}},
-		}) {
-			label(terminal_title(&p.terminal), g.focus == .Terminal ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
-			push_right()
-			max_tip := p.maximized ? "Restore terminal" : "Maximize terminal"
-			if icon_button(clay.ID("TerminalMaximize"), p.maximized ? .Restore : .Maximize, 22, 15, max_tip, first_chord_label(.Maximize_Terminal)) {
-				terminal_toggle_maximized()
-			}
-			if icon_button(clay.ID("TerminalRestart"), .Restart, 22, 15, "Restart shell") {
-				terminal_restart(&p.terminal)
-				g.focus = .Terminal
-			}
-			if icon_button(clay.ID("TerminalClose"), .Chevron_Down, 22, 18, "Hide terminal", first_chord_label(.Toggle_Terminal)) {
-				terminal_hide()
-			}
-		}
-		custom_element(clay.ID("TerminalText"), &p.terminal)
-	}
-}
-
-// The divider between the editor and the terminal; drag to resize.
-@(private = "file")
-terminal_splitter :: proc() {
-	if clay.UI(clay.ID("TerminalSplitter"))({
-		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(1)}},
-		backgroundColor = g.terminal_panel.split_drag ? gfx.theme.accent : gfx.theme.border,
-	}) {}
-}
-
-@(private = "file")
-splitter_mouse :: proc(p: ^Terminal_Panel) {
-	r, ok := element_rect(clay.ID("TerminalSplitter"))
-	if !ok do return
-	if g.mouse_pressed && splitter_hit(g.mouse_pos) {
-		p.split_drag = true
-		p.split_grab = g.mouse_pos.y - r.y
-	}
-	if !g.mouse_down do p.split_drag = false
-	if p.split_drag {
-		bottom := f32(g.window_h) - STATUSBAR_HEIGHT
-		max_height := max(bottom - 120, TERMINAL_MIN_HEIGHT) // keep some editor visible
-		p.height = clamp(bottom - (g.mouse_pos.y - p.split_grab), TERMINAL_MIN_HEIGHT, max_height)
-	}
-}
-
-// Whether a point is on the divider's grab area (a few pixels around the line).
-@(private = "file")
-splitter_hit :: proc(pos: [2]f32) -> bool {
-	if !g.terminal_panel.visible || g.terminal_panel.maximized do return false
-	r, ok := element_rect(clay.ID("TerminalSplitter"))
-	return ok && gfx.rect_contains({r.x, r.y - SPLITTER_GRAB / 2 - 1, r.w, SPLITTER_GRAB + 2}, pos)
 }
 
 // --- Status bar --------------------------------------------------------------------
@@ -273,37 +156,37 @@ splitter_hit :: proc(pos: [2]f32) -> bool {
 @(private = "file")
 status_bar :: proc() {
 	if clay.UI(clay.ID("StatusBar"))({
-		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(STATUSBAR_HEIGHT)}, padding = {left = 3, right = 12}, childGap = 16, childAlignment = {y = .Center}},
+		layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(STATUSBAR_HEIGHT)}, padding = {left = 3, right = 12, bottom = 2}, childGap = 16, childAlignment = {y = .Center}},
 		backgroundColor = gfx.theme.statusbar,
-		border = {color = gfx.theme.border, width = {top = 1}},
 	}) {
 		if clay.UI()({layout = {childGap = 2}}) {
 			if icon_button(clay.ID("SidebarToggle"), .Sidebar, 20, 15, "Toggle sidebar", first_chord_label(.Toggle_Sidebar)) {
 				run_command(.Toggle_Sidebar)
 			}
 			if icon_button(clay.ID("TerminalToggle"), .Terminal, 20, 15, "Toggle terminal", first_chord_label(.Toggle_Terminal)) {
-				run_command(.Toggle_Terminal)
+				defer_action(Run_Command(.Toggle_Terminal))
 			}
 			if icon_button(clay.ID("SettingsButton"), .Settings, 20, 15, "Settings", first_chord_label(.Open_Settings)) {
 				run_command(.Open_Settings)
 			}
 		}
-		e := &g.editor
-		if e.status != .None {
+		if e := focused_editor(); e != nil {
 			name := relative_to_root(e.path)
 			if e.new_file do name = fmt.tprintf("%s (new)", name)
 			label(editor_is_modified(e) ? fmt.tprintf("%s •", name) : name, gfx.theme.text, FONT_SIZE_SMALL)
-		}
-		if e.status == .Text {
-			if !textedit.caret_hidden(e) do label(cursor_status(e), gfx.theme.text_dim, FONT_SIZE_SMALL)
-			label(fmt.tprintf("%d lines", buffer.line_count(&e.buf)), gfx.theme.text_dim, FONT_SIZE_SMALL)
-			label(e.buf.crlf ? "CRLF" : "LF", gfx.theme.text_dim, FONT_SIZE_SMALL)
-			if e.md != nil {
-				rendered := md_rendered(e)
-				if icon_button(clay.ID("MarkdownView"), rendered ? .Code : .Eye, 20, 15, rendered ? "Show Markdown source" : "Show rendered Markdown", first_chord_label(.Toggle_Markdown_View)) {
-					run_command(.Toggle_Markdown_View)
+			if e.status == .Text {
+				if !textedit.caret_hidden(e) do label(cursor_status(e), gfx.theme.text_dim, FONT_SIZE_SMALL)
+				label(fmt.tprintf("%d lines", buffer.line_count(&e.buf)), gfx.theme.text_dim, FONT_SIZE_SMALL)
+				label(e.buf.crlf ? "CRLF" : "LF", gfx.theme.text_dim, FONT_SIZE_SMALL)
+				if e.md != nil {
+					rendered := md_rendered(e)
+					if icon_button(clay.ID("MarkdownView"), rendered ? .Code : .Eye, 20, 15, rendered ? "Show Markdown source" : "Show rendered Markdown", first_chord_label(.Toggle_Markdown_View)) {
+						run_command(.Toggle_Markdown_View)
+					}
 				}
 			}
+		} else if p := g.panes.focused; p != nil {
+			label(pane_title(p), gfx.theme.text, FONT_SIZE_SMALL)
 		}
 		push_right()
 		label(fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, gfx.scale), gfx.theme.text_dim, FONT_SIZE_SMALL)
@@ -327,33 +210,29 @@ cursor_status :: proc(e: ^Editor) -> string {
 
 @(private = "file")
 cursors: [sdl.SystemCursor]^sdl.Cursor // created on first use
-@(private = "file")
+@(private)
 current_cursor := sdl.SystemCursor.DEFAULT
 
-// An I-beam over editable text, a resize arrow on the splitter, the normal
-// arrow elsewhere. Call after layout.
+// An I-beam over editable text, a resize arrow on a divider between panes, a
+// move arrow while dragging a pane, the normal arrow elsewhere. Call after layout.
 update_mouse_cursor :: proc() {
 	want := sdl.SystemCursor.DEFAULT
-	e := &g.editor
+	ps := &g.panes
+	divider := ps.divider.tile
+	if divider == nil && ui_interactive() && ps.drag.pane == nil do divider = divider_at(ps.root, g.mouse_pos)
 	switch {
+	case g.dialog.open, g.menu.open && pointer_in(clay.ID("ContextMenu")):
+		// The arrow over popups that cover what is under them.
 	case g.finder.open:
 		if pointer_in(clay.ID("FinderInput")) do want = .TEXT
 	case g.settings_window.open && !ui_interactive():
 		if settings_window_over_text() do want = .TEXT
-	case g.terminal_panel.split_drag || splitter_hit(g.mouse_pos):
-		want = .NS_RESIZE
-	case e.status != .Text || terminal_maximized():
-	case e.dragging && g.mouse_down:
-		want = .TEXT // keep the I-beam while drag-selecting, wherever the mouse goes
+	case ps.drag.active:
+		want = .MOVE
+	case divider != nil:
+		want = divider.axis == .Row ? .EW_RESIZE : .NS_RESIZE
 	case:
-		over_text := editor_text_hit(e, g.mouse_pos)
-		look := textedit.Pointer.Text
-		if e.kind.pointer != nil do look = e.kind.pointer(e, g.mouse_pos, over_text)
-		switch look {
-		case .Arrow: want = .DEFAULT
-		case .Hand:  want = .POINTER
-		case .Text:  if over_text && e.scrollbar_drag == nil do want = .TEXT
-		}
+		want = editor_cursor()
 	}
 	if want == current_cursor do return
 	cursor := sdl.GetDefaultCursor()
@@ -362,6 +241,28 @@ update_mouse_cursor :: proc() {
 		cursor = cursors[want]
 	}
 	if cursor != nil && sdl.SetCursor(cursor) do current_cursor = want
+}
+
+// The cursor over the editors: the I-beam while drag-selecting, wherever the
+// mouse goes, else whatever the view under the pointer shows there.
+@(private = "file")
+editor_cursor :: proc() -> sdl.SystemCursor {
+	for p in g.panes.open {
+		if e, ok := p.content.(^Editor); ok && pane_live(p) && e.status == .Text && e.dragging && g.mouse_down do return .TEXT
+	}
+	for p in g.panes.open {
+		e, ok := p.content.(^Editor)
+		if !ok || !pane_live(p) || e.status != .Text || !gfx.rect_contains(e.view, g.mouse_pos) do continue
+		over_text := editor_text_hit(e, g.mouse_pos)
+		look := textedit.Pointer.Text
+		if e.kind.pointer != nil do look = e.kind.pointer(e, g.mouse_pos, over_text)
+		switch look {
+		case .Arrow: return .DEFAULT
+		case .Hand:  return .POINTER
+		case .Text:  return over_text && e.scrollbar_drag == nil ? .TEXT : .DEFAULT
+		}
+	}
+	return .DEFAULT
 }
 
 destroy_mouse_cursors :: proc() {

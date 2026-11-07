@@ -47,7 +47,7 @@ Editor :: struct {
 	},
 	drag_origin: Selection, // selection made by the initial click, for word/line/block drag
 	drag_from:   [2]f32,    // where the press was; the drag starts once the pointer leaves it
-	blink_t0: u64,          // caret blink phase start (reset on activity)
+	drag_moved:  bool,      // the pointer has left drag_from since the press
 	// The primary caret's line and visual column, cached: on a long line the
 	// column takes a scan from the line start.
 	caret_pos: struct {
@@ -144,6 +144,29 @@ md_toggle_view :: proc(e: ^Editor) {
 	}
 }
 
+// After the file was renamed to e.path: highlighting follows the new name, and
+// the editor gains or drops its Markdown structure and rendered view.
+editor_path_changed :: proc(e: ^Editor) {
+	if e.status != .Text do return
+	syntax.highlighter_open(&e.hl, &e.buf, e.path)
+	markdown_now := is_markdown_path(e.path)
+	if markdown_now == (e.md != nil) do return
+	if markdown_now {
+		e.md = new(markdown.Doc)
+		markdown.doc_open(e.md, &e.buf)
+		mdview.attach(&e.md_view, e, e.md, &TEXT_KIND, md_initial_mode(e))
+	} else {
+		markdown.doc_destroy(e.md)
+		free(e.md)
+		e.md = nil
+		mdview.destroy(&e.md_view.mdv)
+		e.md_view = {}
+		editor_attach(e)
+		e.kind_data = nil
+	}
+	textedit.normalize(e)
+}
+
 is_markdown_path :: proc(path: string) -> bool {
 	ext := filepath.ext(path)
 	return strings.equal_fold(ext, ".md") || strings.equal_fold(ext, ".markdown") || strings.equal_fold(ext, ".mdx")
@@ -205,17 +228,6 @@ editor_save :: proc(e: ^Editor) -> bool {
 	return true
 }
 
-// Asks what to do with unsaved changes. Returns false if the user cancelled.
-editor_confirm_discard :: proc(e: ^Editor) -> bool {
-	if !editor_is_modified(e) do return true
-	message := strings.concatenate({"Save changes to ", relative_to_root(e.path), "?"}, context.temp_allocator)
-	switch ask("Unsaved changes", message, {"Save", "Don't Save", "Cancel"}, default = 0, cancel = 2) {
-	case 0: return editor_save(e)
-	case 1: return true
-	}
-	return false
-}
-
 // --- Text helpers -----------------------------------------------------------------
 
 // Line and visual column of the primary caret.
@@ -236,7 +248,6 @@ caret_line_col :: proc(e: ^Editor) -> (line, col: int) {
 // A key in the editor's view (see textedit.key). Returns true if it was handled.
 editor_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 	if e.status != .Text do return false
-	e.blink_t0 = sdl.GetTicksNS()
 	return textedit.key(e, key)
 }
 
@@ -244,7 +255,6 @@ editor_handle_key :: proc(e: ^Editor, key: sdl.KeyboardEvent) -> bool {
 // apply, e.g. no text file is open.
 editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 	if e.status != .Text do return false
-	e.blink_t0 = sdl.GetTicksNS()
 	if textedit.caret_hidden(e) {
 		// Nothing to copy; pasting shows the caret, as typing does, and
 		// commands that select show it where it is.
@@ -274,7 +284,6 @@ editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 editor_text_input :: proc(e: ^Editor, text: string) {
 	if e.status != .Text do return
 	textedit.show_caret(e, true)
-	e.blink_t0 = sdl.GetTicksNS()
 	e.kind.text_input(e, text)
 }
 

@@ -105,6 +105,7 @@ Terminal_Option :: enum c.int {
 	Mode_Default       = 33,
 	Mode               = 34,
 	Scrollback_Max_Bytes = 27,
+	Resize_Pull_Scrollback = 40,
 }
 
 Terminal_Data :: enum c.int {

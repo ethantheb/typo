@@ -82,7 +82,7 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 			attachTo = .ElementWithId,
 			parentId = list.id,
 			offset = {r.x - area.x, r.y - area.y},
-			zIndex = 200, // above popups (100), below tooltips (300)
+			zIndex = 110, // above popups (100), below the context menu (120) and dialog (150)
 			pointerCaptureMode = .Passthrough,
 		},
 	}) {}

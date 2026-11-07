@@ -1,0 +1,95 @@
+diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
+index d915bcf6d..70569d1ff 100644
+--- a/src/terminal/PageList.zig
++++ b/src/terminal/PageList.zig
+@@ -1477,7 +1477,7 @@ fn resizeCols(
+ 
+     // Reflow all our rows.
+     {
+-        var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
++        var reflow_cursor: ReflowCursor = .init(first_rewritten_node, !opts.pull_scrollback);
+         while (it.next()) |row| {
+             try reflow_cursor.reflowRow(
+                 self,
+@@ -1617,6 +1617,12 @@ const ReflowCursor = struct {
+         cap: Capacity,
+     },
+ 
++    /// Whether spaces at the end of a row that doesn't wrap are trimmed
++    /// like empty cells. Set when not pulling scrollback: a pty with its own
++    /// screen buffer (Windows ConPTY) trims them when it reflows, and the
++    /// rows must wrap the same way on both sides to keep the cursor in sync.
++    trim_spaces: bool,
++
+     const StyleCache = struct {
+         src_page: ?*const Page,
+         src_id: stylepkg.Id,
+@@ -1629,7 +1635,7 @@ const ReflowCursor = struct {
+         };
+     };
+ 
+-    fn init(node: *List.Node) ReflowCursor {
++    fn init(node: *List.Node, trim_spaces: bool) ReflowCursor {
+         const page = node.page();
+         const rows = page.rows.ptr(page.memory);
+         return .{
+@@ -1647,6 +1653,7 @@ const ReflowCursor = struct {
+ 
+             .style_cache = .invalid,
+             .cap_memo = null,
++            .trim_spaces = trim_spaces,
+         };
+     }
+ 
+@@ -1667,7 +1674,8 @@ const ReflowCursor = struct {
+         var cols_len = src_page.size.cols;
+         if (!src_row.wrap) {
+             while (cols_len > 0) {
+-                if (!cells[cols_len - 1].isEmpty()) break;
++                const cell = cells[cols_len - 1];
++                if (!cell.isEmpty() and !(self.trim_spaces and cell.isBlankSpace())) break;
+                 cols_len -= 1;
+             }
+ 
+@@ -2620,7 +2628,7 @@ const ReflowCursor = struct {
+         // and we need to fix it up.
+         errdefer comptime unreachable;
+ 
+-        self.* = .init(node);
++        self.* = .init(node, self.trim_spaces);
+         self.cursorAbsolute(old_x, old_y);
+         self.total_rows = old_total_rows;
+     }
+@@ -2718,7 +2726,7 @@ const ReflowCursor = struct {
+         node.page().size.rows = 1;
+         list.pages.insertAfter(self.node, node);
+ 
+-        self.* = .init(node);
++        self.* = .init(node, self.trim_spaces);
+         self.new_rows = new_rows;
+     }
+ 
+diff --git a/src/terminal/page.zig b/src/terminal/page.zig
+index ad2b1a7e5..78a3eb491 100644
+--- a/src/terminal/page.zig
++++ b/src/terminal/page.zig
+@@ -2368,6 +2368,19 @@ pub const Cell = packed struct(u64) {
+         };
+     }
+ 
++    /// Returns true if the cell shows nothing but its background: a narrow
++    /// space, or a cell with only a background color.
++    pub fn isBlankSpace(self: Cell) bool {
++        if (self.wide != .narrow) return false;
++        return switch (self.content_tag) {
++            .codepoint => self.content.codepoint.data == ' ',
++            .codepoint_grapheme => false,
++            .bg_color_palette,
++            .bg_color_rgb,
++            => true,
++        };
++    }
++
+     pub inline fn hasGrapheme(self: Cell) bool {
+         return self.content_tag == .codepoint_grapheme;
+     }

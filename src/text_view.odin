@@ -242,7 +242,6 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 
 	primary := e.sels[e.primary]
 	primary_line := buffer.offset_to_line(&e.buf, primary.head)
-	caret_w := max(math.round(2 * scale), 1)
 
 	lines := visible_lines(e, first, last, hl_start, hl_end)
 	for l, i in lines {
@@ -287,14 +286,18 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 				if textedit.sel_lo(e.sels[j]) > end do break
 				// A caret at a line's end belongs to that line, not the next.
 				if h < l.start || h > end do continue
-				gfx.fill_rect(col_x(l.text, h - l.start, text_x, adv), y, caret_w, lh, gfx.theme.caret)
+				gfx.draw_caret(col_x(l.text, h - l.start, text_x, adv), y, lh, scale, gfx.theme.caret)
 			}
 		}
 	}
 
-	// Gutter, drawn last so horizontally scrolled text slides under it. Line
-	// numbers use a smaller font, baseline-aligned with the text.
+	// Gutter, drawn last so horizontally scrolled text slides under it; the
+	// caret line's highlight continues across it. Line numbers use a smaller
+	// font, baseline-aligned with the text.
 	gfx.fill_rect(b.x, b.y, gutter, b.h, gfx.theme.gutter)
+	if primary.anchor == primary.head && primary_line >= first && primary_line < last {
+		gfx.fill_rect(b.x, math.round(y0 + f32(primary_line - first) * lh), gutter, lh, gfx.theme.current_line)
+	}
 	num_font := gfx.text_get_font(&gfx.text_system, .Editor, gutter_font_size())
 	if num_font == nil do return
 	num_dy := text_dy + f32(ttf.GetFontAscent(font) - ttf.GetFontAscent(num_font))

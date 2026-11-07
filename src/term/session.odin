@@ -68,6 +68,14 @@ session_init :: proc(s: ^Session, cols, rows: u16, wake: Notify_Proc, wake_data:
 	if terminal_new(nil, &s.vt, s.cols, s.rows) != .Success do return false
 	scrollback: uint = SCROLLBACK_BYTES
 	terminal_set(s.vt, .Scrollback_Max_Bytes, &scrollback)
+	// ConPTY keeps its own screen without scrollback, and the two screens must
+	// stay row for row the same, or the shell draws in the wrong place: growing
+	// taller adds blank rows at the bottom instead of pulling scrollback down,
+	// and rewrapping drops trailing spaces (patches/ghostty.patch).
+	when ODIN_OS == .Windows {
+		pull := false
+		terminal_set(s.vt, .Resize_Pull_Scrollback, &pull)
+	}
 	terminal_set(s.vt, .Userdata, s)
 	terminal_set(s.vt, .Write_Pty, rawptr(Write_Pty_Fn(on_write_pty)))
 	// The cursor blinks unless a program asks for a steady one.

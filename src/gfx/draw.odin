@@ -150,6 +150,13 @@ fill_rounded_rect :: proc(b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Col
 	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
 }
 
+// A text caret at (x, y), h tall (pixels): a bar with rounded ends.
+draw_caret :: proc(x, y, h, scale: f32, c: clay.Color) {
+	w := max(math.round(2 * scale), 2)
+	inset := math.round(scale)
+	fill_rounded_rect({x, y + inset, w, h - 2 * inset}, {w / 2, w / 2, w / 2, w / 2}, c)
+}
+
 draw_border :: proc(b: clay.BoundingBox, r: clay.CornerRadius, w: clay.BorderWidth, c: clay.Color, scale: f32) {
 	left, right, top, bottom := f32(w.left) * scale, f32(w.right) * scale, f32(w.top) * scale, f32(w.bottom) * scale
 

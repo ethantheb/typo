@@ -11,8 +11,9 @@ import "core:time"
 import sdl "../../vendor/sdl3"
 import ttf "../../vendor/sdl3/ttf"
 
-// Font families: the bundled IBM Plex Mono (editor and terminal) and IBM Plex
-// Sans (rendered Markdown), and the fonts installed on the system. Installed fonts are found by a
+// Font families: the bundled IBM Plex Mono (editor and terminal), Instrument
+// Sans (UI and rendered Markdown) and IBM Plex Sans (another choice for
+// Markdown), and the fonts installed on the system. Installed fonts are found by a
 // background thread that opens every file in the system font folders. It runs
 // the first time the list is needed (to load a configured family that isn't
 // bundled, which shows the bundled font until then) and again each time the font
@@ -20,7 +21,8 @@ import ttf "../../vendor/sdl3/ttf"
 // until the new one is ready.
 
 BUNDLED_FAMILY :: "IBM Plex Mono"
-BUNDLED_MD_FAMILY :: "IBM Plex Sans"
+BUNDLED_MD_FAMILY :: "Instrument Sans"
+BUNDLED_PLEX_SANS :: "IBM Plex Sans"
 
 // Where to load a font from.
 Font_Source :: struct {
@@ -55,6 +57,15 @@ BUNDLED_FACES := [?]Font_Face {
 }
 
 BUNDLED_MD_FACES := [?]Font_Face {
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Regular.ttf")}, 400, false},
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-SemiBold.ttf")}, 600, false},
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Bold.ttf")}, 700, false},
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Italic.ttf")}, 400, true},
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-BoldItalic.ttf")}, 700, true},
+	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Medium.ttf")}, 500, false},
+}
+
+BUNDLED_PLEX_SANS_FACES := [?]Font_Face {
 	{{data = #load("../../assets/fonts/IBMPlexSans-Regular.ttf")}, 400, false},
 	{{data = #load("../../assets/fonts/IBMPlexSans-SemiBold.ttf")}, 600, false},
 	{{data = #load("../../assets/fonts/IBMPlexSans-Bold.ttf")}, 700, false},
@@ -196,16 +207,20 @@ font_family_names :: proc(sf: ^System_Fonts) -> []string {
 // installed family.
 markdown_family_names :: proc(sf: ^System_Fonts) -> []string {
 	names := make([dynamic]string, 0, len(sf.families) + 2, context.temp_allocator)
-	append(&names, BUNDLED_MD_FAMILY, BUNDLED_FAMILY)
+	append(&names, BUNDLED_MD_FAMILY, BUNDLED_PLEX_SANS, BUNDLED_FAMILY)
 	for f in sf.families do append(&names, f.name)
 	return names[:]
 }
 
 // Whether `family` is known to be unavailable, so a bundled font is shown instead.
 font_family_missing :: proc(sf: ^System_Fonts, family: string) -> bool {
-	if family == BUNDLED_FAMILY || family == BUNDLED_MD_FAMILY || !sf.scanned do return false
+	if is_bundled_family(family) || !sf.scanned do return false
 	for f in sf.families do if f.name == family do return false
 	return true
+}
+
+is_bundled_family :: proc(family: string) -> bool {
+	return family == BUNDLED_FAMILY || family == BUNDLED_MD_FAMILY || family == BUNDLED_PLEX_SANS
 }
 
 // The faces of `family`, or nil (with found = false) while the installed fonts
@@ -215,6 +230,7 @@ family_faces :: proc(sf: ^System_Fonts, family: string) -> (faces: []Font_Face, 
 	switch family {
 	case BUNDLED_FAMILY:    return BUNDLED_FACES[:], true
 	case BUNDLED_MD_FAMILY: return BUNDLED_MD_FACES[:], true
+	case BUNDLED_PLEX_SANS: return BUNDLED_PLEX_SANS_FACES[:], true
 	}
 	for &f in sf.families do if f.name == family do return f.faces[:], true
 	return nil, false
@@ -357,7 +373,7 @@ open_face :: proc(path: cstring, index: i64) -> ^ttf.Font {
 add_face :: proc(found: ^[dynamic]Font_Family, font: ^ttf.Font, path: string, index: i64, weight: int) {
 	name := string(ttf.GetFontFamilyName(font))
 	style := strings.to_lower(string(ttf.GetFontStyleName(font)), context.temp_allocator)
-	if name == "" || name == BUNDLED_FAMILY || name == BUNDLED_MD_FAMILY do return
+	if name == "" || is_bundled_family(name) do return
 	italic := strings.contains(style, "italic") || strings.contains(style, "oblique")
 	family: ^Font_Family
 	for &f in found do if f.name == name do family = &f

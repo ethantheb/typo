@@ -62,6 +62,27 @@ workspace_destroy :: proc(ws: ^Workspace) {
 	ws^ = {}
 }
 
+// Reads the tree again after files changed, keeping open folders open.
+workspace_refresh :: proc(ws: ^Workspace) {
+	expanded := make([dynamic]string, context.temp_allocator)
+	for n, i in ws.nodes do if i > 0 && n.expanded do append(&expanded, strings.clone(n.path, context.temp_allocator))
+	workspace_open(ws, strings.clone(ws.root, context.temp_allocator))
+	workspace_expand(ws, expanded[:])
+}
+
+// Expands the folders at `paths`, parents listed before their children.
+workspace_expand :: proc(ws: ^Workspace, paths: []string) {
+	// A parent comes before its children, so each is loaded by its turn.
+	for path in paths {
+		for n, i in ws.nodes {
+			if n.is_dir && !n.expanded && n.path == path {
+				workspace_toggle(ws, i)
+				break
+			}
+		}
+	}
+}
+
 // Expands or collapses a directory, reading its contents on first expand.
 workspace_toggle :: proc(ws: ^Workspace, index: int) {
 	if !ws.nodes[index].is_dir do return

@@ -97,10 +97,10 @@ test_fuzzy :: proc(t: ^testing.T) {
 
 @(test)
 test_shell_display_name :: proc(t: ^testing.T) {
-	testing.expect_value(t, shell_display_name("pwsh -NoLogo"), "POWERSHELL")
-	testing.expect_value(t, shell_display_name(`"C:\Program Files\Git\bin\bash.exe" --login`), "BASH")
-	testing.expect_value(t, shell_display_name("/bin/zsh"), "ZSH")
-	testing.expect_value(t, shell_display_name(""), "TERMINAL")
+	testing.expect_value(t, shell_display_name("pwsh -NoLogo"), "PowerShell")
+	testing.expect_value(t, shell_display_name(`"C:\Program Files\Git\bin\bash.exe" --login`), "bash")
+	testing.expect_value(t, shell_display_name("/bin/zsh"), "zsh")
+	testing.expect_value(t, shell_display_name(""), "Terminal")
 }
 
 @(test)

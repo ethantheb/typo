@@ -241,3 +241,49 @@ test_cursor_blink_default :: proc(t: ^testing.T) {
 	terminal_vt_write(s.vt, raw_data(reset), len(reset))
 	testing.expect(t, blinking(&s))
 }
+
+// On Windows, growing taller adds blank rows at the bottom, as ConPTY does,
+// instead of pulling scrollback down: the cursor keeps its row.
+@(test)
+test_grow_keeps_cursor_row :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+	s: Session
+	noop :: proc "contextless" (userdata: rawptr) {}
+	session_init(&s, 20, 4, noop, nil)
+	defer session_destroy(&s)
+	text := "a\r\nb\r\nc\r\nd\r\ne\r\nf"
+	terminal_vt_write(s.vt, raw_data(text), len(text))
+	session_resize(&s, 20, 8, 10, 20)
+
+	render_state_update(s.render, s.vt)
+	c := init_sized(Render_Cursor)
+	render_state_get(s.render, .Cursor, &c)
+	testing.expect_value(t, c.viewport_y, 3)
+	lines := screen_text(&s)
+	testing.expect_value(t, lines[0], "c")
+	testing.expect_value(t, lines[4], "")
+}
+
+// On Windows, a narrower terminal rewraps lines without their trailing spaces,
+// as ConPTY does: PowerShell pads table output to the full width, and those
+// spaces must not become extra rows here.
+@(test)
+test_narrow_trims_trailing_spaces :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+	s: Session
+	noop :: proc "contextless" (userdata: rawptr) {}
+	session_init(&s, 20, 4, noop, nil)
+	defer session_destroy(&s)
+	text := "abcdefg            \r\nx"
+	terminal_vt_write(s.vt, raw_data(text), len(text))
+	session_resize(&s, 5, 4, 10, 20)
+
+	render_state_update(s.render, s.vt)
+	c := init_sized(Render_Cursor)
+	render_state_get(s.render, .Cursor, &c)
+	testing.expect_value(t, c.viewport_y, 2)
+	lines := screen_text(&s)
+	testing.expect_value(t, lines[0], "abcde")
+	testing.expect_value(t, lines[1], "fg")
+	testing.expect_value(t, lines[2], "x")
+}
