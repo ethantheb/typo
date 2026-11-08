@@ -9,19 +9,24 @@ import "../buffer"
 import "../markdown"
 import "../syntax"
 
-// --- Selections -------------------------------------------------------------------
+// --- Selections --------------------------------------------------------------------
 
 sel_lo :: proc(s: Selection) -> int {return min(s.anchor, s.head)}
 sel_hi :: proc(s: Selection) -> int {return max(s.anchor, s.head)}
 
+
 // Sorts selections and merges any that overlap (or are identical carets),
-// keeping track of which one is primary.
+// keeping track of which one is primary
 normalize :: proc(v: ^View) {
 	if len(v.sels) == 0 do return
-	if v.kind != nil && v.kind.snap != nil do v.kind.snap(v)
-	primary_head := v.sels[v.primary].head
-	slice.sort_by(v.sels[:], proc(a, b: Selection) -> bool {return sel_lo(a) < sel_lo(b)})
+	if v.kind != nil && v.kind.snap != nil {
+		v.kind.snap(v)
+	}
 
+	primary_head := v.sels[v.primary].head
+	slice.sort_by(v.sels[:], starts_before)
+
+	// Merge
 	out := 0
 	for i in 1 ..< len(v.sels) {
 		cur := &v.sels[out]
@@ -29,7 +34,7 @@ normalize :: proc(v: ^View) {
 		overlaps := sel_lo(next) < sel_hi(cur^) || sel_lo(next) == sel_lo(cur^)
 		if overlaps {
 			lo, hi := min(sel_lo(cur^), sel_lo(next)), max(sel_hi(cur^), sel_hi(next))
-			// Keep the direction of the existing selection.
+			// Keep the direction of the existing selection
 			if cur.head >= cur.anchor {
 				cur^ = {lo, hi, -1}
 			} else {
@@ -42,6 +47,7 @@ normalize :: proc(v: ^View) {
 	}
 	resize(&v.sels, out + 1)
 
+	// The primary is the one holding its caret
 	v.primary = 0
 	for s, i in v.sels {
 		if sel_lo(s) <= primary_head && primary_head <= sel_hi(s) {
@@ -51,6 +57,13 @@ normalize :: proc(v: ^View) {
 	}
 }
 
+
+@(private = "file")
+starts_before :: proc(a, b: Selection) -> bool {
+	return sel_lo(a) < sel_lo(b)
+}
+
+
 set_single_selection :: proc(v: ^View, s: Selection) {
 	clear(&v.sels)
 	append(&v.sels, s)
@@ -58,10 +71,12 @@ set_single_selection :: proc(v: ^View, s: Selection) {
 	normalize(v)
 }
 
-// Index of the first selection that ends at or after `offset`.
+
+// Index of the first selection that ends at or after `offset`
 first_selection_at :: proc(v: ^View, offset: int) -> int {
 	return first_selection_in(v.sels[:], offset)
 }
+
 
 first_selection_in :: proc(sels: []Selection, offset: int) -> int {
 	lo, hi := 0, len(sels)
@@ -76,41 +91,53 @@ first_selection_in :: proc(sels: []Selection, offset: int) -> int {
 	return lo
 }
 
+
 selection_ranges :: proc(v: ^View) -> [][2]int {
 	ranges := make([][2]int, len(v.sels), context.temp_allocator)
 	for s, i in v.sels do ranges[i] = {sel_lo(s), sel_hi(s)}
 	return ranges
 }
 
-// --- Text helpers -----------------------------------------------------------------
 
-// Content of a line (without its line ending), capped at MAX_LINE_SCAN bytes.
+// --- Text helpers ------------------------------------------------------------------
+
+// Content of a line (without its line ending), capped at MAX_LINE_SCAN bytes
 line_text :: proc(v: ^View, line: int) -> (text: string, start: int) {
 	start = buffer.line_start(&v.buf, line)
 	end := min(buffer.line_end(&v.buf, line), start + MAX_LINE_SCAN)
 	return string(buffer.read_alloc(&v.buf, start, end)), start
 }
 
-// [lo, hi) of a whole line including its line break.
+
+// [lo, hi) of a whole line including its line break
 line_span :: proc(v: ^View, line: int) -> (lo, hi: int) {
 	lo = buffer.line_start(&v.buf, line)
-	hi = line + 1 < buffer.line_count(&v.buf) ? buffer.line_start(&v.buf, line + 1) : buffer.length(&v.buf)
+	if line + 1 < buffer.line_count(&v.buf) {
+		hi = buffer.line_start(&v.buf, line + 1)
+	} else {
+		hi = buffer.length(&v.buf)
+	}
 	return
 }
 
-// Length of a line's leading spaces and tabs.
+
+// Length of a line's leading spaces and tabs
 indent_len :: proc(text: string) -> int {
 	n := 0
-	for n < len(text) && (text[n] == ' ' || text[n] == '\t') do n += 1
+	for n < len(text) && (text[n] == ' ' || text[n] == '\t') {
+		n += 1
+	}
 	return n
 }
 
-// The visual column after character `r` at column `col` (tabs jump to the next stop).
+
+// The visual column after character `r` at column `col` (tabs jump to the next stop)
 next_col :: proc(col: int, r: rune) -> int {
 	return r == '\t' ? (col / TAB_WIDTH + 1) * TAB_WIDTH : col + 1
 }
 
-// Visual column of byte index i in a line, with tabs expanded.
+
+// Visual column of byte index i in a line, with tabs expanded
 visual_col :: proc(text: string, i: int) -> int {
 	col := 0
 	for r, j in text {
@@ -120,13 +147,14 @@ visual_col :: proc(text: string, i: int) -> int {
 	return col
 }
 
-// Byte index in a line nearest to visual column `col`.
+
+// Byte index in a line nearest to visual column `col`
 byte_at_col :: proc(text: string, col: int) -> int {
 	c := 0
 	for r, j in text {
 		next := next_col(c, r)
 		if col < next {
-			// Inside a wide character (tab): snap to the nearer edge.
+			// Inside a wide character (tab): snap to the nearer edge
 			return col - c <= next - col ? j : j + utf8.rune_size(r)
 		}
 		c = next
@@ -134,32 +162,44 @@ byte_at_col :: proc(text: string, col: int) -> int {
 	return len(text)
 }
 
-// Offset of the character boundary before `offset`, treating "\r\n" as one.
+
+// Offset of the character boundary before `offset`, treating "\r\n" as one
 prev_boundary :: proc(v: ^View, offset: int) -> int {
 	if offset <= 0 do return 0
+
 	buf: [4]u8
 	lo := max(offset - 4, 0)
 	b := buffer.read(&v.buf, lo, offset, buf[:])
-	if b[len(b) - 1] == '\n' && len(b) >= 2 && b[len(b) - 2] == '\r' do return offset - 2
+	if b[len(b) - 1] == '\n' && len(b) >= 2 && b[len(b) - 2] == '\r' {
+		return offset - 2
+	}
+
 	_, size := utf8.decode_last_rune(b)
 	return offset - max(size, 1)
 }
 
+
 next_boundary :: proc(v: ^View, offset: int) -> int {
 	n := buffer.length(&v.buf)
 	if offset >= n do return n
+
 	buf: [4]u8
 	b := buffer.read(&v.buf, offset, min(offset + 4, n), buf[:])
-	if b[0] == '\r' && len(b) >= 2 && b[1] == '\n' do return offset + 2
+	if b[0] == '\r' && len(b) >= 2 && b[1] == '\n' {
+		return offset + 2
+	}
+
 	_, size := utf8.decode_rune(b)
 	return offset + max(size, 1)
 }
+
 
 Char_Class :: enum {
 	Space,
 	Word,
 	Punct,
 }
+
 
 char_class :: proc(c: u8) -> Char_Class {
 	switch c {
@@ -171,52 +211,72 @@ char_class :: proc(c: u8) -> Char_Class {
 	return .Punct
 }
 
+
 // Word boundary left/right of `offset`, staying within the line unless already
-// at its edge (then it moves to the adjacent line).
+// at its edge (then it moves to the adjacent line)
 word_boundary :: proc(v: ^View, offset: int, dir: int) -> int {
 	line := buffer.offset_to_line(&v.buf, offset)
 	text, start := line_text(v, line)
 	i := offset - start
+
 	if dir < 0 {
 		if i <= 0 do return prev_boundary(v, offset)
-		for i > 0 && char_class(text[i - 1]) == .Space do i -= 1
+
+		for i > 0 && char_class(text[i - 1]) == .Space {
+			i -= 1
+		}
 		if i > 0 {
 			class := char_class(text[i - 1])
-			for i > 0 && char_class(text[i - 1]) == class do i -= 1
+			for i > 0 && char_class(text[i - 1]) == class {
+				i -= 1
+			}
 		}
 	} else {
 		if i >= len(text) do return next_boundary(v, offset)
-		for i < len(text) && char_class(text[i]) == .Space do i += 1
+
+		for i < len(text) && char_class(text[i]) == .Space {
+			i += 1
+		}
 		if i < len(text) {
 			class := char_class(text[i])
-			for i < len(text) && char_class(text[i]) == class do i += 1
+			for i < len(text) && char_class(text[i]) == class {
+				i += 1
+			}
 		}
 	}
 	return start + i
 }
 
-// The word (or run of punctuation/space) around offset, for double-click.
+
+// The word (or run of punctuation/space) around offset, for double-click
 word_at :: proc(v: ^View, offset: int) -> (lo, hi: int) {
 	line := buffer.offset_to_line(&v.buf, offset)
 	text, start := line_text(v, line)
 	i := offset - start
 	if len(text) == 0 do return offset, offset
+
 	probe := min(i, len(text) - 1)
 	class := char_class(text[probe])
 	a, b := probe, probe
-	for a > 0 && char_class(text[a - 1]) == class do a -= 1
-	for b < len(text) && char_class(text[b]) == class do b += 1
+	for a > 0 && char_class(text[a - 1]) == class {
+		a -= 1
+	}
+	for b < len(text) && char_class(text[b]) == class {
+		b += 1
+	}
 	return start + a, start + b
 }
 
-// --- Editing ------------------------------------------------------------------------
+
+// --- Editing -----------------------------------------------------------------------
 
 // Replaces ranges[i] with texts[i] (or texts[0] for all) as one undo step and
 // leaves a caret after each insertion. Ranges must be sorted; overlapping ones
-// are merged first.
+// are merged first
 apply :: proc(v: ^View, kind: buffer.Edit_Kind, ranges: [][2]int, texts: []string) {
 	assert(len(ranges) == len(v.sels))
-	// Merge overlapping ranges (e.g. word deletes from adjacent carets).
+
+	// Merge overlapping ranges (e.g. word deletes from adjacent carets)
 	merged := make([dynamic][2]int, 0, len(ranges), context.temp_allocator)
 	merged_texts := make([dynamic]string, 0, len(ranges), context.temp_allocator)
 	primary := 0
@@ -231,6 +291,7 @@ apply :: proc(v: ^View, kind: buffer.Edit_Kind, ranges: [][2]int, texts: []strin
 		if i == v.primary do primary = len(merged) - 1
 	}
 
+	// Replace each, with a caret after it
 	buffer.begin(&v.buf, kind, now(), v.sels[:])
 	clear(&v.sels)
 	delta := 0
@@ -242,27 +303,32 @@ apply :: proc(v: ^View, kind: buffer.Edit_Kind, ranges: [][2]int, texts: []strin
 		append(&v.sels, Selection{caret, caret, -1})
 		delta += len(t) - (hi - lo)
 	}
+
 	v.primary = primary
 	normalize(v)
 	buffer.end(&v.buf, v.sels[:])
 	v.reveal = true
 }
 
+
 // The time (ns) an edit is stamped with (buffer.begin), to tell which ones are
-// close enough to merge. Every edit to a view's buffer uses it.
+// close enough to merge. Every edit to a view's buffer uses it
 now :: proc() -> u64 {
 	return u64(time.tick_now()._nsec)
 }
+
 
 insert :: proc(v: ^View, text: string, kind := buffer.Edit_Kind.Typing) {
 	apply(v, kind, selection_ranges(v), {text})
 }
 
-// Backspace/Delete: removes the selection, or the character/word next to each caret.
+
+// Backspace/Delete: removes the selection, or the character/word next to each caret
 delete_text :: proc(v: ^View, dir: int, word: bool) {
 	ranges := selection_ranges(v)
 	for &r, i in ranges {
 		if r[0] != r[1] do continue
+
 		h := v.sels[i].head
 		if dir < 0 {
 			r[0] = word ? word_boundary(v, h, -1) : prev_boundary(v, h)
@@ -273,7 +339,8 @@ delete_text :: proc(v: ^View, dir: int, word: bool) {
 	apply(v, .Deleting, ranges, {""})
 }
 
-// --- Drawing helpers ----------------------------------------------------------------
+
+// --- Drawing helpers ---------------------------------------------------------------
 
 Run :: struct {
 	text:  string,
@@ -282,6 +349,7 @@ Run :: struct {
 	style: markdown.Text_Styles,
 }
 
+
 // Splits the part of a line covering visual columns [first_col, first_col+count)
 // into runs of one highlight and style, with tabs expanded to spaces. Whitespace
 // joins the current run (it draws nothing), so runs break only where the color
@@ -289,14 +357,23 @@ Run :: struct {
 // is uncolored. line_style may be nil. A character the font lacks (`has_glyph`
 // false) is drawn by a fallback font with its own advance, so it gets a run of
 // its own, keeping later columns on the grid. With letter spacing (`spaced`)
-// every character is a run of its own.
-visible_runs :: proc(text: string, line_hl: []syntax.Highlight, line_style: []markdown.Text_Styles, first_col, count: int, spaced: bool, has_glyph: proc(r: rune) -> bool) -> []Run {
+// every character is a run of its own
+visible_runs :: proc(
+	text: string,
+	line_hl: []syntax.Highlight,
+	line_style: []markdown.Text_Styles,
+	first_col, count: int,
+	spaced: bool,
+	has_glyph: proc(r: rune) -> bool,
+) -> []Run {
 	Span :: struct {
 		lo, hi: int, // into sb
 		col:    int,
 		hl:     syntax.Highlight,
 		style:  markdown.Text_Styles,
 	}
+
+	// The characters in view, as spans of text with tabs expanded
 	spans := make([dynamic]Span, context.temp_allocator)
 	sb := strings.builder_make(context.temp_allocator)
 	open := false // the last span may be extended
@@ -311,9 +388,17 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, line_style: []ma
 		st := i < len(line_style) ? line_style[i] : {}
 		own := !spaced && has_glyph(r)
 		space := r == ' ' || r == '\t'
-		if !open || !own || (!space && (h != spans[len(spans) - 1].hl || st != spans[len(spans) - 1].style)) {
+
+		// A new span, unless this character continues the last one
+		new_span := !open || !own
+		if !new_span && !space {
+			last := &spans[len(spans) - 1]
+			new_span = h != last.hl || st != last.style
+		}
+		if new_span {
 			append(&spans, Span{len(sb.buf), len(sb.buf), col, h, st})
 		}
+
 		if r == '\t' {
 			for _ in col ..< next do strings.write_byte(&sb, ' ')
 		} else {
@@ -323,10 +408,13 @@ visible_runs :: proc(text: string, line_hl: []syntax.Highlight, line_style: []ma
 		open = own
 	}
 
+	// The spans that draw something
 	runs := make([dynamic]Run, 0, len(spans), context.temp_allocator)
 	for span in spans {
 		run := string(sb.buf[span.lo:span.hi])
-		if len(strings.trim_space(run)) > 0 do append(&runs, Run{run, span.col, span.hl, span.style})
+		if len(strings.trim_space(run)) > 0 {
+			append(&runs, Run{run, span.col, span.hl, span.style})
+		}
 	}
 	return runs[:]
 }

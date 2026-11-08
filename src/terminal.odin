@@ -16,19 +16,22 @@ import "gfx"
 // Each frame, terminal_frame feeds pending shell output to the terminal and
 // refreshes a per-row cache (text runs and background runs with resolved
 // colors) for the rows libghostty-vt reports as changed. Drawing only walks
-// that cache, so an unchanged terminal costs almost nothing per frame.
+// that cache, so an unchanged terminal costs almost nothing per frame
+
 
 TERMINAL_PUMP_BUDGET :: 4 * time.Millisecond
-TERMINAL_PADDING :: 8 // logical pixels around the cell grid
+TERMINAL_PADDING     :: 8 // logical pixels around the cell grid
 
 Terminal :: struct {
 	session:     term.Session,
 	initialized: bool,
 	spawned:     bool, // a shell has been started at least once
+
 	// Shown in titles, e.g. "PowerShell". A fixed buffer: restarting sets it
-	// while this frame's render commands may still point at it.
+	// while this frame's render commands may still point at it
 	shell_name:  [32]u8,
 	shell_len:   int,
+
 	busy:        bool, // output is still waiting to be parsed
 	full_redraw: bool, // colors changed: rebuild every row
 	rows:        [dynamic]Term_Row,
@@ -37,8 +40,8 @@ Terminal :: struct {
 	view:        gfx.Rect, // cell grid area from the last layout
 	cell_w:      f32,
 	cell_h:      f32,
-	selecting:   bool, // left button went down on the grid and selects text
-	reporting:   bool, // left button went down on the grid and is sent to the program
+	selecting:   bool,   // left button went down on the grid and selects text
+	reporting:   bool,   // left button went down on the grid and is sent to the program
 	last_cell:   [2]int, // cell under the pointer at the last mouse report
 }
 
@@ -65,16 +68,19 @@ Term_Row :: struct {
 	sel:   [2]int,        // selected columns, inclusive, or {-1, -1}
 }
 
-// --- Lifecycle ---------------------------------------------------------------
+
+// --- Lifecycle ---------------------------------------------------------------------
 
 // Creates the terminal state; the shell starts on the first frame it is shown,
-// once its size is known.
+// once its size is known
 terminal_init :: proc(t: ^Terminal) -> bool {
 	if t.initialized do return true
+
 	t.initialized = term.session_init(&t.session, 80, 24, wake_main_loop, nil)
 	terminal_apply_theme(t)
 	return t.initialized
 }
+
 
 terminal_destroy :: proc(t: ^Terminal) {
 	if t.initialized do term.session_destroy(&t.session)
@@ -83,14 +89,18 @@ terminal_destroy :: proc(t: ^Terminal) {
 	t^ = {}
 }
 
+
 terminal_start_shell :: proc(t: ^Terminal) {
 	shell := g.settings.terminal_shell != "" ? g.settings.terminal_shell : term.default_shell()
 	t.shell_len = copy(t.shell_name[:], shell_display_name(shell))
+
 	if !term.session_spawn(&t.session, shell, g.workspace.root, g.settings.bundled_conpty) {
-		term.session_print_notice(&t.session, "Could not start the shell. Press Enter to try again.")
+		notice := "Could not start the shell. Press Enter to try again."
+		term.session_print_notice(&t.session, notice)
 	}
 	t.spawned = true
 }
+
 
 terminal_restart :: proc(t: ^Terminal) {
 	term.session_kill(&t.session)
@@ -98,14 +108,18 @@ terminal_restart :: proc(t: ^Terminal) {
 	terminal_start_shell(t)
 }
 
+
 terminal_title :: proc(t: ^Terminal) -> string {
 	return t.shell_len > 0 ? string(t.shell_name[:t.shell_len]) : "Terminal"
 }
 
+
 // The program a shell command line runs, for titles: its first word (or quoted
-// path) without directory or extension.
+// path) without directory or extension
 shell_display_name :: proc(command: string) -> string {
 	cmd := strings.trim_space(command)
+
+	// The first word, or the quoted path
 	program := cmd
 	if strings.has_prefix(cmd, `"`) {
 		end := strings.index_byte(cmd[1:], '"')
@@ -113,8 +127,15 @@ shell_display_name :: proc(command: string) -> string {
 	} else if space := strings.index_byte(cmd, ' '); space >= 0 {
 		program = cmd[:space]
 	}
-	if slash := strings.last_index_any(program, `/\`); slash >= 0 do program = program[slash + 1:]
-	if dot := strings.last_index_byte(program, '.'); dot > 0 do program = program[:dot]
+
+	// Without directory or extension
+	if slash := strings.last_index_any(program, `/\`); slash >= 0 {
+		program = program[slash + 1:]
+	}
+	if dot := strings.last_index_byte(program, '.'); dot > 0 {
+		program = program[:dot]
+	}
+
 	switch strings.to_lower(program, context.temp_allocator) {
 	case "pwsh", "powershell": return "PowerShell"
 	case "":                   return "Terminal"
@@ -122,13 +143,16 @@ shell_display_name :: proc(command: string) -> string {
 	return program
 }
 
-// Terminal colors follow the editor theme.
+
+// Terminal colors follow the editor theme
 terminal_apply_theme :: proc(t: ^Terminal) {
 	if !t.initialized do return
+
 	palette: [256]term.Color_Rgb
 	term.color_palette_default(&palette[0])
 	for c, i in gfx.theme.ansi do palette[i] = to_rgb(c)
 	fg, bg, cursor := to_rgb(gfx.theme.text), to_rgb(gfx.theme.bg), to_rgb(gfx.theme.caret)
+
 	vt := t.session.vt
 	term.terminal_set(vt, .Color_Palette, &palette)
 	term.terminal_set(vt, .Color_Foreground, &fg)
@@ -137,20 +161,23 @@ terminal_apply_theme :: proc(t: ^Terminal) {
 	t.full_redraw = true
 }
 
+
 @(private = "file")
 to_rgb :: proc(c: clay.Color) -> term.Color_Rgb {
 	return {u8(c.r), u8(c.g), u8(c.b)}
 }
+
 
 @(private = "file")
 to_color :: proc(c: term.Color_Rgb) -> clay.Color {
 	return {f32(c.r), f32(c.g), f32(c.b), 255}
 }
 
-// --- Per frame ---------------------------------------------------------------
+
+// --- Per frame ---------------------------------------------------------------------
 
 // Parses pending output, and while visible, sizes the grid to its element,
-// handles the mouse and refreshes the row cache.
+// handles the mouse and refreshes the row cache
 terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interactive: bool) {
 	s := &t.session
 	busy, exited := term.session_pump(s, TERMINAL_PUMP_BUDGET)
@@ -160,22 +187,31 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 
 	t.cell_w = editor_char_width()
 	t.cell_h = f32(editor_line_height())
+
 	if r, ok := element_rect(element); ok {
-		t.view = {r.x + TERMINAL_PADDING, r.y + TERMINAL_PADDING / 2, r.w - TERMINAL_PADDING * 2, r.h - TERMINAL_PADDING}
+		t.view = {
+			r.x + TERMINAL_PADDING,
+			r.y + TERMINAL_PADDING / 2,
+			r.w - TERMINAL_PADDING * 2,
+			r.h - TERMINAL_PADDING,
+		}
+
 		// While panes move, the grid keeps its size until they settle, so the
-		// shell isn't sent a resize every frame.
+		// shell isn't sent a resize every frame
 		if !g.animating || !t.spawned {
 			cols := u16(max(t.view.w / t.cell_w, 2))
 			rows := u16(max(t.view.h / t.cell_h, 1))
 			term.session_resize(s, cols, rows, u32(t.cell_w * gfx.scale), u32(t.cell_h * gfx.scale))
 		}
-		// The shell starts once the real size is known, so it never sees 80x24.
+
+		// The shell starts once the real size is known, so it never sees 80x24
 		if !t.spawned do terminal_start_shell(t)
 	}
 
 	if interactive do terminal_mouse(t, element)
 	update_rows(t)
 }
+
 
 @(private = "file")
 update_rows :: proc(t: ^Terminal) {
@@ -186,6 +222,7 @@ update_rows :: proc(t: ^Terminal) {
 	t.colors = term.init_sized(term.Render_Colors)
 	term.render_state_get(s.render, .Colors, &t.colors)
 
+	// As many cached rows as the grid has
 	n: u16
 	term.render_state_get(s.render, .Rows, &n)
 	for len(t.rows) > int(n) {
@@ -198,17 +235,24 @@ update_rows :: proc(t: ^Terminal) {
 	dirty: term.Render_Dirty
 	term.render_state_get(s.render, .Dirty, &dirty)
 	full := dirty == .Full || t.full_redraw || resized
-	if dirty == .False && !full do return
+	if dirty == .False && !full {
+		return
+	}
 
+	// Rebuild the rows that changed
 	term.render_state_get(s.render, .Row_Iterator, &s.row_iter)
 	for y := 0; term.render_state_row_iterator_next(s.row_iter) && y < len(t.rows); y += 1 {
 		row_dirty: bool
 		term.render_state_row_get(s.row_iter, .Dirty, &row_dirty)
-		if full || row_dirty do build_row(t, &t.rows[y])
+		if full || row_dirty {
+			build_row(t, &t.rows[y])
+		}
 	}
+
 	term.render_state_clean(s.render)
 	t.full_redraw = false
 }
+
 
 @(private = "file")
 row_destroy :: proc(row: ^Term_Row) {
@@ -218,11 +262,12 @@ row_destroy :: proc(row: ^Term_Row) {
 	delete(row.cells)
 }
 
+
 // Reads one row from the render state into its cache: background runs, and
 // text runs that each share a color and font. Blank cells extend the current
 // run as spaces; a wide (2-cell) character, or one drawn by a fallback font,
 // gets a run of its own so its advance can't shift the cells after it. With
-// letter spacing every character does.
+// letter spacing every character does
 @(private = "file")
 build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 	s := &t.session
@@ -233,10 +278,12 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 
 	sel := term.init_sized(term.Row_Selection)
 	row.sel = {-1, -1}
-	if term.render_state_row_get(s.row_iter, .Selection, &sel) == .Success do row.sel = {int(sel.start_x), int(sel.end_x)}
+	has_sel := term.render_state_row_get(s.row_iter, .Selection, &sel) == .Success
+	if has_sel do row.sel = {int(sel.start_x), int(sel.end_x)}
 
 	default_fg, default_bg := to_color(t.colors.foreground), to_color(t.colors.background)
 	term.render_state_row_get(s.row_iter, .Cells, &s.cells)
+
 	open := false // the last run may still be extended
 	for col := 0; term.render_state_row_cells_next(s.cells); col += 1 {
 		raw: term.Cell
@@ -249,10 +296,12 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		}
 		cells := wide == .Wide ? 2 : 1
 
+		// Its style and colors
 		style := term.init_sized(term.Style)
 		has_style: bool
 		term.render_state_row_cells_get(s.cells, .Has_Styling, &has_style)
 		if has_style do term.render_state_row_cells_get(s.cells, .Style, &style)
+
 		fg_rgb, bg_rgb: term.Color_Rgb
 		has_fg := term.render_state_row_cells_get(s.cells, .Fg_Color, &fg_rgb) == .Success
 		has_bg := term.render_state_row_cells_get(s.cells, .Bg_Color, &bg_rgb) == .Success
@@ -264,8 +313,13 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		}
 		if style.faint do fg.a = 140
 
+		// The background extends the last run of its color, or starts one
 		if has_bg {
-			if last := len(row.bgs) - 1; last >= 0 && row.bgs[last].col + row.bgs[last].count == col && row.bgs[last].color == bg {
+			last := len(row.bgs) - 1
+			extends := last >= 0 &&
+			           row.bgs[last].col + row.bgs[last].count == col &&
+			           row.bgs[last].color == bg
+			if extends {
 				row.bgs[last].count += cells
 			} else {
 				append(&row.bgs, Term_Bg{col, cells, bg})
@@ -276,8 +330,9 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		term.render_state_row_cells_get(s.cells, .Graphemes_Len, &n)
 		if n == 0 || style.invisible {
 			append(&row.cells, 0)
+
 			// A blank continues the open run as a space (spaces draw nothing,
-			// so the run's color doesn't matter for them).
+			// so the run's color doesn't matter for them)
 			if open {
 				r := &row.runs[len(row.runs) - 1]
 				if r.end_col == col {
@@ -289,21 +344,42 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 			continue
 		}
 
+		// Its codepoints
 		cps_buf: [8]u32
 		cps := cps_buf[:]
 		if n > len(cps_buf) do cps = make([]u32, n, context.temp_allocator)
 		term.render_state_row_cells_get(s.cells, .Graphemes_Buf, raw_data(cps))
 		append(&row.cells, rune(cps[0]))
 
+		// The open run takes it if it looks the same, else a new run starts
 		bold, underline, strike := style.bold, style.underline != 0, style.strikethrough
-		solo := cells == 2 || g.settings.letter_spacing != 0 || !gfx.font_has_own_glyph(&gfx.text_system, .Editor, rune(cps[0]))
+		solo := cells == 2 ||
+		        g.settings.letter_spacing != 0 ||
+		        !gfx.font_has_own_glyph(&gfx.text_system, .Editor, rune(cps[0]))
 		if open {
 			r := &row.runs[len(row.runs) - 1]
-			open = r.end_col == col && r.fg == fg && r.bold == bold && r.underline == underline && r.strike == strike && !solo
+			open = r.end_col == col &&
+			       r.fg == fg &&
+			       r.bold == bold &&
+			       r.underline == underline &&
+			       r.strike == strike &&
+			       !solo
 		}
 		if !open {
-			append(&row.runs, Term_Run{text = {len(row.text), len(row.text)}, col = col, end_col = col, fg = fg, bold = bold, underline = underline, strike = strike})
+			append(
+				&row.runs,
+				Term_Run {
+					text = {len(row.text), len(row.text)},
+					col = col,
+					end_col = col,
+					fg = fg,
+					bold = bold,
+					underline = underline,
+					strike = strike,
+				},
+			)
 		}
+
 		r := &row.runs[len(row.runs) - 1]
 		for cp in cps[:n] {
 			bytes, size := utf8.encode_rune(rune(cp))
@@ -315,14 +391,17 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 	}
 }
 
-// --- Drawing -----------------------------------------------------------------
+
+// --- Drawing -----------------------------------------------------------------------
 
 draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	if t.cell_w <= 0 do return
+
 	font := gfx.text_get_font(&gfx.text_system, .Editor, editor_font_size())
 	if font == nil do return
 	bold_font := gfx.text_get_font(&gfx.text_system, .Editor_Bold, editor_font_size())
 	if bold_font == nil do bold_font = font
+
 	gfx.push_clip_box(b)
 	defer gfx.pop_clip()
 
@@ -330,23 +409,30 @@ draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	adv, lh := t.cell_w * scale, t.cell_h * scale
 	text_dy := math.round((lh - f32(ttf.GetFontHeight(font))) / 2)
 	line_w := max(math.round(scale), 1)
-	cell_x :: proc(ox, adv: f32, col: int) -> f32 {return math.round(ox + f32(col) * adv)}
 
 	for &row, y in t.rows {
 		ry := math.round(oy + f32(y) * lh)
 		ry2 := math.round(oy + f32(y + 1) * lh)
+
+		// Backgrounds, then the selection
 		for bg in row.bgs {
-			x := cell_x(ox, adv, bg.col)
-			gfx.fill_rect(x, ry, cell_x(ox, adv, bg.col + bg.count) - x, ry2 - ry, bg.color)
+			x := term_cell_x(ox, adv, bg.col)
+			gfx.fill_rect(x, ry, term_cell_x(ox, adv, bg.col + bg.count) - x, ry2 - ry, bg.color)
 		}
 		if row.sel[0] >= 0 {
-			x := cell_x(ox, adv, row.sel[0])
-			gfx.fill_rect(x, ry, cell_x(ox, adv, row.sel[1] + 1) - x, ry2 - ry, gfx.theme.selection)
+			x := term_cell_x(ox, adv, row.sel[0])
+			sel_w := term_cell_x(ox, adv, row.sel[1] + 1) - x
+			gfx.fill_rect(x, ry, sel_w, ry2 - ry, gfx.theme.selection)
 		}
+
+		// Text, with its lines
 		for run in row.runs {
-			x := cell_x(ox, adv, run.col)
-			gfx.draw_text(gfx.text_get(&gfx.text_system, run.bold ? bold_font : font, string(row.text[run.text[0]:run.text[1]])), x, ry + text_dy, run.fg)
-			w := cell_x(ox, adv, run.end_col) - x
+			x := term_cell_x(ox, adv, run.col)
+			run_font := run.bold ? bold_font : font
+			text := string(row.text[run.text[0]:run.text[1]])
+			gfx.draw_text(gfx.text_get(&gfx.text_system, run_font, text), x, ry + text_dy, run.fg)
+
+			w := term_cell_x(ox, adv, run.end_col) - x
 			if run.underline do gfx.fill_rect(x, ry2 - 2 * line_w, w, line_w, run.fg)
 			if run.strike do gfx.fill_rect(x, math.round((ry + ry2) / 2), w, line_w, run.fg)
 		}
@@ -355,15 +441,30 @@ draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	draw_cursor(t, font, ox, oy, adv, lh, text_dy, line_w)
 }
 
+
+// The x of a column's left edge
+@(private = "file")
+term_cell_x :: proc(ox, adv: f32, col: int) -> f32 {
+	return math.round(ox + f32(col) * adv)
+}
+
+
 @(private = "file")
 draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, line_w: f32) {
 	c := t.cursor
-	if !c.visible || !c.viewport_has_value || int(c.viewport_y) >= len(t.rows) do return
+	if !c.visible || !c.viewport_has_value || int(c.viewport_y) >= len(t.rows) {
+		return
+	}
+
+	// Its cell, two wide on a wide character
 	col := int(c.viewport_x)
-	if c.wide_tail && col > 0 do col -= 1
+	if c.wide_tail && col > 0 {
+		col -= 1
+	}
 	row := &t.rows[c.viewport_y]
 	glyph := col < len(row.cells) ? row.cells[col] : 0
-	cells := col + 1 < len(row.cells) && glyph != 0 && row.cells[col + 1] == 0 && is_wide_rune(glyph) ? 2 : 1
+	blank_after := col + 1 < len(row.cells) && glyph != 0 && row.cells[col + 1] == 0
+	cells := blank_after && is_wide_rune(glyph) ? 2 : 1
 
 	x := math.round(ox + f32(col) * adv)
 	y := math.round(oy + f32(c.viewport_y) * lh)
@@ -371,20 +472,25 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 	h := math.round(oy + f32(c.viewport_y + 1) * lh) - y
 	color := t.colors.cursor_has_value ? to_color(t.colors.cursor) : gfx.theme.caret
 
-	// Steady: programs asking for a blinking cursor get it shown always.
+	// Steady: programs asking for a blinking cursor get it shown always
 	style := c.visual_style
 	if focused_terminal() != t do style = .Block_Hollow
+
 	switch style {
 	case .Block:
 		gfx.fill_rect(x, y, w, h, color)
 		if glyph != 0 {
 			buf, n := utf8.encode_rune(glyph)
-			gfx.draw_text(gfx.text_get(&gfx.text_system, font, string(buf[:n])), x, y + text_dy, to_color(t.colors.background))
+			text := gfx.text_get(&gfx.text_system, font, string(buf[:n]))
+			gfx.draw_text(text, x, y + text_dy, to_color(t.colors.background))
 		}
+
 	case .Bar:
 		gfx.draw_caret(x, y, h, gfx.scale, color)
+
 	case .Underline:
 		gfx.fill_rect(x, y + h - 2 * line_w, w, 2 * line_w, color)
+
 	case .Block_Hollow:
 		gfx.fill_rect(x, y, w, line_w, color)
 		gfx.fill_rect(x, y + h - line_w, w, line_w, color)
@@ -393,10 +499,19 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 	}
 }
 
-// Rough East Asian Wide / emoji test, used only to size the block cursor.
+
+// Rough East Asian Wide / emoji test, used only to size the block cursor
 @(private = "file")
 is_wide_rune :: proc(r: rune) -> bool {
-	return r >= 0x1100 && (r <= 0x115F || (r >= 0x2E80 && r <= 0xA4CF) || (r >= 0xAC00 && r <= 0xD7A3) ||
-		(r >= 0xF900 && r <= 0xFAFF) || (r >= 0xFE30 && r <= 0xFE4F) || (r >= 0xFF00 && r <= 0xFF60) ||
-		(r >= 0xFFE0 && r <= 0xFFE6) || (r >= 0x1F300 && r <= 0x1FAFF) || (r >= 0x20000 && r <= 0x3FFFD))
+	if r < 0x1100 do return false
+
+	return r <= 0x115F ||
+	       (r >= 0x2E80 && r <= 0xA4CF) ||
+	       (r >= 0xAC00 && r <= 0xD7A3) ||
+	       (r >= 0xF900 && r <= 0xFAFF) ||
+	       (r >= 0xFE30 && r <= 0xFE4F) ||
+	       (r >= 0xFF00 && r <= 0xFF60) ||
+	       (r >= 0xFFE0 && r <= 0xFFE6) ||
+	       (r >= 0x1F300 && r <= 0x1FAFF) ||
+	       (r >= 0x20000 && r <= 0x3FFFD)
 }

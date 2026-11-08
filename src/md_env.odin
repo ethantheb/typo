@@ -5,7 +5,8 @@ import "core:strings"
 import sdl "../vendor/sdl3"
 import "mdview"
 
-// Connects the rendered Markdown view (package mdview) to the app's state.
+// Connects the rendered Markdown view (package mdview) to the app's state
+
 
 md_env_init :: proc() {
 	mdview.env = {
@@ -17,6 +18,7 @@ md_env_init :: proc() {
 		open_file    = md_open_file,
 	}
 }
+
 
 @(private = "file")
 md_config :: proc() -> mdview.Config {
@@ -31,17 +33,20 @@ md_config :: proc() -> mdview.Config {
 	}
 }
 
+
 @(private = "file")
 md_input :: proc() -> mdview.Input {
 	return {g.mouse_pos, g.mouse_down, g.mouse_pressed, sdl.GetModState(), g.frame}
 }
+
 
 @(private = "file")
 md_files :: proc() -> []string {
 	return g.finder.files[:]
 }
 
-// Opens a linked file next frame, with the caret at the heading it names.
+
+// Opens a linked file next frame, with the caret at the heading it names
 @(private = "file")
 md_open_file :: proc(path, heading: string) {
 	g.pending = Open_File(strings.clone(path))

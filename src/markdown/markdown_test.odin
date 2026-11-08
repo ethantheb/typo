@@ -10,6 +10,7 @@ import "core:time"
 import "../buffer"
 import "../syntax"
 
+
 @(private = "file")
 make_buffer :: proc(s: string) -> buffer.Buffer {
 	b: buffer.Buffer
@@ -17,13 +18,15 @@ make_buffer :: proc(s: string) -> buffer.Buffer {
 	return b
 }
 
+
 @(private = "file")
 parse_all :: proc(doc: ^Doc, b: ^buffer.Buffer) {
 	doc_open(doc, b)
 	doc_update(doc, b, max(int), time.Hour)
 }
 
-// Line kinds of `text`, parsed from scratch.
+
+// Line kinds of `text`, parsed from scratch
 @(private = "file")
 kinds :: proc(text: string) -> []Line_Kind {
 	b := make_buffer(text)
@@ -31,10 +34,12 @@ kinds :: proc(text: string) -> []Line_Kind {
 	doc: Doc
 	defer doc_destroy(&doc)
 	parse_all(&doc, &b)
+
 	out := make([]Line_Kind, len(doc.lines), context.temp_allocator)
 	for l, i in doc.lines do out[i] = l.kind
 	return out
 }
+
 
 @(private = "file")
 infos :: proc(text: string) -> []Line_Info {
@@ -43,20 +48,33 @@ infos :: proc(text: string) -> []Line_Info {
 	doc: Doc
 	defer doc_destroy(&doc)
 	parse_all(&doc, &b)
+
 	out := make([]Line_Info, len(doc.lines), context.temp_allocator)
 	copy(out, doc.lines[:])
 	return out
 }
 
+
 @(private = "file")
-expect_kinds :: proc(t: ^testing.T, text: string, want: []Line_Kind, loc := #caller_location) {
+expect_kinds :: proc(
+	t: ^testing.T,
+	text: string,
+	want: []Line_Kind,
+	loc := #caller_location,
+) {
 	got := kinds(text)
+
 	ok := len(got) == len(want)
-	if ok do for k, i in got do if k != want[i] do ok = false
+	if ok {
+		for k, i in got {
+			if k != want[i] do ok = false
+		}
+	}
 	testing.expectf(t, ok, "%q: got %v, want %v", text, got, want, loc = loc)
 }
 
-// The state after the last line of `text`.
+
+// The state after the last line of `text`
 @(private = "file")
 final_state :: proc(text: string) -> State {
 	s: State
@@ -66,13 +84,30 @@ final_state :: proc(text: string) -> State {
 	return s
 }
 
+
 @(test)
 test_headings :: proc(t: ^testing.T) {
-	expect_kinds(t, "# a\n###### b\n####### c\n#5\n#", {.Atx_Heading, .Atx_Heading, .Paragraph, .Paragraph, .Atx_Heading})
-	expect_kinds(t, "Foo\n===\nBar\n---", {.Paragraph, .Setext_Underline, .Paragraph, .Setext_Underline})
-	// Without a closing line, a first "---" is a thematic break, not front matter.
-	expect_kinds(t, "---\n\n***\n_ _ _", {.Thematic_Break, .Blank, .Thematic_Break, .Thematic_Break})
-	expect_kinds(t, "x\n\n---\n***\n_ _ _", {.Paragraph, .Blank, .Thematic_Break, .Thematic_Break, .Thematic_Break})
+	expect_kinds(
+		t,
+		"# a\n###### b\n####### c\n#5\n#",
+		{.Atx_Heading, .Atx_Heading, .Paragraph, .Paragraph, .Atx_Heading},
+	)
+	expect_kinds(
+		t,
+		"Foo\n===\nBar\n---",
+		{.Paragraph, .Setext_Underline, .Paragraph, .Setext_Underline},
+	)
+	// Without a closing line, a first "---" is a thematic break, not front matter
+	expect_kinds(
+		t,
+		"---\n\n***\n_ _ _",
+		{.Thematic_Break, .Blank, .Thematic_Break, .Thematic_Break},
+	)
+	expect_kinds(
+		t,
+		"x\n\n---\n***\n_ _ _",
+		{.Paragraph, .Blank, .Thematic_Break, .Thematic_Break, .Thematic_Break},
+	)
 	expect_kinds(t, "    # not", {.Indented_Code})
 
 	l := infos("## Title ##\nx\n===")
@@ -85,6 +120,7 @@ test_headings :: proc(t: ^testing.T) {
 	_, d, _ = parse_line({}, "# a#")
 	testing.expect_value(t, d.close, [2]i32{0, 0})
 }
+
 
 @(test)
 test_quotes_and_lazy :: proc(t: ^testing.T) {
@@ -102,16 +138,17 @@ test_quotes_and_lazy :: proc(t: ^testing.T) {
 	testing.expect_value(t, d.marks[1].lo, 2)
 	testing.expect_value(t, d.content[0], 4)
 
-	// A lazy line keeps the markers of the containers it continues.
+	// A lazy line keeps the markers of the containers it continues
 	info: Line_Info
 	info, d, _ = parse_line(final_state("> > a"), "> b")
 	testing.expect(t, .Lazy in info.flags)
 	testing.expect_value(t, d.n_marks, 1)
 	testing.expect_value(t, d.reached, 1)
 
-	// A quote breaks a lazy continuation's paragraph.
+	// A quote breaks a lazy continuation's paragraph
 	expect_kinds(t, "> a\n---", {.Paragraph, .Thematic_Break})
 }
+
 
 @(test)
 test_lists :: proc(t: ^testing.T) {
@@ -124,12 +161,13 @@ test_lists :: proc(t: ^testing.T) {
 	testing.expect(t, .Lazy in infos("- a\ne")[1].flags)
 
 	// Ordered items: only "1." may interrupt a paragraph, but any number starts
-	// a sibling item.
+	// a sibling item
 	testing.expect(t, .Item_Start not_in infos("a\n2. b")[1].flags)
 	testing.expect(t, .Item_Start in infos("a\n1. b")[1].flags)
 	testing.expect(t, .Item_Start in infos("1. a\n2. b")[1].flags)
+
 	// An empty item can't interrupt a paragraph, except one nested in an item
-	// or followed by a space; a single "-" is not a heading underline either.
+	// or followed by a space; a single "-" is not a heading underline either
 	testing.expect_value(t, infos("a\n-")[1].kind, Line_Kind.Paragraph)
 	testing.expect_value(t, infos("a\n--")[1].kind, Line_Kind.Setext_Underline)
 	testing.expect_value(t, infos("a\n=")[1].kind, Line_Kind.Setext_Underline)
@@ -140,7 +178,7 @@ test_lists :: proc(t: ^testing.T) {
 	testing.expect(t, .Item_Start in infos("1. a\n   2.")[1].flags)
 	testing.expect_value(t, final_state("- a\n  -").depth, 2)
 
-	// Nested lists and content indentation.
+	// Nested lists and content indentation
 	s := final_state("- a\n  - b")
 	testing.expect_value(t, s.depth, 2)
 	testing.expect_value(t, s.containers[1].indent, 2)
@@ -158,9 +196,10 @@ test_lists :: proc(t: ^testing.T) {
 	testing.expect_value(t, d.marks[0].hi, 5)
 	testing.expect_value(t, d.content[0], 6)
 
-	// A thematic break wins over a list item.
+	// A thematic break wins over a list item
 	expect_kinds(t, "- - -\n* * *", {.Thematic_Break, .Thematic_Break})
 }
+
 
 @(test)
 test_tasks :: proc(t: ^testing.T) {
@@ -172,26 +211,41 @@ test_tasks :: proc(t: ^testing.T) {
 	testing.expect(t, .Task not_in l[4].flags)
 	testing.expect(t, .Task not_in l[5].flags)
 	testing.expect(t, .Task not_in l[6].flags)
+
 	_, d, _ := parse_line({}, "- [x] b")
 	testing.expect_value(t, d.task, [2]i32{2, 5})
 }
 
+
 @(test)
 test_code :: proc(t: ^testing.T) {
-	expect_kinds(t, "```odin\nx\n```\ny", {.Fence_Open, .Fence_Body, .Fence_Close, .Paragraph})
+	expect_kinds(
+		t,
+		"```odin\nx\n```\ny",
+		{.Fence_Open, .Fence_Body, .Fence_Close, .Paragraph},
+	)
 	expect_kinds(t, "````\n```\n````", {.Fence_Open, .Fence_Body, .Fence_Close})
 	expect_kinds(t, "~~~\n```\n~~~", {.Fence_Open, .Fence_Body, .Fence_Close})
 	expect_kinds(t, "``` a`b\nc", {.Paragraph, .Paragraph})
 	expect_kinds(t, "```\nnever closed\n", {.Fence_Open, .Fence_Body, .Fence_Body})
-	expect_kinds(t, "    x\n\n    y\nz", {.Indented_Code, .Blank, .Indented_Code, .Paragraph})
+	expect_kinds(
+		t,
+		"    x\n\n    y\nz",
+		{.Indented_Code, .Blank, .Indented_Code, .Paragraph},
+	)
 	expect_kinds(t, "a\n    b", {.Paragraph, .Paragraph})
 	expect_kinds(t, "> ```\n> x\ny", {.Fence_Open, .Fence_Body, .Paragraph})
 
 	testing.expect_value(t, final_state("```odin").fence_lang, syntax.Language.Odin)
-	testing.expect_value(t, final_state("~~~ python {.x}").fence_lang, syntax.Language.Python)
+	testing.expect_value(
+		t,
+		final_state("~~~ python {.x}").fence_lang,
+		syntax.Language.Python,
+	)
 	_, d, _ := parse_line({}, "```  rust  ")
 	testing.expect_value(t, d.info, [2]i32{5, 9})
 }
+
 
 @(test)
 test_html :: proc(t: ^testing.T) {
@@ -205,11 +259,17 @@ test_html :: proc(t: ^testing.T) {
 	expect_kinds(t, "<notatag x", {.Paragraph})
 }
 
+
 @(test)
 test_tables :: proc(t: ^testing.T) {
-	expect_kinds(t, "| a | b |\n|---|:-:|\n| 1 | 2 |\n3\n\nx", {.Paragraph, .Table_Delim, .Table_Row, .Table_Row, .Blank, .Paragraph})
+	expect_kinds(
+		t,
+		"| a | b |\n|---|:-:|\n| 1 | 2 |\n3\n\nx",
+		{.Paragraph, .Table_Delim, .Table_Row, .Table_Row, .Blank, .Paragraph},
+	)
 	expect_kinds(t, "a | b\n--|--\n> q", {.Paragraph, .Table_Delim, .Paragraph})
-	// Header and delimiter cell counts must match.
+
+	// Header and delimiter cell counts must match
 	expect_kinds(t, "| a | b |\n|---|", {.Paragraph, .Paragraph})
 	expect_kinds(t, "a\n---", {.Paragraph, .Setext_Underline})
 	testing.expect_value(t, infos("|a|b|c|\n|-|-|-|")[1].aux, 3)
@@ -217,35 +277,59 @@ test_tables :: proc(t: ^testing.T) {
 	testing.expect_value(t, table_cells("a"), 1)
 }
 
+
 @(test)
 test_definitions_and_extras :: proc(t: ^testing.T) {
-	expect_kinds(t, "[a]: /url\n[b]: <x y> 'title'\n[c]: /u bad", {.Link_Ref_Def, .Link_Ref_Def, .Paragraph})
+	expect_kinds(
+		t,
+		"[a]: /url\n[b]: <x y> 'title'\n[c]: /u bad",
+		{.Link_Ref_Def, .Link_Ref_Def, .Paragraph},
+	)
 	expect_kinds(t, "[a]: /url\n===", {.Link_Ref_Def, .Paragraph})
 	expect_kinds(t, "[^1]: note\nmore", {.Footnote_Def, .Paragraph})
-	expect_kinds(t, "$$\nx^2\n$$\n$$ y $$", {.Math_Fence, .Math_Body, .Math_Fence, .Math_Fence})
-	expect_kinds(t, "---\ntitle: x\n---\n# h", {.Front_Matter_Fence, .Front_Matter_Body, .Front_Matter_Fence, .Atx_Heading})
-	expect_kinds(t, "---\ntitle: x\n...", {.Front_Matter_Fence, .Front_Matter_Body, .Front_Matter_Fence})
+	expect_kinds(
+		t,
+		"$$\nx^2\n$$\n$$ y $$",
+		{.Math_Fence, .Math_Body, .Math_Fence, .Math_Fence},
+	)
+	expect_kinds(
+		t,
+		"---\ntitle: x\n---\n# h",
+		{.Front_Matter_Fence, .Front_Matter_Body, .Front_Matter_Fence, .Atx_Heading},
+	)
+	expect_kinds(
+		t,
+		"---\ntitle: x\n...",
+		{.Front_Matter_Fence, .Front_Matter_Body, .Front_Matter_Fence},
+	)
 	expect_kinds(t, "---\n# h", {.Thematic_Break, .Atx_Heading})
+
 	_, d, _ := parse_line({}, "[label]: /x")
 	testing.expect_value(t, d.label, [2]i32{1, 6})
 }
 
-// Snippets that open and close blocks, for random edits.
+
+// Snippets that open and close blocks, for random edits
 @(private = "file")
 SNIPPETS := [?]string {
-	"```", "```odin\n", "~~~", "\n", "\n\n", "===", "---", "| a | b |", "|--|--|", "> ", "- ", "1. ", "2) ",
-	"    ", "\t", "<div>", "<!--", "-->", "# ", "text ", "word", "[x]: /u", "$$", "- [ ] ", "*", "<span>",
+	"```", "```odin\n", "~~~", "\n", "\n\n", "===", "---", "| a | b |", "|--|--|", "> ",
+	"- ", "1. ", "2) ", "    ", "\t", "<div>", "<!--", "-->", "# ", "text ", "word",
+	"[x]: /u", "$$", "- [ ] ", "*", "<span>",
 }
+
 
 @(private = "file")
 random_snippets :: proc(n: int) -> string {
 	sb := strings.builder_make(context.temp_allocator)
-	for _ in 0 ..< n do strings.write_string(&sb, SNIPPETS[rand.int_max(len(SNIPPETS))])
+	for _ in 0 ..< n {
+		strings.write_string(&sb, SNIPPETS[rand.int_max(len(SNIPPETS))])
+	}
 	return strings.to_string(sb)
 }
 
+
 // Incremental parsing after random edits, sometimes interrupted (a small
-// budget, as when parsing in the background), matches a full parse.
+// budget, as when parsing in the background), matches a full parse
 @(test)
 test_incremental_matches_full :: proc(t: ^testing.T) {
 	rand.reset(7)
@@ -259,7 +343,7 @@ test_incremental_matches_full :: proc(t: ^testing.T) {
 
 		sels := []buffer.Selection{{0, 0, -1}}
 		for step in 0 ..< 50 {
-			// A few edits per update, like several carets.
+			// A few edits per update, like several carets
 			for _ in 0 ..< 1 + rand.int_max(3) {
 				n := buffer.length(&b)
 				at := rand.int_max(n + 1)
@@ -268,6 +352,7 @@ test_incremental_matches_full :: proc(t: ^testing.T) {
 				buffer.replace(&b, at, remove, random_snippets(rand.int_max(3)))
 				buffer.end(&b, sels)
 			}
+
 			doc_edit(&doc, buffer.take_changes(&b))
 			if rand.int_max(3) == 0 {
 				doc_update(&doc, &b, rand.int_max(buffer.line_count(&b)), 0)
@@ -276,47 +361,96 @@ test_incremental_matches_full :: proc(t: ^testing.T) {
 				check_against_full(t, &doc, &b, round, step)
 			}
 		}
+
 		doc_update(&doc, &b, max(int), time.Hour)
 		check_against_full(t, &doc, &b, round, -1)
 	}
 }
+
 
 @(private = "file")
 check_against_full :: proc(t: ^testing.T, doc: ^Doc, b: ^buffer.Buffer, round, step: int) {
 	full: Doc
 	defer doc_destroy(&full)
 	parse_all(&full, b)
-	if !testing.expectf(t, len(doc.lines) == len(full.lines), "round %d step %d: %d lines, want %d", round, step, len(doc.lines), len(full.lines)) do return
+
+	same_count := testing.expectf(
+		t,
+		len(doc.lines) == len(full.lines),
+		"round %d step %d: %d lines, want %d",
+		round,
+		step,
+		len(doc.lines),
+		len(full.lines),
+	)
+	if !same_count do return
 	testing.expect(t, !doc_busy(doc))
+
 	for i in 0 ..< len(full.lines) {
 		a, f := doc.lines[i], full.lines[i]
-		same := a.kind == f.kind && a.aux == f.aux && a.flags == f.flags && a.len == f.len && a.first == f.first && line_state(doc, i) == line_state(&full, i)
-		if !testing.expectf(t, same, "round %d step %d line %d: %v, want %v", round, step, i, a, f) do return
+		same := a.kind == f.kind &&
+		        a.aux == f.aux &&
+		        a.flags == f.flags &&
+		        a.len == f.len &&
+		        a.first == f.first &&
+		        line_state(doc, i) == line_state(&full, i)
+		same_line := testing.expectf(
+			t,
+			same,
+			"round %d step %d line %d: %v, want %v",
+			round,
+			step,
+			i,
+			a,
+			f,
+		)
+		if !same_line do return
 	}
 }
 
+
 // Every line knows its block's first line, however long the block; a long
-// paragraph's inlines are parsed in the same pieces from any of its lines.
+// paragraph's inlines are parsed in the same pieces from any of its lines
 @(test)
 test_long_blocks :: proc(t: ^testing.T) {
-	text := strings.concatenate({"x\n\n```\n", strings.repeat("code\n", 6000, context.temp_allocator), "```\n\n", strings.repeat("para\n", 450, context.temp_allocator)}, context.temp_allocator)
+	text := strings.concatenate(
+		{
+			"x\n\n```\n",
+			strings.repeat("code\n", 6000, context.temp_allocator),
+			"```\n\n",
+			strings.repeat("para\n", 450, context.temp_allocator),
+		},
+		context.temp_allocator,
+	)
 	b := make_buffer(text)
 	defer buffer.buffer_destroy(&b)
 	doc: Doc
 	defer doc_destroy(&doc)
 	parse_all(&doc, &b)
+
 	testing.expect_value(t, block_first(&doc, 6003), 2)
 	testing.expect_value(t, block_first(&doc, 2), 2)
 	testing.expect_value(t, block_first(&doc, 6004), 6004) // the blank line
+
 	para := 6005
 	for i in para ..< para + 450 {
 		first, last, ok := block_extent(&doc, i)
 		piece := para + (i - para) / MAX_BLOCK_LINES * MAX_BLOCK_LINES
 		want_last := min(piece + MAX_BLOCK_LINES, para + 450) - 1
-		if !testing.expectf(t, ok && first == piece && last == want_last, "line %d: lines %d-%d, want %d-%d", i, first, last, piece, want_last) do break
+		same := testing.expectf(
+			t,
+			ok && first == piece && last == want_last,
+			"line %d: lines %d-%d, want %d-%d",
+			i,
+			first,
+			last,
+			piece,
+			want_last,
+		)
+		if !same do break
 	}
 
-	// Inserting a line in the middle of a block moves the rest of it.
+	// Inserting a line in the middle of a block moves the rest of it
 	sels := []buffer.Selection{{0, 0, -1}}
 	buffer.begin(&b, .Other, 0, sels)
 	buffer.replace(&b, buffer.line_start(&b, 3000), 0, "more\n")
@@ -325,6 +459,7 @@ test_long_blocks :: proc(t: ^testing.T) {
 	doc_update(&doc, &b, max(int), time.Hour)
 	testing.expect_value(t, block_first(&doc, 6004), 2)
 }
+
 
 @(test)
 test_typing_reparses_one_line :: proc(t: ^testing.T) {
@@ -341,36 +476,54 @@ test_typing_reparses_one_line :: proc(t: ^testing.T) {
 	buffer.end(&b, sels)
 	doc_edit(&doc, buffer.take_changes(&b))
 	testing.expect_value(t, doc.cursor, 500)
+
 	doc_update(&doc, &b, 0, 0)
 	testing.expect(t, !doc_busy(&doc))
 	testing.expect_value(t, doc.lines[500].len, 10)
 }
 
-// --- Inlines ----------------------------------------------------------------------------
 
-// Spans of `text` as "Kind:content" (plus "->url" for links), sorted.
+// --- Inlines ------------------------------------------------------------------------
+
+// Spans of `text` as "Kind:content" (plus "->url" for links), sorted
 @(private = "file")
 describe :: proc(text: string, labels: ^Labels = nil) -> []string {
 	spans := make([dynamic]Span, context.temp_allocator)
 	inline_parse(text, labels, &spans)
+
 	out := make([]string, len(spans), context.temp_allocator)
 	for s, i in spans {
 		out[i] = fmt.tprintf("%v:%s", s.kind, text[s.open_hi:s.close_lo])
-		if s.url != {} do out[i] = fmt.tprintf("%s->%s", out[i], text[s.url[0]:s.url[1]])
+		if s.url != {} {
+			out[i] = fmt.tprintf("%s->%s", out[i], text[s.url[0]:s.url[1]])
+		}
 	}
 	slice.sort(out)
 	return out
 }
 
+
 @(private = "file")
-expect_spans :: proc(t: ^testing.T, text: string, want: []string, labels: ^Labels = nil, loc := #caller_location) {
+expect_spans :: proc(
+	t: ^testing.T,
+	text: string,
+	want: []string,
+	labels: ^Labels = nil,
+	loc := #caller_location,
+) {
 	got := describe(text, labels)
 	ok := len(got) == len(want)
 	sorted := slice.clone(want, context.temp_allocator)
 	slice.sort(sorted)
-	if ok do for g, i in got do if g != sorted[i] do ok = false
+
+	if ok {
+		for g, i in got {
+			if g != sorted[i] do ok = false
+		}
+	}
 	testing.expectf(t, ok, "%q: got %v, want %v", text, got, sorted, loc = loc)
 }
+
 
 @(test)
 test_emphasis :: proc(t: ^testing.T) {
@@ -391,6 +544,7 @@ test_emphasis :: proc(t: ^testing.T) {
 	expect_spans(t, "*foo [bar* baz](u)", {"Link:bar* baz->u"})
 }
 
+
 @(test)
 test_code_and_escapes :: proc(t: ^testing.T) {
 	expect_spans(t, "`code`", {"Code:code"})
@@ -404,6 +558,7 @@ test_code_and_escapes :: proc(t: ^testing.T) {
 	expect_spans(t, "$5 and $6", {})
 }
 
+
 @(test)
 test_links :: proc(t: ^testing.T) {
 	expect_spans(t, `[text](http://x "t")`, {"Link:text->http://x"})
@@ -413,6 +568,7 @@ test_links :: proc(t: ^testing.T) {
 	expect_spans(t, "[a [b](c) d](e)", {"Link:b->c"})
 	expect_spans(t, "[a](b", {})
 
+	// Reference links
 	labels: Labels
 	defer delete(labels)
 	labels[label_hash("Ref  One")] = 0
@@ -421,31 +577,49 @@ test_links :: proc(t: ^testing.T) {
 	expect_spans(t, "[text][ref one]", {"Link:text->ref one"}, &labels)
 	expect_spans(t, "[nope]", {}, &labels)
 
+	// Autolinks, bare URLs and email addresses, wikilinks and embeds
 	expect_spans(t, "<https://a.b/c>", {"Autolink:https://a.b/c->https://a.b/c"})
 	expect_spans(t, "<me@x.org>", {"Autolink:me@x.org->me@x.org"})
 	expect_spans(t, "visit www.example.com.", {"Url:www.example.com->www.example.com"})
 	expect_spans(t, "(see https://a.b/c).", {"Url:https://a.b/c->https://a.b/c"})
 	expect_spans(t, "wwwx and http:", {})
-	expect_spans(t, "[[Page]] [[Page|Alias]]", {"Wikilink:Page->Page", "Wikilink:Alias->Page"})
-	expect_spans(t, "![[pic.png]] ![[Note]] ![[a b.JPG|300]]", {"Image:pic.png->pic.png", "Wikilink:Note->Note", "Image:a b.JPG->a b.JPG"})
-	expect_spans(t, "[see www.x.com](u) www.y.com]", {"Link:see www.x.com->u", "Url:www.y.com]->www.y.com]"})
-	expect_spans(t, "mail a.b-c_d@x.org. or *me@x.io*", {"Emph:me@x.io", "Url:a.b-c_d@x.org->a.b-c_d@x.org", "Url:me@x.io->me@x.io"})
+	expect_spans(
+		t,
+		"[[Page]] [[Page|Alias]]",
+		{"Wikilink:Page->Page", "Wikilink:Alias->Page"},
+	)
+	expect_spans(
+		t,
+		"![[pic.png]] ![[Note]] ![[a b.JPG|300]]",
+		{"Image:pic.png->pic.png", "Wikilink:Note->Note", "Image:a b.JPG->a b.JPG"},
+	)
+	expect_spans(
+		t,
+		"[see www.x.com](u) www.y.com]",
+		{"Link:see www.x.com->u", "Url:www.y.com]->www.y.com]"},
+	)
+	expect_spans(
+		t,
+		"mail a.b-c_d@x.org. or *me@x.io*",
+		{"Emph:me@x.io", "Url:a.b-c_d@x.org->a.b-c_d@x.org", "Url:me@x.io->me@x.io"},
+	)
 	expect_spans(t, "a@b no@x.y- `c`d@e.f", {"Code:c", "Url:d@e.f->d@e.f"})
 
-	// Footnote references need a definition.
+	// Footnote references need a definition
 	expect_spans(t, "note[^1].", {}, &labels)
 	labels[label_hash("1", true)] = 0
 	expect_spans(t, "note[^1].", {"Footnote_Ref:1"}, &labels)
 	expect_spans(t, "[1]", {}, &labels)
 
-	// Labels fold case fully.
+	// Labels fold case fully
 	testing.expect_value(t, label_hash("STRASSE"), label_hash("straße"))
 	testing.expect_value(t, label_hash("ΣΑΣ"), label_hash("σας"))
 	testing.expect_value(t, unescape(`a\_b&amp;c\d`), `a_b&c\d`)
 }
 
+
 // Front matter needs a closing line: adding or removing one changes how the
-// lines above it read.
+// lines above it read
 @(test)
 test_front_matter_edits :: proc(t: ^testing.T) {
 	b := make_buffer("---\ntitle: x\n# h\n\ntext\n")
@@ -456,65 +630,80 @@ test_front_matter_edits :: proc(t: ^testing.T) {
 	testing.expect_value(t, doc.lines[0].kind, Line_Kind.Thematic_Break)
 
 	sels := []buffer.Selection{{0, 0, -1}}
-	edit :: proc(doc: ^Doc, b: ^buffer.Buffer, at, remove: int, insert: string, sels: []buffer.Selection) {
-		buffer.begin(b, .Other, 0, sels)
-		buffer.replace(b, at, remove, insert)
-		buffer.end(b, sels)
-		doc_edit(doc, buffer.take_changes(b))
-		doc_update(doc, b, max(int), time.Hour)
-	}
 	at := buffer.line_start(&b, 2)
-	edit(&doc, &b, at, 0, "---\n", sels)
+	apply_edit(&doc, &b, at, 0, "---\n", sels)
 	check_against_full(t, &doc, &b, 0, 0)
 	testing.expect_value(t, doc.lines[0].kind, Line_Kind.Front_Matter_Fence)
 	testing.expect_value(t, doc.lines[1].kind, Line_Kind.Front_Matter_Body)
 	testing.expect_value(t, doc.lines[3].kind, Line_Kind.Atx_Heading)
 
-	edit(&doc, &b, at + 2, 1, "", sels) // "--"
+	apply_edit(&doc, &b, at + 2, 1, "", sels) // "--"
 	check_against_full(t, &doc, &b, 0, 1)
 	testing.expect_value(t, doc.lines[0].kind, Line_Kind.Thematic_Break)
 
-	edit(&doc, &b, at + 2, 0, ".", sels) // "--.": still no closing line
-	edit(&doc, &b, at, 3, "...", sels)
+	apply_edit(&doc, &b, at + 2, 0, ".", sels) // "--.": still no closing line
+	apply_edit(&doc, &b, at, 3, "...", sels)
 	check_against_full(t, &doc, &b, 0, 2)
 	testing.expect_value(t, doc.lines[2].kind, Line_Kind.Front_Matter_Fence)
 
-	edit(&doc, &b, 0, 1, "", sels) // "--" on the first line
+	apply_edit(&doc, &b, 0, 1, "", sels) // "--" on the first line
 	check_against_full(t, &doc, &b, 0, 3)
 	testing.expect_value(t, doc.lines[0].kind, Line_Kind.Paragraph)
 }
 
+
+// Replaces `remove` bytes at `at` with `insert`, then reparses
+@(private = "file")
+apply_edit :: proc(
+	doc: ^Doc,
+	b: ^buffer.Buffer,
+	at, remove: int,
+	insert: string,
+	sels: []buffer.Selection,
+) {
+	buffer.begin(b, .Other, 0, sels)
+	buffer.replace(b, at, remove, insert)
+	buffer.end(b, sels)
+	doc_edit(doc, buffer.take_changes(b))
+	doc_update(doc, b, max(int), time.Hour)
+}
+
+
 @(test)
 test_text_highlight :: proc(t: ^testing.T) {
-	text := "# Title\n\nSome **bold** and `code` &amp; \\*x.\n\n```odin\nx := 1 // c\n```\n> quote\n- [x] done\n\n| a | b |\n|---|---|\n| *c* | d |"
+	text := "# Title\n\n" +
+	        "Some **bold** and `code` &amp; \\*x.\n\n" +
+	        "```odin\nx := 1 // c\n```\n" +
+	        "> quote\n- [x] done\n\n" +
+	        "| a | b |\n|---|---|\n| *c* | d |"
 	b := make_buffer(text)
 	defer buffer.buffer_destroy(&b)
 	doc: Doc
 	defer doc_destroy(&doc)
 	parse_all(&doc, &b)
+
 	hl := make([]syntax.Highlight, len(text), context.temp_allocator)
 	style := make([]Text_Styles, len(text), context.temp_allocator)
 	highlight_range(&doc, &b, 0, hl, style)
-	at :: proc(text, needle: string) -> int {return strings.index(text, needle)}
 
 	testing.expect_value(t, hl[0], syntax.Highlight.Punctuation)
-	testing.expect_value(t, hl[at(text, "Title")], syntax.Highlight.Keyword)
-	testing.expect(t, .Bold in style[at(text, "bold")])
-	testing.expect_value(t, hl[at(text, "**bold")], syntax.Highlight.Punctuation)
-	testing.expect_value(t, hl[at(text, "code`")], syntax.Highlight.String)
-	testing.expect_value(t, hl[at(text, "&amp;")], syntax.Highlight.Escape)
-	testing.expect_value(t, hl[at(text, "; \\*")], syntax.Highlight.Escape)
-	testing.expect_value(t, hl[at(text, "\\*x")], syntax.Highlight.Punctuation)
-	testing.expect(t, hl[at(text, "*x")] != .Punctuation)
-	testing.expect_value(t, hl[at(text, "odin")], syntax.Highlight.Type)
-	testing.expect_value(t, hl[at(text, "// c")], syntax.Highlight.Comment)
-	testing.expect_value(t, hl[at(text, "1 //")], syntax.Highlight.Number)
-	testing.expect_value(t, hl[at(text, "quote")], syntax.Highlight.Comment)
-	testing.expect_value(t, hl[at(text, "[x]")], syntax.Highlight.Keyword)
-	testing.expect(t, .Bold in style[at(text, "a |")])
-	testing.expect(t, .Italic in style[at(text, "c*")])
+	testing.expect_value(t, hl[find(text, "Title")], syntax.Highlight.Keyword)
+	testing.expect(t, .Bold in style[find(text, "bold")])
+	testing.expect_value(t, hl[find(text, "**bold")], syntax.Highlight.Punctuation)
+	testing.expect_value(t, hl[find(text, "code`")], syntax.Highlight.String)
+	testing.expect_value(t, hl[find(text, "&amp;")], syntax.Highlight.Escape)
+	testing.expect_value(t, hl[find(text, "; \\*")], syntax.Highlight.Escape)
+	testing.expect_value(t, hl[find(text, "\\*x")], syntax.Highlight.Punctuation)
+	testing.expect(t, hl[find(text, "*x")] != .Punctuation)
+	testing.expect_value(t, hl[find(text, "odin")], syntax.Highlight.Type)
+	testing.expect_value(t, hl[find(text, "// c")], syntax.Highlight.Comment)
+	testing.expect_value(t, hl[find(text, "1 //")], syntax.Highlight.Number)
+	testing.expect_value(t, hl[find(text, "quote")], syntax.Highlight.Comment)
+	testing.expect_value(t, hl[find(text, "[x]")], syntax.Highlight.Keyword)
+	testing.expect(t, .Bold in style[find(text, "a |")])
+	testing.expect(t, .Italic in style[find(text, "c*")])
 
-	// A lazy line of a quoted paragraph is quoted too, under its inlines' colors.
+	// A lazy line of a quoted paragraph is quoted too, under its inlines' colors
 	{
 		lazy := "> q\nlazy `c`"
 		lb := make_buffer(lazy)
@@ -522,17 +711,24 @@ test_text_highlight :: proc(t: ^testing.T) {
 		ldoc: Doc
 		defer doc_destroy(&ldoc)
 		parse_all(&ldoc, &lb)
+
 		lhl := make([]syntax.Highlight, len(lazy), context.temp_allocator)
 		lstyle := make([]Text_Styles, len(lazy), context.temp_allocator)
 		highlight_range(&ldoc, &lb, 0, lhl, lstyle)
-		testing.expect_value(t, lhl[at(lazy, "lazy")], syntax.Highlight.Comment)
-		testing.expect_value(t, lhl[at(lazy, "c`")], syntax.Highlight.String)
+		testing.expect_value(t, lhl[find(lazy, "lazy")], syntax.Highlight.Comment)
+		testing.expect_value(t, lhl[find(lazy, "c`")], syntax.Highlight.String)
 	}
 
-	// Highlighting part of the document gives the same result for that part.
-	from := at(text, "x :=")
+	// Highlighting part of the document gives the same result for that part
+	from := find(text, "x :=")
 	part := make([]syntax.Highlight, 12, context.temp_allocator)
 	part_style := make([]Text_Styles, 12, context.temp_allocator)
 	highlight_range(&doc, &b, from, part, part_style)
 	for h, i in part do testing.expect_value(t, h, hl[from + i])
+}
+
+
+@(private = "file")
+find :: proc(text, needle: string) -> int {
+	return strings.index(text, needle)
 }

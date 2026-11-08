@@ -9,7 +9,8 @@ import "core:unicode/utf8"
 // ![[embeds]] and [^footnote] references to defined footnotes) over one block's
 // text. Strikethrough takes exactly two tildes, as in Obsidian (GFM also allows
 // one). Spans record the exact bytes of their markers so the view can hide or
-// show them.
+// show them
+
 
 Span_Kind :: enum u8 {
 	Emph,
@@ -31,7 +32,7 @@ Span_Kind :: enum u8 {
 }
 
 // Byte offsets into the parsed text. The opening marker is [lo, open_hi), the
-// closing one [close_lo, hi) and the content between them.
+// closing one [close_lo, hi) and the content between them
 Span :: struct {
 	lo, hi:            i32,
 	open_hi, close_lo: i32,
@@ -43,7 +44,7 @@ Span :: struct {
 }
 
 // Link reference and footnote definitions by label_hash: the line of the first
-// one with each label.
+// one with each label
 Labels :: map[u64]int
 
 @(private = "file")
@@ -74,7 +75,8 @@ Parser :: struct {
 	brackets: [dynamic]Bracket,
 }
 
-// Appends the spans of `text` (a block's content, lines joined by '\n') to `out`.
+
+// Appends the spans of `text` (a block's content, lines joined by '\n') to `out`
 inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 	p := Parser {
 		s        = text,
@@ -84,6 +86,7 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 		brackets = make([dynamic]Bracket, context.temp_allocator),
 	}
 	s := text
+
 	i := 0
 	for i < len(s) {
 		c := s[i]
@@ -97,6 +100,7 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 			if i + 1 < len(s) && s[i + 1] == '\n' {
 				add_span(&p, .Hard_Break, i, i + 1, i + 1, i + 1)
 			}
+
 		case '`':
 			if end := code_span(s, i); end > 0 {
 				run := run_length(s, i, '`')
@@ -106,6 +110,7 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 			}
 			i += run_length(s, i, '`')
 			continue
+
 		case '<':
 			if end, url_lo, url_hi := autolink(s, i); end > 0 {
 				sp := make_span(.Autolink, i, end, i + 1, end - 1)
@@ -119,18 +124,21 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 				i += l
 				continue
 			}
+
 		case '&':
 			if j := entity_len(s[i:]); j > 0 {
 				add_span(&p, .Entity, i, i + j, i + j, i + j)
 				i += j
 				continue
 			}
+
 		case '$':
 			if end, run := math_span(s, i); end > 0 {
 				add_span(&p, .Math, i, end, i + run, end - run)
 				i = end
 				continue
 			}
+
 		case '[':
 			if i + 1 < len(s) && s[i + 1] == '[' {
 				if end, target_hi, alias_lo := wikilink(s, i); end > 0 {
@@ -142,19 +150,23 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 				}
 			}
 			if i + 1 < len(s) && s[i + 1] == '^' {
-				if end := footnote_ref(s, i); end > 0 && p.labels != nil && label_hash(s[i + 2:end - 1], true) in p.labels {
+				end := footnote_ref(s, i)
+				if end > 0 && p.labels != nil && label_hash(s[i + 2:end - 1], true) in p.labels {
 					add_span(&p, .Footnote_Ref, i, end, i + 2, end - 1)
 					i = end
 					continue
 				}
 			}
 			append(&p.brackets, Bracket{i32(i), false, true, len(p.delims)})
+
 		case '!':
-			// An embed: "![[image.png]]" is an image, "![[Note]]" a wikilink.
+			// An embed: "![[image.png]]" is an image, "![[Note]]" a wikilink
 			if i + 2 < len(s) && s[i + 1] == '[' && s[i + 2] == '[' {
 				if end, target_hi, alias_lo := wikilink(s, i + 1); end > 0 {
 					sp := make_span(.Wikilink, i, end, alias_lo, end - 2)
-					if is_image_name(s[i + 3:target_hi]) do sp = make_span(.Image, i, end, i + 3, target_hi)
+					if is_image_name(s[i + 3:target_hi]) {
+						sp = make_span(.Image, i, end, i + 3, target_hi)
+					}
 					sp.url = {i32(i + 3), i32(target_hi)}
 					sp.embed = true
 					append(p.out, sp)
@@ -167,14 +179,17 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 				i += 2
 				continue
 			}
+
 		case ']':
 			if end := close_bracket(&p, i); end > 0 {
 				i = end
 				continue
 			}
+
 		case '*', '_', '~', '=':
 			i = push_delimiter(&p, i)
 			continue
+
 		case 'w', 'h', 'f':
 			if end := bare_url(s, i, in_link(&p)); end > 0 {
 				sp := make_span(.Url, i, end, i, end)
@@ -183,6 +198,7 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 				i = end
 				continue
 			}
+
 		case '@':
 			if lo, end := email(&p, i); end > 0 {
 				sp := make_span(.Url, lo, end, lo, end)
@@ -194,32 +210,48 @@ inline_parse :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 		}
 		i += 1
 	}
+
 	process_emphasis(&p, 0)
 }
 
+
 // Appends the spans of a table row (see row_iterator): each cell parsed on its
-// own, without the spaces around it, in offsets of `text`.
+// own, without the spaces around it, in offsets of `text`
 inline_parse_row :: proc(text: string, labels: ^Labels, out: ^[dynamic]Span) {
 	it := row_iterator(text)
 	for lo, hi in row_next(&it) {
+		// The cell without its spaces
 		lo, hi := lo, hi
-		for lo < hi && (text[lo] == ' ' || text[lo] == '\t') do lo += 1
-		for hi > lo && (text[hi - 1] == ' ' || text[hi - 1] == '\t') do hi -= 1
+		for lo < hi && (text[lo] == ' ' || text[lo] == '\t') {
+			lo += 1
+		}
+		for hi > lo && (text[hi - 1] == ' ' || text[hi - 1] == '\t') {
+			hi -= 1
+		}
+
 		first := len(out)
 		inline_parse(text[lo:hi], labels, out)
+
+		// From offsets in the cell to offsets in the row
+		shift := i32(lo)
 		for &s in out[first:] {
-			s.lo, s.hi, s.open_hi, s.close_lo = s.lo + i32(lo), s.hi + i32(lo), s.open_hi + i32(lo), s.close_lo + i32(lo)
-			s.url += i32(lo)
-			s.title += i32(lo)
+			s.lo += shift
+			s.hi += shift
+			s.open_hi += shift
+			s.close_lo += shift
+			s.url += shift
+			s.title += shift
 		}
 	}
 }
 
+
 // FNV-1a of a normalized reference label: case-folded, whitespace runs as one
-// space, trimmed. Footnote labels hash differently from link labels.
+// space, trimmed. Footnote labels hash differently from link labels
 label_hash :: proc(label: string, footnote := false) -> u64 {
 	h: u64 = 0xcbf29ce484222325
 	if footnote do h = (h ~ '^') * 0x100000001b3
+
 	space := false
 	started := false
 	for r in label {
@@ -227,11 +259,13 @@ label_hash :: proc(label: string, footnote := false) -> u64 {
 			space = started
 			continue
 		}
+
 		if space {
 			h = (h ~ ' ') * 0x100000001b3
 			space = false
 		}
 		started = true
+
 		for f in fold(r) {
 			if f == 0 do break
 			buf, n := utf8.encode_rune(f)
@@ -241,7 +275,8 @@ label_hash :: proc(label: string, footnote := false) -> u64 {
 	return h
 }
 
-// Unicode case folding: lower case, plus the folds that differ from it.
+
+// Unicode case folding: lower case, plus the folds that differ from it
 @(private = "file")
 fold :: proc(r: rune) -> [2]rune {
 	switch r {
@@ -252,8 +287,9 @@ fold :: proc(r: rune) -> [2]rune {
 	return {unicode.to_lower(r), 0}
 }
 
+
 // s with backslash escapes and entity references replaced by the characters
-// they stand for, as in a link destination or title.
+// they stand for, as in a link destination or title
 unescape :: proc(s: string, allocator := context.temp_allocator) -> string {
 	sb := strings.builder_make(allocator)
 	for i := 0; i < len(s); i += 1 {
@@ -262,43 +298,60 @@ unescape :: proc(s: string, allocator := context.temp_allocator) -> string {
 			strings.write_byte(&sb, s[i])
 			continue
 		}
+
 		if j := entity_len(s[i:]); s[i] == '&' && j > 0 {
 			buf, w, _ := entity.unescape_entity(s[i:i + j])
 			strings.write_string(&sb, string(buf[:w]))
 			i += j - 1
 			continue
 		}
+
 		strings.write_byte(&sb, s[i])
 	}
 	return strings.to_string(sb)
 }
 
+
 @(private = "file")
 make_span :: proc(kind: Span_Kind, lo, hi, open_hi, close_lo: int) -> Span {
-	return {lo = i32(lo), hi = i32(hi), open_hi = i32(open_hi), close_lo = i32(close_lo), kind = kind}
+	return {
+		lo       = i32(lo),
+		hi       = i32(hi),
+		open_hi  = i32(open_hi),
+		close_lo = i32(close_lo),
+		kind     = kind,
+	}
 }
+
 
 @(private = "file")
 add_span :: proc(p: ^Parser, kind: Span_Kind, lo, hi, open_hi, close_lo: int) {
 	append(p.out, make_span(kind, lo, hi, open_hi, close_lo))
 }
 
+
 @(private = "file")
 run_length :: proc(s: string, i: int, c: u8) -> int {
 	n := 0
-	for i + n < len(s) && s[i + n] == c do n += 1
+	for i + n < len(s) && s[i + n] == c {
+		n += 1
+	}
 	return n
 }
 
-// End of the code span opened by the backtick run at i, or 0.
+
+// End of the code span opened by the backtick run at i, or 0
 @(private = "file")
 code_span :: proc(s: string, i: int) -> int {
 	n := run_length(s, i, '`')
+
+	// The next run as long as the opening one
 	j := i + n
 	for j < len(s) {
 		k := strings.index_byte(s[j:], '`')
 		if k < 0 do return 0
 		j += k
+
 		m := run_length(s, j, '`')
 		if m == n do return j + m
 		j += m
@@ -306,54 +359,83 @@ code_span :: proc(s: string, i: int) -> int {
 	return 0
 }
 
-// An autolink `<scheme:...>` or `<user@host>`: its end and the destination.
+
+// An autolink `<scheme:...>` or `<user@host>`: its end and the destination
 @(private = "file")
 autolink :: proc(s: string, i: int) -> (end, url_lo, url_hi: int) {
 	j := i + 1
-	// URI: a scheme of 2-32 characters, ':', then no spaces, '<' or '>'.
+
+	// URI: a scheme of 2-32 characters, ':', then no spaces, '<' or '>'
 	k := j
-	for k < len(s) && (is_alnum(s[k]) || s[k] == '+' || s[k] == '.' || s[k] == '-') do k += 1
+	for k < len(s) && (is_alnum(s[k]) || s[k] == '+' || s[k] == '.' || s[k] == '-') {
+		k += 1
+	}
 	if k - j >= 2 && k - j <= 32 && is_alpha(s[j]) && k < len(s) && s[k] == ':' {
-		for k < len(s) && s[k] > ' ' && s[k] != '<' && s[k] != '>' do k += 1
-		if k < len(s) && s[k] == '>' do return k + 1, j, k
+		for k < len(s) && s[k] > ' ' && s[k] != '<' && s[k] != '>' {
+			k += 1
+		}
+		if k < len(s) && s[k] == '>' {
+			return k + 1, j, k
+		}
 		return
 	}
-	// Email.
+
+	// Email
 	k = j
-	for k < len(s) && (is_alnum(s[k]) || strings.index_byte(".!#$%&'*+/=?^_`{|}~-", s[k]) >= 0) do k += 1
-	if k == j || k >= len(s) || s[k] != '@' do return
+	for k < len(s) &&
+	    (is_alnum(s[k]) || strings.index_byte(".!#$%&'*+/=?^_`{|}~-", s[k]) >= 0) {
+		k += 1
+	}
+	if k == j || k >= len(s) || s[k] != '@' {
+		return
+	}
+
 	k += 1
 	host := k
-	for k < len(s) && (is_alnum(s[k]) || s[k] == '-' || s[k] == '.') do k += 1
-	if k == host || k >= len(s) || s[k] != '>' do return
+	for k < len(s) && (is_alnum(s[k]) || s[k] == '-' || s[k] == '.') {
+		k += 1
+	}
+	if k == host || k >= len(s) || s[k] != '>' {
+		return
+	}
 	return k + 1, j, k
 }
 
+
 // `$x$` or `$$x$$` on one line: the end and the marker length, or 0. The
 // content can't start or end with a space, and a closing `$` can't be followed
-// by a digit (so prices stay text).
+// by a digit (so prices stay text)
 @(private = "file")
 math_span :: proc(s: string, i: int) -> (end, run: int) {
 	run = min(run_length(s, i, '$'), 2)
 	if run_length(s, i, '$') > 2 do return 0, 0
+
 	lo := i + run
-	if lo >= len(s) || is_space(s[lo]) do return 0, 0
+	if lo >= len(s) || is_space(s[lo]) {
+		return 0, 0
+	}
+
 	for j := lo; j < len(s); j += 1 {
 		switch s[j] {
 		case '\n': return 0, 0
 		case '\\': j += 1
 		case '$':
-			if run_length(s, j, '$') != run || is_space(s[j - 1]) || j == lo do continue
+			if run_length(s, j, '$') != run || is_space(s[j - 1]) || j == lo {
+				continue
+			}
 			after := j + run
-			if after < len(s) && is_digit(s[after]) do continue
+			if after < len(s) && is_digit(s[after]) {
+				continue
+			}
 			return after, run
 		}
 	}
 	return 0, 0
 }
 
+
 // `[[target]]` or `[[target|alias]]` on one line: the end, where the target
-// ends and where the shown text starts.
+// ends and where the shown text starts
 @(private = "file")
 wikilink :: proc(s: string, i: int) -> (end, target_hi, text_lo: int) {
 	j := i + 2
@@ -365,7 +447,9 @@ wikilink :: proc(s: string, i: int) -> (end, target_hi, text_lo: int) {
 		case '|':
 			if target_hi < 0 do target_hi = j
 		case ']':
-			if j + 1 >= len(s) || s[j + 1] != ']' || j == i + 2 do return 0, 0, 0
+			if j + 1 >= len(s) || s[j + 1] != ']' || j == i + 2 {
+				return 0, 0, 0
+			}
 			if target_hi < 0 do return j + 2, j, i + 2
 			return j + 2, target_hi, target_hi + 1
 		}
@@ -374,27 +458,40 @@ wikilink :: proc(s: string, i: int) -> (end, target_hi, text_lo: int) {
 	return 0, 0, 0
 }
 
+
 // The length of the entity reference at the start of s ("&amp;", "&#123;",
-// "&#x1F;"), or 0. Numeric ones have at most 7 decimal or 6 hex digits.
+// "&#x1F;"), or 0. Numeric ones have at most 7 decimal or 6 hex digits
 @(private)
 entity_len :: proc(s: string) -> int {
+	// Numeric
 	if len(s) > 2 && s[1] == '#' {
 		hex := s[2] == 'x' || s[2] == 'X'
 		lo := hex ? 3 : 2
 		j := lo
-		for j < len(s) && (is_digit(s[j]) || (hex && strings.index_byte("abcdefABCDEF", s[j]) >= 0)) do j += 1
-		if j == lo || j - lo > (hex ? 6 : 7) || j >= len(s) || s[j] != ';' do return 0
+		for j < len(s) &&
+		    (is_digit(s[j]) || (hex && strings.index_byte("abcdefABCDEF", s[j]) >= 0)) {
+			j += 1
+		}
+		if j == lo || j - lo > (hex ? 6 : 7) || j >= len(s) || s[j] != ';' {
+			return 0
+		}
 		return j + 1
 	}
-	if _, w, j := entity.unescape_entity(s); w > 0 && j > 1 && j <= len(s) && s[j - 1] == ';' do return j
+
+	// Named
+	if _, w, j := entity.unescape_entity(s); w > 0 && j > 1 && j <= len(s) && s[j - 1] == ';' {
+		return j
+	}
 	return 0
 }
 
-// Whether a file name has an image extension.
+
+// Whether a file name has an image extension
 @(private = "file")
 is_image_name :: proc(name: string) -> bool {
 	dot := strings.last_index_byte(name, '.')
 	if dot < 0 do return false
+
 	switch strings.to_lower(name[dot + 1:], context.temp_allocator) {
 	case "png", "jpg", "jpeg", "gif", "bmp", "webp", "svg", "tga", "psd":
 		return true
@@ -402,33 +499,48 @@ is_image_name :: proc(name: string) -> bool {
 	return false
 }
 
-// `[^label]` with no spaces in the label: its end, or 0.
+
+// `[^label]` with no spaces in the label: its end, or 0
 @(private = "file")
 footnote_ref :: proc(s: string, i: int) -> int {
 	j := i + 2
 	for j < len(s) && s[j] != ']' {
-		if is_space(s[j]) || s[j] == '[' do return 0
+		if is_space(s[j]) || s[j] == '[' {
+			return 0
+		}
 		j += 1
 	}
-	if j >= len(s) || j == i + 2 do return 0
+
+	if j >= len(s) || j == i + 2 {
+		return 0
+	}
 	return j + 1
 }
 
-// Whether an open bracket could still become a link.
+
+// Whether an open bracket could still become a link
 @(private = "file")
 in_link :: proc(p: ^Parser) -> bool {
-	for b in p.brackets do if b.active && !b.image do return true
+	for b in p.brackets {
+		if b.active && !b.image {
+			return true
+		}
+	}
 	return false
 }
 
+
 // A GFM extended autolink starting at i (www., http(s):// or ftp://), or 0.
-// Inside a link's text it ends before a ']'.
+// Inside a link's text it ends before a ']'
 @(private = "file")
 bare_url :: proc(s: string, i: int, in_link: bool) -> int {
 	if i > 0 {
 		b := s[i - 1]
-		if !is_space(b) && b != '*' && b != '_' && b != '~' && b != '(' do return 0
+		if !is_space(b) && b != '*' && b != '_' && b != '~' && b != '(' {
+			return 0
+		}
 	}
+
 	rest := s[i:]
 	lo := 0
 	switch {
@@ -438,47 +550,78 @@ bare_url :: proc(s: string, i: int, in_link: bool) -> int {
 	case strings.has_prefix(rest, "ftp://"):   lo = 6
 	case:                                      return 0
 	}
+
 	end := lo
-	for end < len(rest) && !is_space(rest[end]) && rest[end] != '<' && !(in_link && rest[end] == ']') do end += 1
+	for end < len(rest) &&
+	    !is_space(rest[end]) &&
+	    rest[end] != '<' &&
+	    !(in_link && rest[end] == ']') {
+		end += 1
+	}
+
 	// Trailing punctuation isn't part of the link, nor an unbalanced ')', nor
-	// what looks like an entity reference ("&hl;").
+	// what looks like an entity reference ("&hl;")
 	for end > lo {
 		c := rest[end - 1]
 		if strings.index_byte("?!.,:*_~'\"", c) >= 0 {
 			end -= 1
 			continue
 		}
+
 		if c == ';' {
 			amp := end - 2
-			for amp > lo && is_alnum(rest[amp]) do amp -= 1
+			for amp > lo && is_alnum(rest[amp]) {
+				amp -= 1
+			}
 			if amp < end - 2 && rest[amp] == '&' {
 				end = amp
 				continue
 			}
 		}
+
 		if c == ')' && strings.count(rest[:end], "(") < strings.count(rest[:end], ")") {
 			end -= 1
 			continue
 		}
 		break
 	}
+
+	// A domain, with a dot in it after "www."
 	domain := rest[lo:end]
-	if slash := strings.index_byte(domain, '/'); slash >= 0 do domain = domain[:slash]
-	if domain == "" || (lo == 4 && strings.index_byte(domain, '.') < 0) do return 0
+	if slash := strings.index_byte(domain, '/'); slash >= 0 {
+		domain = domain[:slash]
+	}
+	if domain == "" || (lo == 4 && strings.index_byte(domain, '.') < 0) {
+		return 0
+	}
 	return i + end
 }
 
+
 // A GFM extended email autolink around the '@' at i: its start and end, or
-// end = 0. The address doesn't start inside an earlier span or delimiter run.
+// end = 0. The address doesn't start inside an earlier span or delimiter run
 @(private = "file")
 email :: proc(p: ^Parser, i: int) -> (lo, end: int) {
 	s := p.s
+
+	// The local part
 	lo = i
-	for lo > 0 && (is_alnum(s[lo - 1]) || strings.index_byte(".+-_", s[lo - 1]) >= 0) do lo -= 1
-	for sp in p.out do if int(sp.hi) > lo && int(sp.lo) < i do lo = max(lo, int(sp.hi))
-	for d in p.delims do if int(d.pos + d.count) > lo && int(d.pos) < i do lo = max(lo, int(d.pos + d.count))
+	for lo > 0 && (is_alnum(s[lo - 1]) || strings.index_byte(".+-_", s[lo - 1]) >= 0) {
+		lo -= 1
+	}
+	for sp in p.out {
+		if int(sp.hi) > lo && int(sp.lo) < i {
+			lo = max(lo, int(sp.hi))
+		}
+	}
+	for d in p.delims {
+		if int(d.pos + d.count) > lo && int(d.pos) < i {
+			lo = max(lo, int(d.pos + d.count))
+		}
+	}
 	if lo >= i do return 0, 0
-	// The domain: letters, digits, '-', '_' and dots followed by one of those.
+
+	// The domain: letters, digits, '-', '_' and dots followed by one of those
 	dots := 0
 	end = i + 1
 	for end < len(s) {
@@ -490,9 +633,12 @@ email :: proc(p: ^Parser, i: int) -> (lo, end: int) {
 		}
 		end += 1
 	}
-	if dots == 0 || !is_alpha(s[end - 1]) do return 0, 0
+	if dots == 0 || !is_alpha(s[end - 1]) {
+		return 0, 0
+	}
 	return lo, end
 }
+
 
 // --- Emphasis -----------------------------------------------------------------------
 
@@ -501,70 +647,96 @@ is_unicode_space :: proc(r: rune) -> bool {
 	return r == utf8.RUNE_ERROR || unicode.is_space(r)
 }
 
+
 @(private = "file")
 is_unicode_punct :: proc(r: rune) -> bool {
 	if r < 0x80 do return is_ascii_punct(u8(r))
 	return unicode.is_punct(r) || unicode.is_symbol(r)
 }
 
-// Pushes the delimiter run at i (*, _, ~ or =) and returns where it ends.
+
+// Pushes the delimiter run at i (*, _, ~ or =) and returns where it ends
 @(private = "file")
 push_delimiter :: proc(p: ^Parser, i: int) -> int {
 	s := p.s
 	c := s[i]
 	n := run_length(s, i, c)
 	end := i + n
-	if (c == '=' || c == '~') && n != 2 do return end
+	if (c == '=' || c == '~') && n != 2 {
+		return end
+	}
 
+	// The characters around the run
 	before: rune = ' '
 	if i > 0 do before, _ = utf8.decode_last_rune_in_string(s[:i])
 	after: rune = ' '
 	if end < len(s) do after, _ = utf8.decode_rune_in_string(s[end:])
 	if before == '\n' do before = ' '
-	left := !is_unicode_space(after) && (!is_unicode_punct(after) || is_unicode_space(before) || is_unicode_punct(before))
-	right := !is_unicode_space(before) && (!is_unicode_punct(before) || is_unicode_space(after) || is_unicode_punct(after))
+
+	// Left- and right-flanking
+	left := !is_unicode_space(after) &&
+	        (!is_unicode_punct(after) || is_unicode_space(before) || is_unicode_punct(before))
+	right := !is_unicode_space(before) &&
+	         (!is_unicode_punct(before) || is_unicode_space(after) || is_unicode_punct(after))
 
 	can_open, can_close := left, right
 	if c == '_' {
 		can_open = left && (!right || is_unicode_punct(before))
 		can_close = right && (!left || is_unicode_punct(after))
 	}
+
 	if can_open || can_close {
-		append(&p.delims, Delim{pos = i32(i), count = i32(n), orig = i32(n), ch = c, can_open = can_open, can_close = can_close})
+		delim := Delim {
+			pos       = i32(i),
+			count     = i32(n),
+			orig      = i32(n),
+			ch        = c,
+			can_open  = can_open,
+			can_close = can_close,
+		}
+		append(&p.delims, delim)
 	}
 	return end
 }
 
+
 // Matches emphasis delimiters above stack index `bottom` (CommonMark's
-// "process emphasis"), then drops them.
+// "process emphasis"), then drops them
 @(private = "file")
 process_emphasis :: proc(p: ^Parser, bottom: int) {
 	d := p.delims[:]
+
 	// Lowest index an opener for a closer of each kind can be at; below it a
-	// search already failed. Keyed by character, closer length % 3 and can_open.
+	// search already failed. Keyed by character, closer length % 3 and can_open
 	openers_bottom: [4][3][2]int
-	for &a in openers_bottom do for &b in a do for &x in b do x = bottom
-	char_index :: proc(c: u8) -> int {
-		switch c {
-		case '*': return 0
-		case '_': return 1
-		case '~': return 2
+	for &a in openers_bottom {
+		for &b in a {
+			for &x in b do x = bottom
 		}
-		return 3
 	}
 
 	for ci := bottom; ci < len(d); ci += 1 {
 		closer := &d[ci]
-		if closer.removed || !closer.can_close do continue
+		if closer.removed || !closer.can_close {
+			continue
+		}
+
 		for closer.count > 0 {
-			key := &openers_bottom[char_index(closer.ch)][closer.orig % 3][closer.can_open ? 1 : 0]
+			// Look for an opener
+			open_index := closer.can_open ? 1 : 0
+			key := &openers_bottom[char_index(closer.ch)][closer.orig % 3][open_index]
 			found := -1
 			for oi := ci - 1; oi >= key^; oi -= 1 {
 				o := &d[oi]
-				if o.removed || o.ch != closer.ch || !o.can_open || o.count == 0 do continue
+				if o.removed || o.ch != closer.ch || !o.can_open || o.count == 0 {
+					continue
+				}
+
 				switch closer.ch {
 				case '*', '_':
-					odd := (o.can_close || closer.can_open) && (o.orig + closer.orig) % 3 == 0 && !(o.orig % 3 == 0 && closer.orig % 3 == 0)
+					odd := (o.can_close || closer.can_open) &&
+					       (o.orig + closer.orig) % 3 == 0 &&
+					       !(o.orig % 3 == 0 && closer.orig % 3 == 0)
 					if odd do continue
 				case '~':
 					if o.count != closer.count do continue
@@ -572,11 +744,14 @@ process_emphasis :: proc(p: ^Parser, bottom: int) {
 				found = oi
 				break
 			}
+
 			if found < 0 {
 				key^ = ci
 				if !closer.can_open do closer.removed = true
 				break
 			}
+
+			// The span they make
 			o := &d[found]
 			use := i32(1)
 			kind := Span_Kind.Emph
@@ -593,37 +768,65 @@ process_emphasis :: proc(p: ^Parser, bottom: int) {
 				use = 2
 				kind = .Highlight
 			}
+
 			o.count -= use
 			lo := o.pos + o.count
-			append(p.out, Span{lo = lo, open_hi = lo + use, close_lo = closer.pos, hi = closer.pos + use, kind = kind})
+			span := Span {
+				lo       = lo,
+				open_hi  = lo + use,
+				close_lo = closer.pos,
+				hi       = closer.pos + use,
+				kind     = kind,
+			}
+			append(p.out, span)
 			closer.pos += use
 			closer.count -= use
+
+			// Delimiters between them can't match any more
 			for k in found + 1 ..< ci do d[k].removed = true
 			if o.count == 0 do o.removed = true
 		}
 		if closer.count == 0 do closer.removed = true
 	}
+
 	resize(&p.delims, bottom)
 }
 
-// --- Links ----------------------------------------------------------------------------
+
+// Index of a delimiter character in process_emphasis's openers_bottom
+@(private = "file")
+char_index :: proc(c: u8) -> int {
+	switch c {
+	case '*': return 0
+	case '_': return 1
+	case '~': return 2
+	}
+	return 3
+}
+
+
+// --- Links --------------------------------------------------------------------------
 
 // Handles a ']' at i: a link or image if an opener matches and a destination or
-// a defined label follows. Returns the end of the link, or 0.
+// a defined label follows. Returns the end of the link, or 0
 @(private = "file")
 close_bracket :: proc(p: ^Parser, i: int) -> int {
 	if len(p.brackets) == 0 do return 0
 	b := pop(&p.brackets)
 	if !b.active do return 0
+
 	s := p.s
 	text_lo := int(b.pos) + (b.image ? 2 : 1)
 
+	// An inline destination
 	end, url_lo, url_hi := -1, 0, 0
 	title: [2]int
 	reference := false
 	if i + 1 < len(s) && s[i + 1] == '(' {
 		end, url_lo, url_hi, title = inline_destination(s, i + 2)
 	}
+
+	// Else a defined label: "[text][label]", "[label][]" or "[label]"
 	if end < 0 {
 		label_lo, label_hi := text_lo, i
 		after := i + 1
@@ -634,28 +837,42 @@ close_bracket :: proc(p: ^Parser, i: int) -> int {
 				after = i + 2 + close + 1
 			}
 		}
-		if p.labels != nil && label_hi > label_lo && !unescaped_bracket(s[label_lo:label_hi]) && label_hash(s[label_lo:label_hi]) in p.labels {
+
+		if p.labels != nil &&
+		   label_hi > label_lo &&
+		   !unescaped_bracket(s[label_lo:label_hi]) &&
+		   label_hash(s[label_lo:label_hi]) in p.labels {
 			end, url_lo, url_hi = after, label_lo, label_hi
 			reference = true
 		}
 	}
 	if end < 0 do return 0
 
+	// The link
 	process_emphasis(p, b.delims)
 	sp := make_span(b.image ? .Image : .Link, int(b.pos), end, text_lo, i)
 	sp.url = {i32(url_lo), i32(url_hi)}
 	sp.title = {i32(title[0]), i32(title[1])}
 	sp.reference = reference
+
+	// No links inside links
 	if !b.image {
-		// No links inside links.
-		for &o in p.brackets do if !o.image do o.active = false
-		#reverse for o, k in p.out do if o.kind == .Url && int(o.lo) >= text_lo && int(o.hi) <= i do ordered_remove(p.out, k)
+		for &o in p.brackets {
+			if !o.image do o.active = false
+		}
+		#reverse for o, k in p.out {
+			if o.kind == .Url && int(o.lo) >= text_lo && int(o.hi) <= i {
+				ordered_remove(p.out, k)
+			}
+		}
 	}
+
 	append(p.out, sp)
 	return end
 }
 
-// Whether a label holds a ']' not escaped by a backslash.
+
+// Whether a label holds a ']' not escaped by a backslash
 @(private = "file")
 unescaped_bracket :: proc(s: string) -> bool {
 	for i := 0; i < len(s); i += 1 {
@@ -667,19 +884,24 @@ unescaped_bracket :: proc(s: string) -> bool {
 	return false
 }
 
+
 // Parses `(dest "title")` from just after the '('. Returns the end (after ')'),
-// the destination and the title (inside its quotes), or end = -1.
+// the destination and the title (inside its quotes), or end = -1
 @(private = "file")
 inline_destination :: proc(s: string, from: int) -> (end, lo, hi: int, title: [2]int) {
 	j := skip_link_space(s, from)
 	lo = j
+
+	// The destination: "<...>", or up to a space with balanced parentheses
 	if j < len(s) && s[j] == '<' {
 		k := j + 1
 		for k < len(s) && s[k] != '>' && s[k] != '\n' && s[k] != '<' {
 			if s[k] == '\\' do k += 1
 			k += 1
 		}
-		if k >= len(s) || s[k] != '>' do return -1, 0, 0, {}
+		if k >= len(s) || s[k] != '>' {
+			return -1, 0, 0, {}
+		}
 		lo, hi = j + 1, k
 		j = k + 1
 	} else {
@@ -699,6 +921,8 @@ inline_destination :: proc(s: string, from: int) -> (end, lo, hi: int, title: [2
 		if depth != 0 do return -1, 0, 0, {}
 		hi = j
 	}
+
+	// The title, after a space
 	k := skip_link_space(s, j)
 	if k < len(s) && k > j && (s[k] == '"' || s[k] == '\'' || s[k] == '(') {
 		close := s[k] == '(' ? u8(')') : s[k]
@@ -711,11 +935,15 @@ inline_destination :: proc(s: string, from: int) -> (end, lo, hi: int, title: [2
 		title = {k + 1, m}
 		k = skip_link_space(s, m + 1)
 	}
-	if k >= len(s) || s[k] != ')' do return -1, 0, 0, {}
+
+	if k >= len(s) || s[k] != ')' {
+		return -1, 0, 0, {}
+	}
 	return k + 1, lo, hi, title
 }
 
-// Skips spaces and tabs with at most one line break.
+
+// Skips spaces and tabs with at most one line break
 @(private = "file")
 skip_link_space :: proc(s: string, j: int) -> int {
 	j := j

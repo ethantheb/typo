@@ -5,7 +5,8 @@ import "../syntax"
 
 // Highlighting for the plain-text view: Markdown elements mapped onto the code
 // highlight colors, plus bold/italic/strikethrough styles. Fenced code is
-// colored by its language's lexer.
+// colored by its language's lexer
+
 
 Text_Style :: enum u8 {
 	Bold,
@@ -15,7 +16,7 @@ Text_Style :: enum u8 {
 
 Text_Styles :: bit_set[Text_Style;u8]
 
-// Lines above a visible fence body line lexed at most to find its lexer state.
+// Lines above a visible fence body line lexed at most to find its lexer state
 @(private = "file")
 MAX_FENCE_LOOKBACK :: 2000
 
@@ -26,24 +27,41 @@ Painter :: struct {
 	style: []Text_Styles,
 }
 
+
 @(private = "file")
 paint :: proc(p: ^Painter, lo, hi: int, h: syntax.Highlight) {
-	for i in max(lo, p.start) ..< min(hi, p.start + len(p.hl)) do p.hl[i - p.start] = h
+	for i in max(lo, p.start) ..< min(hi, p.start + len(p.hl)) {
+		p.hl[i - p.start] = h
+	}
 }
+
 
 @(private = "file")
 paint_style :: proc(p: ^Painter, lo, hi: int, s: Text_Styles) {
-	for i in max(lo, p.start) ..< min(hi, p.start + len(p.hl)) do p.style[i - p.start] += s
+	for i in max(lo, p.start) ..< min(hi, p.start + len(p.hl)) {
+		p.style[i - p.start] += s
+	}
 }
 
-// Fills hl[i] and style[i] for document bytes [start, start+len(hl)).
-highlight_range :: proc(doc: ^Doc, b: ^buffer.Buffer, start: int, hl: []syntax.Highlight, style: []Text_Styles) {
+
+// Fills hl[i] and style[i] for document bytes [start, start+len(hl))
+highlight_range :: proc(
+	doc: ^Doc,
+	b: ^buffer.Buffer,
+	start: int,
+	hl: []syntax.Highlight,
+	style: []Text_Styles,
+) {
 	for &x in hl do x = .None
 	for &x in style do x = {}
-	if len(hl) == 0 || len(doc.lines) == 0 do return
+	if len(hl) == 0 || len(doc.lines) == 0 {
+		return
+	}
+
 	p := Painter{start, hl, style}
 	first := buffer.offset_to_line(b, start)
-	last := min(buffer.offset_to_line(b, start + len(hl) - 1), len(doc.lines) - 1)
+	last_in_range := buffer.offset_to_line(b, start + len(hl) - 1)
+	last := min(last_in_range, len(doc.lines) - 1)
 	labels := doc_labels(doc, b)
 	spans := make([dynamic]Span, context.temp_allocator)
 	fence: struct {
@@ -56,69 +74,105 @@ highlight_range :: proc(doc: ^Doc, b: ^buffer.Buffer, start: int, hl: []syntax.H
 	for i := first; i <= last; i += 1 {
 		info := doc.lines[i]
 		line_lo := buffer.line_start(b, i)
-		text := string(buffer.read_alloc(b, line_lo, line_lo + int(info.len)))
+		line_hi := line_lo + int(info.len)
+		text := string(buffer.read_alloc(b, line_lo, line_hi))
 		d := line_detail(doc, i, text)
-		at :: proc(line_lo: int, x: i32) -> int {return line_lo + int(x)}
 
+		// Block markers, quotes and task boxes
 		for m in d.marks[:d.n_marks] {
-			paint(&p, at(line_lo, m.lo), at(line_lo, m.hi), m.kind == .Quote ? .Punctuation : .Operator)
+			mark_color: syntax.Highlight = m.kind == .Quote ? .Punctuation : .Operator
+			paint(&p, at(line_lo, m.lo), at(line_lo, m.hi), mark_color)
 		}
-		if quoted(doc, i) do paint(&p, at(line_lo, d.content[0]), line_lo + len(text), .Comment)
+		if quoted(doc, i) {
+			paint(&p, at(line_lo, d.content[0]), line_lo + len(text), .Comment)
+		}
 		if d.task != {} {
-			paint(&p, at(line_lo, d.task[0]), at(line_lo, d.task[1]), .Task_Checked in info.flags ? .Keyword : .Operator)
+			task_color: syntax.Highlight = .Task_Checked in info.flags ? .Keyword : .Operator
+			paint(&p, at(line_lo, d.task[0]), at(line_lo, d.task[1]), task_color)
 		}
 
+		// The line's own syntax
 		#partial switch info.kind {
 		case .Atx_Heading:
 			paint(&p, at(line_lo, d.open[0]), at(line_lo, d.open[1]), .Punctuation)
 			paint(&p, at(line_lo, d.open[1]), line_lo + len(text), .Keyword)
 			paint_style(&p, at(line_lo, d.open[1]), line_lo + len(text), {.Bold})
-			if d.close != {} do paint(&p, at(line_lo, d.close[0]), at(line_lo, d.close[1]), .Punctuation)
-		case .Setext_Underline, .Thematic_Break, .Table_Delim, .Fence_Close, .Math_Fence, .Front_Matter_Fence:
+			if d.close != {} {
+				paint(&p, at(line_lo, d.close[0]), at(line_lo, d.close[1]), .Punctuation)
+			}
+
+		case .Setext_Underline,
+		     .Thematic_Break,
+		     .Table_Delim,
+		     .Fence_Close,
+		     .Math_Fence,
+		     .Front_Matter_Fence:
 			paint(&p, at(line_lo, d.content[0]), line_lo + len(text), .Punctuation)
+
 		case .Fence_Open:
 			paint(&p, at(line_lo, d.open[0]), line_lo + len(text), .Punctuation)
 			paint(&p, at(line_lo, d.info[0]), at(line_lo, d.info[1]), .Type)
 			fence.rules = syntax.rules_for(line_state(doc, i).fence_lang)
 			fence.state, fence.line = {}, i
+
 		case .Fence_Body:
-			// Colored by language only when the fence names one.
+			// Colored by language only when the fence names one
 			if line_state(doc, i).fence_lang == .None {
 				paint(&p, at(line_lo, d.content[0]), line_lo + len(text), .String)
 				continue
 			}
+
 			if fence.line != i - 1 {
 				fence.rules = syntax.rules_for(line_state(doc, i).fence_lang)
 				fence.state = fence_state_before(doc, b, fence.rules, i)
 			}
+
 			body := text[d.content[0]:]
 			out := make([]syntax.Highlight, len(body), context.temp_allocator)
 			fence.state = syntax.lex_line(fence.rules, fence.state, transmute([]u8)body, out)
 			fence.line = i
-			for h, k in out do paint(&p, at(line_lo, d.content[0]) + k, at(line_lo, d.content[0]) + k + 1, h)
+
+			body_lo := at(line_lo, d.content[0])
+			for h, k in out {
+				paint(&p, body_lo + k, body_lo + k + 1, h)
+			}
+
 		case .Indented_Code:
 			paint(&p, at(line_lo, d.content[0]), line_lo + len(text), .String)
+
 		case .Html:
 			paint(&p, line_lo, line_lo + len(text), .Attribute)
+
 		case .Front_Matter_Body:
 			paint(&p, line_lo, line_lo + len(text), .Comment)
+
 		case .Math_Body:
 			paint(&p, line_lo, line_lo + len(text), .Number)
+
 		case .Link_Ref_Def, .Footnote_Def:
+			label_color: syntax.Highlight = info.kind == .Footnote_Def ? .Label : .Function
 			paint(&p, at(line_lo, d.label[0] - 1), at(line_lo, d.label[1] + 2), .Punctuation)
-			paint(&p, at(line_lo, d.label[0]), at(line_lo, d.label[1]), info.kind == .Footnote_Def ? .Label : .Function)
-			if info.kind == .Link_Ref_Def do paint(&p, at(line_lo, d.label[1] + 2), line_lo + len(text), .Attribute)
+			paint(&p, at(line_lo, d.label[0]), at(line_lo, d.label[1]), label_color)
+			if info.kind == .Link_Ref_Def {
+				paint(&p, at(line_lo, d.label[1] + 2), line_lo + len(text), .Attribute)
+			}
 		}
 
 		// Inline syntax, for the whole block at once, over the colors of its
-		// lines painted above.
+		// lines painted above
 		lo, hi, ok := block_extent(doc, i)
-		if !ok || info.kind == .Link_Ref_Def || i != min(hi, last) do continue
-		heading := info.kind == .Atx_Heading || setext_heading(doc, hi) || is_table_header(doc, i)
+		if !ok || info.kind == .Link_Ref_Def || i != min(hi, last) {
+			continue
+		}
+
+		heading := info.kind == .Atx_Heading ||
+		           setext_heading(doc, hi) ||
+		           is_table_header(doc, i)
 		if info.kind == .Table_Row || is_table_header(doc, i) {
 			highlight_table_row(&p, text, line_lo, d, heading, labels)
 			continue
 		}
+
 		bt := block_text(doc, b, lo, hi)
 		clear(&spans)
 		inline_parse(bt.text, labels, &spans)
@@ -132,10 +186,24 @@ highlight_range :: proc(doc: ^Doc, b: ^buffer.Buffer, start: int, hl: []syntax.H
 	}
 }
 
+
+// Document offset of byte `x` of the line starting at `line_lo`
+@(private = "file")
+at :: proc(line_lo: int, x: i32) -> int {
+	return line_lo + int(x)
+}
+
+
 // The lexer state at the start of fence body line i, lexing from its fence (or
-// MAX_FENCE_LOOKBACK lines up, in a longer block).
-fence_state_before :: proc(doc: ^Doc, b: ^buffer.Buffer, rules: ^syntax.Lang_Rules, i: int) -> syntax.Lex_State {
+// MAX_FENCE_LOOKBACK lines up, in a longer block)
+fence_state_before :: proc(
+	doc: ^Doc,
+	b: ^buffer.Buffer,
+	rules: ^syntax.Lang_Rules,
+	i: int,
+) -> syntax.Lex_State {
 	open := max(block_first(doc, i), i - MAX_FENCE_LOOKBACK)
+
 	state: syntax.Lex_State
 	for j in open + 1 ..< i {
 		lo := buffer.line_start(b, j)
@@ -146,27 +214,48 @@ fence_state_before :: proc(doc: ^Doc, b: ^buffer.Buffer, rules: ^syntax.Lang_Rul
 	return state
 }
 
+
 @(private = "file")
-highlight_table_row :: proc(p: ^Painter, text: string, line_lo: int, d: Line_Detail, heading: bool, labels: ^Labels) {
+highlight_table_row :: proc(
+	p: ^Painter,
+	text: string,
+	line_lo: int,
+	d: Line_Detail,
+	heading: bool,
+	labels: ^Labels,
+) {
 	row := text[d.content[0]:]
 	base := line_lo + int(d.content[0])
+
+	// Pipes, and bold header cells
 	it := row_iterator(row)
 	for lo, hi in row_next(&it) {
-		if lo > 0 && row[lo - 1] == '|' do paint(p, base + lo - 1, base + lo, .Punctuation)
-		if hi < len(row) && row[hi] == '|' do paint(p, base + hi, base + hi + 1, .Punctuation)
+		if lo > 0 && row[lo - 1] == '|' {
+			paint(p, base + lo - 1, base + lo, .Punctuation)
+		}
+		if hi < len(row) && row[hi] == '|' {
+			paint(p, base + hi, base + hi + 1, .Punctuation)
+		}
 		if heading do paint_style(p, base + lo, base + hi, {.Bold})
 	}
+
+	// Inline syntax
 	spans := make([dynamic]Span, context.temp_allocator)
 	inline_parse_row(row, labels, &spans)
 	bt := Block_Text{text = row, segs = {{doc_lo = base, lo = 0, hi = len(row)}}}
 	paint_spans(p, &bt, spans[:])
 }
 
+
 @(private = "file")
 paint_spans :: proc(p: ^Painter, bt: ^Block_Text, spans: []Span) {
-	doc :: proc(bt: ^Block_Text, x: i32) -> int {return block_to_doc(bt, int(x))}
 	for s in spans {
-		lo, open_hi, close_lo, hi := doc(bt, s.lo), doc(bt, s.open_hi), doc(bt, s.close_lo), doc(bt, s.hi)
+		lo := to_doc(bt, s.lo)
+		open_hi := to_doc(bt, s.open_hi)
+		close_lo := to_doc(bt, s.close_lo)
+		hi := to_doc(bt, s.hi)
+
+		// Inside the markers
 		switch s.kind {
 		case .Emph:      paint_style(p, open_hi, close_lo, {.Italic})
 		case .Strong:    paint_style(p, open_hi, close_lo, {.Bold})
@@ -182,13 +271,26 @@ paint_spans :: proc(p: ^Painter, bt: ^Block_Text, spans: []Span) {
 		case .Link, .Image, .Wikilink:
 			paint(p, open_hi, close_lo, .Function)
 			paint(p, close_lo, hi, .Punctuation)
-			if s.kind != .Wikilink && !s.reference && !s.embed do paint(p, doc(bt, s.url[0]), doc(bt, s.url[1]), .Attribute)
+			if s.kind != .Wikilink && !s.reference && !s.embed {
+				paint(p, to_doc(bt, s.url[0]), to_doc(bt, s.url[1]), .Attribute)
+			}
 		case .Autolink, .Url:
 			paint(p, open_hi, close_lo, .Attribute)
 		case .Footnote_Ref:
 			paint(p, open_hi, close_lo, .Label)
 		}
+
+		// The markers
 		paint(p, lo, open_hi, .Punctuation)
-		if s.kind != .Link && s.kind != .Image && s.kind != .Wikilink do paint(p, close_lo, hi, .Punctuation)
+		if s.kind != .Link && s.kind != .Image && s.kind != .Wikilink {
+			paint(p, close_lo, hi, .Punctuation)
+		}
 	}
+}
+
+
+// Document offset of position `x` in a block's text
+@(private = "file")
+to_doc :: proc(bt: ^Block_Text, x: i32) -> int {
+	return block_to_doc(bt, int(x))
 }

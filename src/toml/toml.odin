@@ -14,7 +14,8 @@ import "core:unicode/utf8"
 // Not supported (reported as errors): multi-line strings, dates/times, and
 // arrays of tables ([[...]]).
 //
-// Everything a Document holds lives in one arena, freed by destroy.
+// Everything a Document holds lives in one arena, freed by destroy
+
 
 Table :: map[string]Value
 
@@ -37,16 +38,22 @@ Error :: struct {
 	msg:  string,
 }
 
-// On error, err.msg is allocated with `allocator` (the caller frees it).
+
+// On error, err.msg is allocated with `allocator` (the caller frees it)
 parse :: proc(src: string, allocator := context.allocator) -> (doc: ^Document, err: Error) {
 	doc = new(Document, allocator)
 	if virtual.arena_init_growing(&doc.arena) != nil {
 		free(doc, allocator)
 		return nil, {1, strings.clone("out of memory", allocator)}
 	}
+
 	p := Parser{src = src, line = 1}
-	// Windows editors often save UTF-8 with a byte-order mark (EF BB BF); skip it.
-	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF do p.src = src[3:]
+	// Windows editors often save UTF-8 with a byte-order mark (EF BB BF); skip it
+	if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+		p.src = src[3:]
+	}
+
+	// Parse into the arena
 	ok: bool
 	{
 		context.allocator = virtual.arena_allocator(&doc.arena)
@@ -54,6 +61,7 @@ parse :: proc(src: string, allocator := context.allocator) -> (doc: ^Document, e
 		p.root, p.current = doc.root, doc.root
 		ok = parse_document(&p)
 	}
+
 	if !ok {
 		err = {p.err.line, strings.clone(p.err.msg, allocator)} // copy out before the arena goes
 		destroy(doc, allocator)
@@ -62,19 +70,23 @@ parse :: proc(src: string, allocator := context.allocator) -> (doc: ^Document, e
 	return doc, {}
 }
 
+
 destroy :: proc(doc: ^Document, allocator := context.allocator) {
 	if doc == nil do return
+
 	virtual.arena_destroy(&doc.arena)
 	free(doc, allocator)
 }
 
-// Looks up a dotted path like "appearance.theme".
+
+// Looks up a dotted path like "appearance.theme"
 get :: proc(t: ^Table, path: string) -> (v: Value, ok: bool) {
 	t := t
 	rest := path
 	for {
 		dot := strings.index_byte(rest, '.')
 		if dot < 0 do return t[rest]
+
 		inner, is_table := t[rest[:dot]].(^Table)
 		if !is_table do return nil, false
 		t = inner
@@ -82,9 +94,11 @@ get :: proc(t: ^Table, path: string) -> (v: Value, ok: bool) {
 	}
 }
 
-// Returns s as a TOML basic string literal, quoted and escaped.
+
+// Returns s as a TOML basic string literal, quoted and escaped
 quote :: proc(s: string, allocator := context.temp_allocator) -> string {
 	sb := strings.builder_make(allocator)
+
 	strings.write_byte(&sb, '"')
 	for r in s {
 		switch r {
@@ -97,8 +111,10 @@ quote :: proc(s: string, allocator := context.temp_allocator) -> string {
 		}
 	}
 	strings.write_byte(&sb, '"')
+
 	return strings.to_string(sb)
 }
+
 
 // --- Parser ------------------------------------------------------------------------
 
@@ -112,11 +128,13 @@ Parser :: struct {
 	err:     Error,
 }
 
+
 @(private)
 fail :: proc(p: ^Parser, msg: string) -> bool {
 	if p.err.line == 0 do p.err = {p.line, msg}
 	return false
 }
+
 
 @(private)
 peek :: proc(p: ^Parser, ahead := 0) -> u8 {
@@ -124,10 +142,12 @@ peek :: proc(p: ^Parser, ahead := 0) -> u8 {
 	return i < len(p.src) ? p.src[i] : 0
 }
 
+
 @(private)
 at_end :: proc(p: ^Parser) -> bool {return p.pos >= len(p.src)}
 
-// Skips spaces/tabs and a trailing comment, but not newlines.
+
+// Skips spaces/tabs and a trailing comment, but not newlines
 @(private)
 skip_inline_space :: proc(p: ^Parser) {
 	for !at_end(p) {
@@ -135,14 +155,17 @@ skip_inline_space :: proc(p: ^Parser) {
 		case ' ', '\t':
 			p.pos += 1
 		case '#':
-			for !at_end(p) && peek(p) != '\n' do p.pos += 1
+			for !at_end(p) && peek(p) != '\n' {
+				p.pos += 1
+			}
 		case:
 			return
 		}
 	}
 }
 
-// Skips whitespace, comments and newlines.
+
+// Skips whitespace, comments and newlines
 @(private)
 skip_space :: proc(p: ^Parser) {
 	for !at_end(p) {
@@ -159,10 +182,12 @@ skip_space :: proc(p: ^Parser) {
 	}
 }
 
+
 @(private)
 expect_line_end :: proc(p: ^Parser) -> bool {
 	skip_inline_space(p)
 	if at_end(p) do return true
+
 	if peek(p) == '\r' do p.pos += 1
 	if peek(p) == '\n' {
 		p.pos += 1
@@ -172,11 +197,13 @@ expect_line_end :: proc(p: ^Parser) -> bool {
 	return fail(p, "expected end of line")
 }
 
+
 @(private)
 parse_document :: proc(p: ^Parser) -> bool {
 	for {
 		skip_space(p)
 		if at_end(p) do return true
+
 		if peek(p) == '[' {
 			parse_table_header(p) or_return
 		} else {
@@ -186,10 +213,12 @@ parse_document :: proc(p: ^Parser) -> bool {
 	}
 }
 
+
 @(private)
 parse_table_header :: proc(p: ^Parser) -> bool {
 	p.pos += 1
 	if peek(p) == '[' do return fail(p, "arrays of tables ([[...]]) are not supported")
+
 	keys := parse_key(p) or_return
 	skip_inline_space(p)
 	if peek(p) != ']' do return fail(p, "expected ']'")
@@ -198,6 +227,7 @@ parse_table_header :: proc(p: ^Parser) -> bool {
 	p.current = descend(p, p.root, keys) or_return
 	return true
 }
+
 
 @(private)
 parse_key_value :: proc(p: ^Parser, into: ^Table) -> bool {
@@ -215,7 +245,8 @@ parse_key_value :: proc(p: ^Parser, into: ^Table) -> bool {
 	return true
 }
 
-// Walks (creating as needed) the tables named by keys, starting at t.
+
+// Walks (creating as needed) the tables named by keys, starting at t
 @(private)
 descend :: proc(p: ^Parser, t: ^Table, keys: []string) -> (^Table, bool) {
 	t := t
@@ -235,6 +266,7 @@ descend :: proc(p: ^Parser, t: ^Table, keys: []string) -> (^Table, bool) {
 	}
 	return t, true
 }
+
 
 // key or a.b."c d"
 @(private)
@@ -257,6 +289,7 @@ parse_key :: proc(p: ^Parser) -> (keys: []string, ok: bool) {
 			fail(p, "expected a key")
 			return nil, false
 		}
+
 		skip_inline_space(p)
 		if peek(p) != '.' do break
 		p.pos += 1
@@ -264,25 +297,39 @@ parse_key :: proc(p: ^Parser) -> (keys: []string, ok: bool) {
 	return out[:], true
 }
 
+
 @(private)
 is_bare_key_char :: proc(c: u8) -> bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+	return (c >= 'a' && c <= 'z') ||
+	       (c >= 'A' && c <= 'Z') ||
+	       (c >= '0' && c <= '9') ||
+	       c == '_' ||
+	       c == '-'
 }
+
 
 @(private)
 parse_value :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 	c := peek(p)
 	switch {
 	case c == '"':
-		if peek(p, 1) == '"' && peek(p, 2) == '"' do return nil, fail(p, "multi-line strings are not supported")
+		if peek(p, 1) == '"' && peek(p, 2) == '"' {
+			return nil, fail(p, "multi-line strings are not supported")
+		}
 		return parse_basic_string(p)
+
 	case c == '\'':
-		if peek(p, 1) == '\'' && peek(p, 2) == '\'' do return nil, fail(p, "multi-line strings are not supported")
+		if peek(p, 1) == '\'' && peek(p, 2) == '\'' {
+			return nil, fail(p, "multi-line strings are not supported")
+		}
 		return parse_literal_string(p)
+
 	case c == '[':
 		return parse_array(p)
+
 	case c == '{':
 		return parse_inline_table(p)
+
 	case c == 't' || c == 'f':
 		for word in ([]string{"true", "false"}) {
 			if strings.has_prefix(p.src[p.pos:], word) && !is_bare_key_char(peek(p, len(word))) {
@@ -290,14 +337,17 @@ parse_value :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 				return word == "true", true
 			}
 		}
+
 	case c == '+' || c == '-' || (c >= '0' && c <= '9') || c == 'i' || c == 'n':
 		return parse_number(p)
 	}
 	return nil, fail(p, "expected a value")
 }
 
+
 @(private)
 parse_number :: proc(p: ^Parser) -> (v: Value, ok: bool) {
+	// The number's characters
 	start := p.pos
 	for !at_end(p) {
 		c := peek(p)
@@ -308,19 +358,26 @@ parse_number :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 		}
 	}
 	text, _ := strings.remove_all(p.src[start:p.pos], "_", context.temp_allocator)
+
 	switch text {
 	case "inf", "+inf": return math.INF_F64, true
 	case "-inf":        return math.NEG_INF_F64, true
 	}
-	if n, int_ok := strconv.parse_i64(text); int_ok do return n, true
-	if strings.contains_any(text, ".eE") {
-		if f, float_ok := strconv.parse_f64(text); float_ok do return f, true
+	if n, int_ok := strconv.parse_i64(text); int_ok {
+		return n, true
 	}
+	if strings.contains_any(text, ".eE") {
+		if f, float_ok := strconv.parse_f64(text); float_ok {
+			return f, true
+		}
+	}
+
 	if strings.contains_any(text, ":-") && len(text) >= 8 {
 		return nil, fail(p, "dates and times are not supported")
 	}
 	return nil, fail(p, strings.concatenate({"invalid number '", p.src[start:p.pos], "'"}))
 }
+
 
 @(private)
 parse_literal_string :: proc(p: ^Parser) -> (s: string, ok: bool) {
@@ -331,22 +388,28 @@ parse_literal_string :: proc(p: ^Parser) -> (s: string, ok: bool) {
 		p.pos += 1
 	}
 	if at_end(p) do return "", fail(p, "unterminated string")
+
 	s = strings.clone(p.src[start:p.pos])
 	p.pos += 1
 	return s, true
 }
+
 
 @(private)
 parse_basic_string :: proc(p: ^Parser) -> (s: string, ok: bool) {
 	p.pos += 1
 	sb := strings.builder_make()
 	for {
-		if at_end(p) || peek(p) == '\n' do return "", fail(p, "unterminated string")
+		if at_end(p) || peek(p) == '\n' {
+			return "", fail(p, "unterminated string")
+		}
+
 		c := peek(p)
 		p.pos += 1
 		switch c {
 		case '"':
 			return strings.to_string(sb), true
+
 		case '\\':
 			e := peek(p)
 			p.pos += 1
@@ -363,17 +426,20 @@ parse_basic_string :: proc(p: ^Parser) -> (s: string, ok: bool) {
 				if p.pos + n > len(p.src) do return "", fail(p, "bad unicode escape")
 				code, code_ok := strconv.parse_u64_of_base(p.src[p.pos:][:n], 16)
 				if !code_ok do return "", fail(p, "bad unicode escape")
+
 				p.pos += n
 				buf, size := utf8.encode_rune(rune(code))
 				strings.write_bytes(&sb, buf[:size])
 			case:
 				return "", fail(p, "unknown escape sequence")
 			}
+
 		case:
 			strings.write_byte(&sb, c)
 		}
 	}
 }
+
 
 @(private)
 parse_array :: proc(p: ^Parser) -> (v: Value, ok: bool) {
@@ -385,8 +451,10 @@ parse_array :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 			p.pos += 1
 			return items[:], true
 		}
+
 		item := parse_value(p) or_return
 		append(&items, item)
+
 		skip_space(p)
 		switch peek(p) {
 		case ',':
@@ -400,6 +468,7 @@ parse_array :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 	}
 }
 
+
 @(private)
 parse_inline_table :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 	p.pos += 1
@@ -409,8 +478,10 @@ parse_inline_table :: proc(p: ^Parser) -> (v: Value, ok: bool) {
 		p.pos += 1
 		return t, true
 	}
+
 	for {
 		parse_key_value(p, t) or_return
+
 		skip_inline_space(p)
 		switch peek(p) {
 		case ',':

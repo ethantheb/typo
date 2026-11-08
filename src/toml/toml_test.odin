@@ -26,17 +26,29 @@ inline = { a = 1, b.c = "x" }
 `
 	doc, err := parse(src)
 	defer destroy(doc)
-	if !testing.expectf(t, err.line == 0, "parse error at line %d: %s", err.line, err.msg) do return
+	if !testing.expectf(t, err.line == 0, "parse error at line %d: %s", err.line, err.msg) {
+		return
+	}
 
+	// Values
 	v, ok := get(doc.root, "title")
 	testing.expect_value(t, v.(string), "editor")
-	v, ok = get(doc.root, "appearance.theme");      testing.expect_value(t, v.(string), "dark")
-	v, ok = get(doc.root, "appearance.font_size");  testing.expect_value(t, v.(i64), 15)
-	v, ok = get(doc.root, "appearance.scale");      testing.expect_value(t, v.(f64), 1.25)
-	v, ok = get(doc.root, "appearance.big");        testing.expect_value(t, v.(i64), 1_000_000)
-	v, ok = get(doc.root, "appearance.hex");        testing.expect_value(t, v.(i64), 255)
-	v, ok = get(doc.root, "appearance.on");         testing.expect_value(t, v.(bool), true)
-	v, ok = get(doc.root, "keybindings.find_file"); testing.expect_value(t, v.(string), "Ctrl+E")
+	v, ok = get(doc.root, "appearance.theme")
+	testing.expect_value(t, v.(string), "dark")
+	v, ok = get(doc.root, "appearance.font_size")
+	testing.expect_value(t, v.(i64), 15)
+	v, ok = get(doc.root, "appearance.scale")
+	testing.expect_value(t, v.(f64), 1.25)
+	v, ok = get(doc.root, "appearance.big")
+	testing.expect_value(t, v.(i64), 1_000_000)
+	v, ok = get(doc.root, "appearance.hex")
+	testing.expect_value(t, v.(i64), 255)
+	v, ok = get(doc.root, "appearance.on")
+	testing.expect_value(t, v.(bool), true)
+	v, ok = get(doc.root, "keybindings.find_file")
+	testing.expect_value(t, v.(string), "Ctrl+E")
+
+	// Arrays and tables
 	v, ok = get(doc.root, "keybindings.redo")
 	arr := v.([]Value)
 	testing.expect_value(t, len(arr), 2)
@@ -48,9 +60,11 @@ inline = { a = 1, b.c = "x" }
 	testing.expect_value(t, len(v.([]Value)), 3)
 	v, ok = get(doc.root, "keybindings.inline.b.c")
 	testing.expect_value(t, v.(string), "x")
+
 	_, ok = get(doc.root, "appearance.missing")
 	testing.expect(t, !ok)
 }
+
 
 @(test)
 test_errors :: proc(t: ^testing.T) {
@@ -69,9 +83,11 @@ test_errors :: proc(t: ^testing.T) {
 		destroy(doc)
 		testing.expectf(t, err.msg == c[1], "%q: got %q, want %q", c[0], err.msg, c[1])
 	}
+
 	_, err := parse("ok = 1\n\nbad = ", context.temp_allocator)
 	testing.expect_value(t, err.line, 3)
 
+	// A quoted string reads back as itself
 	original := `a"b\c` + "\n"
 	q := quote(original)
 	doc, perr := parse(strings.concatenate({"k = ", q}, context.temp_allocator))
@@ -80,11 +96,13 @@ test_errors :: proc(t: ^testing.T) {
 	testing.expect_value(t, doc.root["k"].(string), original)
 }
 
+
 @(test)
 test_bom :: proc(t: ^testing.T) {
-	// UTF-8 byte-order mark (EF BB BF) followed by a key.
+	// UTF-8 byte-order mark (EF BB BF) followed by a key
 	bom := [3]u8{0xEF, 0xBB, 0xBF}
 	src := strings.concatenate({string(bom[:]), "a = 1"}, context.temp_allocator)
+
 	doc, err := parse(src)
 	defer destroy(doc)
 	testing.expect_value(t, err.line, 0)

@@ -9,7 +9,8 @@ import "core:sync"
 import sdl "../vendor/sdl3"
 
 // A lazily loaded directory tree. Directory contents are read the first time a
-// directory is expanded, so opening a large folder (or a drive root) is cheap.
+// directory is expanded, so opening a large folder (or a drive root) is cheap
+
 
 Node :: struct {
 	name:     string,
@@ -27,28 +28,43 @@ Workspace :: struct {
 	visible: [dynamic]int,  // flattened, in display order; rebuilt when the tree changes
 }
 
+
 // A folder's display name: its last path element, or the path itself for a
-// drive root like "C:\".
+// drive root like "C:\"
 folder_name :: proc(path: string) -> string {
 	name := filepath.base(strings.trim_right(path, "/\\"))
-	return name == "" || name == "." || strings.has_suffix(name, ":") ? path : name
+	is_drive := name == "" || name == "." || strings.has_suffix(name, ":")
+	return is_drive ? path : name
 }
 
-// `path` relative to the workspace root, or unchanged if outside it.
+
+// `path` relative to the workspace root, or unchanged if outside it
 relative_to_root :: proc(path: string) -> string {
 	root := g.workspace.root
-	if len(path) <= len(root) || !strings.has_prefix(path, root) do return path
+	if len(path) <= len(root) || !strings.has_prefix(path, root) {
+		return path
+	}
+
 	if is_separator(root[len(root) - 1]) do return path[len(root):] // a drive root like "C:\"
 	if is_separator(path[len(root)]) do return path[len(root) + 1:]
 	return path
 }
 
+
 workspace_open :: proc(ws: ^Workspace, root: string) {
 	workspace_destroy(ws)
+
 	ws.root = strings.clone(root)
-	append(&ws.nodes, Node{name = strings.clone(folder_name(root)), path = strings.clone(root), is_dir = true})
+	root_node := Node {
+		name   = strings.clone(folder_name(root)),
+		path   = strings.clone(root),
+		is_dir = true,
+	}
+	append(&ws.nodes, root_node)
+
 	workspace_toggle(ws, 0)
 }
+
 
 workspace_destroy :: proc(ws: ^Workspace) {
 	for &n in ws.nodes {
@@ -62,17 +78,24 @@ workspace_destroy :: proc(ws: ^Workspace) {
 	ws^ = {}
 }
 
-// Reads the tree again after files changed, keeping open folders open.
+
+// Reads the tree again after files changed, keeping open folders open
 workspace_refresh :: proc(ws: ^Workspace) {
 	expanded := make([dynamic]string, context.temp_allocator)
-	for n, i in ws.nodes do if i > 0 && n.expanded do append(&expanded, strings.clone(n.path, context.temp_allocator))
+	for n, i in ws.nodes {
+		if i > 0 && n.expanded {
+			append(&expanded, strings.clone(n.path, context.temp_allocator))
+		}
+	}
+
 	workspace_open(ws, strings.clone(ws.root, context.temp_allocator))
 	workspace_expand(ws, expanded[:])
 }
 
-// Expands the folders at `paths`, parents listed before their children.
+
+// Expands the folders at `paths`, parents listed before their children
 workspace_expand :: proc(ws: ^Workspace, paths: []string) {
-	// A parent comes before its children, so each is loaded by its turn.
+	// A parent comes before its children, so each is loaded by its turn
 	for path in paths {
 		for n, i in ws.nodes {
 			if n.is_dir && !n.expanded && n.path == path {
@@ -83,9 +106,11 @@ workspace_expand :: proc(ws: ^Workspace, paths: []string) {
 	}
 }
 
-// Expands or collapses a directory, reading its contents on first expand.
+
+// Expands or collapses a directory, reading its contents on first expand
 workspace_toggle :: proc(ws: ^Workspace, index: int) {
 	if !ws.nodes[index].is_dir do return
+
 	if !ws.nodes[index].loaded {
 		load_children(ws, index)
 	}
@@ -93,13 +118,17 @@ workspace_toggle :: proc(ws: ^Workspace, index: int) {
 	rebuild_visible(ws)
 }
 
-// Expands every directory between the root and `path` so it shows in the tree.
+
+// Expands every directory between the root and `path` so it shows in the tree
 workspace_reveal :: proc(ws: ^Workspace, path: string) {
 	index := 0
 	outer: for {
 		for child in ws.nodes[index].children {
 			node := ws.nodes[child]
-			if !node.is_dir || !is_path_prefix(node.path, path) do continue
+			if !node.is_dir || !is_path_prefix(node.path, path) {
+				continue
+			}
+
 			if !node.loaded do load_children(ws, child)
 			ws.nodes[child].expanded = true
 			index = child
@@ -107,17 +136,23 @@ workspace_reveal :: proc(ws: ^Workspace, path: string) {
 		}
 		break
 	}
+
 	rebuild_visible(ws)
 }
 
+
 @(private = "file")
 is_path_prefix :: proc(dir, path: string) -> bool {
-	return len(path) > len(dir) && strings.has_prefix(path, dir) && is_separator(path[len(dir)])
+	return len(path) > len(dir) &&
+	       strings.has_prefix(path, dir) &&
+	       is_separator(path[len(dir)])
 }
+
 
 is_separator :: proc(c: u8) -> bool {
 	return c == '/' || c == '\\'
 }
+
 
 @(private = "file")
 load_children :: proc(ws: ^Workspace, index: int) {
@@ -125,17 +160,17 @@ load_children :: proc(ws: ^Workspace, index: int) {
 	dir_path := ws.nodes[index].path
 	depth := ws.nodes[index].depth + (index == 0 ? 0 : 1)
 
+	// The entries, folders first
 	entries, ok := list_directory(dir_path)
 	if !ok do return
-	// As in core:os, directory symlinks and junctions show as files.
-	for &e in entries do e.is_dir = e.is_dir && !e.is_link
+	// As in core:os, directory symlinks and junctions show as files
+	for &e in entries {
+		e.is_dir = e.is_dir && !e.is_link
+	}
+	slice.sort_by(entries, dir_entry_less)
 
-	slice.sort_by(entries, proc(a, b: Dir_Entry) -> bool {
-		if a.is_dir != b.is_dir do return a.is_dir
-		return strings.to_lower(a.name, context.temp_allocator) < strings.to_lower(b.name, context.temp_allocator)
-	})
-
-	sep := is_separator(dir_path[len(dir_path) - 1]) ? "" : os.Path_Separator_String // a drive root like "C:\"
+	// The nodes. A drive root like "C:\" already ends in a separator
+	sep := is_separator(dir_path[len(dir_path) - 1]) ? "" : os.Path_Separator_String
 	for entry in entries {
 		child := len(ws.nodes)
 		append(&ws.nodes, Node {
@@ -144,26 +179,44 @@ load_children :: proc(ws: ^Workspace, index: int) {
 			is_dir = entry.is_dir,
 			depth  = depth,
 		})
-		// ws.nodes may have reallocated, so index rather than holding a pointer.
+		// ws.nodes may have reallocated, so index rather than holding a pointer
 		append(&ws.nodes[index].children, child)
 	}
 }
 
+
+// Folders before files, then by name, ignoring case
+@(private = "file")
+dir_entry_less :: proc(a, b: Dir_Entry) -> bool {
+	if a.is_dir != b.is_dir do return a.is_dir
+
+	a_name := strings.to_lower(a.name, context.temp_allocator)
+	b_name := strings.to_lower(b.name, context.temp_allocator)
+	return a_name < b_name
+}
+
+
 @(private = "file")
 rebuild_visible :: proc(ws: ^Workspace) {
 	clear(&ws.visible)
-	add :: proc(ws: ^Workspace, index: int) {
-		for child in ws.nodes[index].children {
-			append(&ws.visible, child)
-			if ws.nodes[child].expanded do add(ws, child)
-		}
-	}
-	add(ws, 0)
+	add_visible(ws, 0)
 }
 
-// --- Folder picker ------------------------------------------------------------
+
+// Adds the children of a node to the visible list, and theirs while expanded
+@(private = "file")
+add_visible :: proc(ws: ^Workspace, index: int) {
+	for child in ws.nodes[index].children {
+		append(&ws.visible, child)
+		if ws.nodes[child].expanded do add_visible(ws, child)
+	}
+}
+
+
+// --- Folder picker -----------------------------------------------------------------
+
 // SDL may invoke the dialog callback on another thread, so the result is handed
-// over through a mutex and applied on the main thread.
+// over through a mutex and applied on the main thread
 
 @(private = "file")
 picked: struct {
@@ -171,23 +224,33 @@ picked: struct {
 	path:  string,
 }
 
+
 show_open_folder_dialog :: proc() {
 	location := strings.clone_to_cstring(g.workspace.root, context.temp_allocator)
 	sdl.ShowOpenFolderDialog(folder_dialog_callback, nil, g.window, location, false)
 }
 
+
 @(private = "file")
 folder_dialog_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filter: i32) {
 	context = g.ctx
-	if filelist == nil || filelist[0] == nil do return // error or cancelled
+
+	// An error, or cancelled
+	if filelist == nil || filelist[0] == nil {
+		return
+	}
+
 	sync.lock(&picked.mutex)
 	delete(picked.path)
 	picked.path = strings.clone_from_cstring(filelist[0])
 	sync.unlock(&picked.mutex)
+
 	wake_main_loop(nil)
 }
 
-// Returns a folder chosen in the dialog since the last call, if any. Caller owns the string.
+
+// Returns a folder chosen in the dialog since the last call, if any. Caller owns
+// the string
 take_picked_folder :: proc() -> (path: string, ok: bool) {
 	sync.guard(&picked.mutex)
 	path, picked.path = picked.path, ""

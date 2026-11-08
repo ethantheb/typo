@@ -231,10 +231,72 @@ Rendered view (`mdview`):
   and per document + selections + column width (line layouts). A new pane width only
   refits tables. Lines have their own heights in a `Height_Map` (top margin: `pad`).
 
+## Code style
+
+Code should read like the author's own: airy, one idea per line, grouped into steps.
+New and changed code follows this; existing code is brought in line when touched.
+`.claude/hooks/check_style.py` checks the width and `do` rules after every Edit/Write
+of a file in src/ (so edit source with Edit/Write, not shell scripts).
+
+- **Width**: at most 100 columns, tabs counted as 4. Break a long signature or call
+  with its arguments on their own lines and the closing paren on its own line; break a
+  long condition at `&&`/`||`. A named intermediate value beats one long expression.
+- **Steps**: a procedure that does several things puts a blank line between them
+  (setup, the work, the result). A block of more than a few lines that is one step
+  starts with a short label comment.
+- **One-liners**: `if x do y` only when x is a single simple condition and y one simple
+  statement or call (`if !ok do return`). Anything more gets a braced block, guard
+  clauses included.
+- **One thing per line**: one statement per line. Multiple assignment only for values
+  that come together (`value, ok := ...`). Ternaries for simple picks, never nested.
+- **Top level**: two blank lines between procedures; constants and fields that belong
+  together are grouped and aligned. No procedures nested in procedures: a helper is a
+  top-level `@(private = "file")` proc beside its user.
+- **Comments**: short and plain, no trailing period on one-liners. A procedure gets a
+  one-line description of what it does when the name doesn't say it all ("Returns the
+  pane under the pointer, if any"). Inside, steps get labels ("// Close the files that
+  were inside it"). A comment says why when the code can't ("// ConPTY keeps its own
+  screen"). Trailing comments on struct fields are fine; `// --- Section ---` banners
+  split long files. About the current code only (no history, benchmarks, rejected
+  options, conversations).
+
+Example (before, then after):
+
+```odin
+path_deleted :: proc(path: string) {
+	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
+		if i >= len(g.panes.open) do continue
+		if e, ok := g.panes.open[i].content.(^Editor); ok && path_within(e.path, path) {
+			pane_close(g.panes.open[i], ask = false)
+		}
+	}
+	workspace_refresh(&g.workspace)
+	finder_invalidate()
+}
+```
+
+```odin
+// After deleting a file or folder: its open files close, and the tree and the
+// finder forget it
+path_deleted :: proc(path: string) {
+	// Close the files that were inside it
+	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
+		if i >= len(g.panes.open) do continue
+
+		pane := g.panes.open[i]
+		e, is_editor := pane.content.(^Editor)
+		if is_editor && path_within(e.path, path) {
+			pane_close(pane, ask = false)
+		}
+	}
+
+	workspace_refresh(&g.workspace)
+	finder_invalidate()
+}
+```
+
 ## Conventions
 
-- Comments: short, literal, about the current code only (no history, benchmarks,
-  rejected options, conversations). Skip them when the code says it.
 - Reuse helpers: `clicked`, `pointer_in`, `element_rect`, `gfx.rect_contains`,
   `gfx.draw_text`, `gfx.fill_rect`, `gfx.push_clip_box`, `input_box` +
   `text_field_event`, `modal` + `clicked_outside`, `dialog_show` (never a blocking

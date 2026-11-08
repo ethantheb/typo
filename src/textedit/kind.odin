@@ -10,55 +10,55 @@ import sdl "../../vendor/sdl3"
 // text view and the rendered Markdown view (mdview.KIND) are the two kinds; a
 // View's `kind` can change while it is open (toggling a Markdown file's view).
 // A kind keeps its own state in View.kind_data. Procs marked optional may be
-// nil, which means the plain behavior. Points are in window coordinates.
+// nil, which means the plain behavior. Points are in window coordinates
 Kind :: struct {
 	// Per frame: before the mouse is handled (lay out what is in view, with the
-	// bounds from the last layout), and after scrolling.
+	// bounds from the last layout), and after scrolling
 	frame_begin:  proc(v: ^View),
 	frame_end:    proc(v: ^View),
-	// Whether what is in view is ready to be drawn (nothing still loading). Optional.
+	// Whether what is in view is ready to be drawn (nothing still loading). Optional
 	ready:        proc(v: ^View) -> bool,
 	draw:         proc(v: ^View, b: gfx.Rect, scale: f32, caret_on: bool),
 
-	// The document offset nearest to a point.
+	// The document offset nearest to a point
 	offset_at:    proc(v: ^View, p: [2]f32) -> int,
-	// Whether a point is over the text, where a click places the caret.
+	// Whether a point is over the text, where a click places the caret
 	over_text:    proc(v: ^View, p: [2]f32) -> bool,
 	max_scroll:   proc(v: ^View) -> f64,
-	// The height of a line, for wheel steps and scrolling while dragging.
+	// The height of a line, for wheel steps and scrolling while dragging
 	scroll_step:  proc(v: ^View) -> f64,
-	// Moves the scroll target so the primary caret shows.
+	// Moves the scroll target so the primary caret shows
 	reveal:       proc(v: ^View),
-	// Whether two offsets are on the same visual row.
+	// Whether two offsets are on the same visual row
 	same_row:     proc(v: ^View, a, b: int) -> bool,
 
 	// Caret movement for Left, Right, Up, Down, Page_Up, Page_Down, Home and
 	// End (the others are the same in every view); col is the goal kept for
-	// vertical movement (Selection.col).
+	// vertical movement (Selection.col)
 	move:         proc(v: ^View, m: Move, s: Selection) -> (head, col: int),
 	page_height:  proc(v: ^View) -> f64,
 
 	// Moves carets out of text they can't be in (rendered table syntax); run
-	// by normalize. Optional.
+	// by normalize. Optional
 	snap:         proc(v: ^View),
 	// An editing key, after caret movement keys (see `key`). Returns whether it
-	// was handled.
+	// was handled
 	edit_key:     proc(v: ^View, key: sdl.KeyboardEvent) -> bool,
 	text_input:   proc(v: ^View, text: string),
 	// What copying [lo, hi) takes, with text that goes before and after it
-	// (the rendered view adds the markers of a partly selected line). Optional.
+	// (the rendered view adds the markers of a partly selected line). Optional
 	copy_range:   proc(v: ^View, lo, hi: int) -> (from, to: int, before, after: string),
 	// Replaces the selections with pasted text, or with nothing for a cut, its
 	// own way (cells of a rendered table). Returns false to have it done as
-	// plain text. Optional.
+	// plain text. Optional
 	replace:      proc(v: ^View, text: string) -> bool,
-	// After a cut or paste changed the document. Optional.
+	// After a cut or paste changed the document. Optional
 	edited:       proc(v: ^View),
 
 	// A view can hide its caret (the rendered view until a click in the text).
 	// Optional, with show_caret: a key while it is hidden goes to hidden_key
 	// first (done: no further handling, and whether it was handled);
-	// show_caret shows it, moving it into view first if `place`.
+	// show_caret shows it, moving it into view first if `place`
 	caret_hidden: proc(v: ^View) -> bool,
 	hidden_key:   proc(v: ^View, key: sdl.KeyboardEvent) -> (done, handled: bool),
 	show_caret:   proc(v: ^View, place: bool),
@@ -73,7 +73,7 @@ Kind :: struct {
 	// (made by a press, a triple click's block if `block`) to `offset` its own
 	// way; true if it did. drag_x: scrolls sideways while drag-selecting near
 	// the edges. release: the button went up after a drag-selection. pointer:
-	// how the pointer looks at p, if not the usual I-beam over text.
+	// how the pointer looks at p, if not the usual I-beam over text
 	press:        proc(v: ^View, p: [2]f32, mods: sdl.Keymod, clicks: int) -> bool,
 	capture:      proc(v: ^View) -> bool,
 	wheel_x:      proc(v: ^View, p: [2]f32, dx: f32) -> bool,
@@ -84,7 +84,14 @@ Kind :: struct {
 	pointer:      proc(v: ^View, p: [2]f32, over_text: bool) -> Pointer,
 }
 
-// The first proc a kind needs but lacks (those not marked optional), or "".
+Pointer :: enum {
+	Text,  // the I-beam over text, or the arrow elsewhere
+	Arrow, // over a control
+	Hand,  // over something a click acts on
+}
+
+
+// The first proc a kind needs but lacks (those not marked optional), or ""
 missing_proc :: proc(k: ^Kind) -> string {
 	required := [?]struct {
 		name: string,
@@ -104,18 +111,21 @@ missing_proc :: proc(k: ^Kind) -> string {
 		{"edit_key", k.edit_key != nil},
 		{"text_input", k.text_input != nil},
 	}
-	for r in required do if !r.set do return r.name
-	if (k.caret_hidden != nil) != (k.hidden_key != nil && k.show_caret != nil) do return "caret_hidden, hidden_key and show_caret"
+	for r in required {
+		if !r.set do return r.name
+	}
+
+	// The caret procs come together
+	hides_caret := k.caret_hidden != nil
+	shows_caret := k.hidden_key != nil && k.show_caret != nil
+	if hides_caret != shows_caret {
+		return "caret_hidden, hidden_key and show_caret"
+	}
 	return ""
 }
 
-Pointer :: enum {
-	Text,  // the I-beam over text, or the arrow elsewhere
-	Arrow, // over a control
-	Hand,  // over something a click acts on
-}
 
-// --- Movement ---------------------------------------------------------------------
+// --- Movement ----------------------------------------------------------------------
 
 Move :: enum {
 	Left,
@@ -132,15 +142,17 @@ Move :: enum {
 	Doc_End,
 }
 
-// Moves every selection's head (and its anchor too unless `extend`).
+
+// Moves every selection's head (and its anchor too unless `extend`)
 move :: proc(v: ^View, m: Move, extend: bool) {
 	for &s in v.sels {
-		// Left/Right on a selection without Shift collapses it to that side.
+		// Left/Right on a selection without Shift collapses it to that side
 		if !extend && s.anchor != s.head && (m == .Left || m == .Right) {
 			p := m == .Left ? sel_lo(s) : sel_hi(s)
 			s = {p, p, -1}
 			continue
 		}
+
 		col := -1
 		head := s.head
 		switch m {
@@ -153,15 +165,23 @@ move :: proc(v: ^View, m: Move, extend: bool) {
 		}
 		s = {extend ? s.anchor : head, head, col}
 	}
-	if m == .Page_Up || m == .Page_Down do v.target_y += (m == .Page_Up ? -1 : 1) * v.kind.page_height(v)
+
+	// Paging scrolls by a page too
+	if m == .Page_Up || m == .Page_Down {
+		dir: f64 = m == .Page_Up ? -1 : 1
+		v.target_y += dir * v.kind.page_height(v)
+	}
+
 	normalize(v)
 	v.reveal = true
 }
 
-// Caret movement and selection keys, the same in every view.
+
+// Caret movement and selection keys, the same in every view
 navigation_key :: proc(v: ^View, key: sdl.KeyboardEvent) -> bool {
 	ctrl := key.mod & sdl.KMOD_CTRL != {}
 	shift := key.mod & sdl.KMOD_SHIFT != {}
+
 	switch key.key {
 	case sdl.K_LEFT:     move(v, ctrl ? .Word_Left : .Left, shift)
 	case sdl.K_RIGHT:    move(v, ctrl ? .Word_Right : .Right, shift)
@@ -172,7 +192,9 @@ navigation_key :: proc(v: ^View, key: sdl.KeyboardEvent) -> bool {
 	case sdl.K_HOME:     move(v, ctrl ? .Doc_Start : .Home, shift)
 	case sdl.K_END:      move(v, ctrl ? .Doc_End : .End, shift)
 	case sdl.K_ESCAPE:
-		if len(v.sels) == 1 && v.sels[0].anchor == v.sels[0].head do return false
+		if len(v.sels) == 1 && v.sels[0].anchor == v.sels[0].head {
+			return false
+		}
 		single_cursor(v)
 	case:
 		return false
@@ -180,55 +202,72 @@ navigation_key :: proc(v: ^View, key: sdl.KeyboardEvent) -> bool {
 	return true
 }
 
+
 // A key in the view: while its caret is hidden, the kind's hidden_key first;
-// then caret movement; then the kind's editing keys.
+// then caret movement; then the kind's editing keys
 key :: proc(v: ^View, key: sdl.KeyboardEvent) -> bool {
 	if caret_hidden(v) {
-		if done, handled := v.kind.hidden_key(v, key); done do return handled
+		if done, handled := v.kind.hidden_key(v, key); done {
+			return handled
+		}
 	}
+
 	if navigation_key(v, key) do return true
 	return v.kind.edit_key(v, key)
 }
+
 
 caret_hidden :: proc(v: ^View) -> bool {
 	return v.kind.caret_hidden != nil && v.kind.caret_hidden(v)
 }
 
-// Shows a hidden caret, moving it into view first if `place`.
+
+// Shows a hidden caret, moving it into view first if `place`
 show_caret :: proc(v: ^View, place: bool) {
 	if caret_hidden(v) do v.kind.show_caret(v, place)
 }
 
-// Collapses to the primary caret (Escape).
+
+// Collapses to the primary caret (Escape)
 single_cursor :: proc(v: ^View) {
 	p := v.sels[v.primary].head
 	set_single_selection(v, {p, p, -1})
 }
 
+
 select_all :: proc(v: ^View) {
 	set_single_selection(v, {0, buffer.length(&v.buf), -1})
 }
 
-// Adds a caret on the row above (dir = -1) or below the outermost caret.
+
+// Adds a caret on the row above (dir = -1) or below the outermost caret
 add_cursor_vertical :: proc(v: ^View, dir: int) {
 	edge := dir < 0 ? v.sels[0] : v.sels[len(v.sels) - 1]
 	head, col := v.kind.move(v, dir < 0 ? .Up : .Down, edge)
 	if v.kind.same_row(v, head, edge.head) do return
+
 	append(&v.sels, Selection{head, head, col})
 	v.primary = len(v.sels) - 1
 	normalize(v)
 	v.reveal = true
 }
 
-// --- Undo -------------------------------------------------------------------------
+
+// --- Undo --------------------------------------------------------------------------
 
 undo :: proc(v: ^View) {
-	if sels, ok := buffer.undo(&v.buf); ok do restore_selections(v, sels)
+	if sels, ok := buffer.undo(&v.buf); ok {
+		restore_selections(v, sels)
+	}
 }
 
+
 redo :: proc(v: ^View) {
-	if sels, ok := buffer.redo(&v.buf); ok do restore_selections(v, sels)
+	if sels, ok := buffer.redo(&v.buf); ok {
+		restore_selections(v, sels)
+	}
 }
+
 
 @(private = "file")
 restore_selections :: proc(v: ^View, sels: []Selection) {
@@ -239,15 +278,19 @@ restore_selections :: proc(v: ^View, sels: []Selection) {
 	v.reveal = true
 }
 
-// --- Clipboard --------------------------------------------------------------------
+
+// --- Clipboard ---------------------------------------------------------------------
 
 // The text copying the selections takes (carets without a selection copy their
-// whole line), and with `cut` removes it.
+// whole line), and with `cut` removes it
 copy_text :: proc(v: ^View, cut: bool) -> string {
 	sb := strings.builder_make(context.temp_allocator)
 	whole_lines := true
-	for s in v.sels do if s.anchor != s.head do whole_lines = false
+	for s in v.sels {
+		if s.anchor != s.head do whole_lines = false
+	}
 
+	// Each selection's text, a line apart
 	ranges := make([][2]int, len(v.sels), context.temp_allocator)
 	for s, i in v.sels {
 		lo, hi := sel_lo(s), sel_hi(s)
@@ -256,33 +299,49 @@ copy_text :: proc(v: ^View, cut: bool) -> string {
 			lo, hi = line_span(v, buffer.offset_to_line(&v.buf, lo))
 		} else if v.kind.copy_range != nil {
 			lo, hi, before, after = v.kind.copy_range(v, lo, hi)
-			// Grown ranges can overlap: start each after the previous one.
+			// Grown ranges can overlap: start each after the previous one
 			if i > 0 do lo = min(max(lo, ranges[i - 1][1]), hi)
 		}
 		ranges[i] = {lo, hi}
-		if i > 0 && !whole_lines do strings.write_string(&sb, buffer.newline(&v.buf))
+
+		if i > 0 && !whole_lines {
+			strings.write_string(&sb, buffer.newline(&v.buf))
+		}
 		strings.write_string(&sb, before)
 		strings.write_bytes(&sb, buffer.read_alloc(&v.buf, lo, hi))
 		strings.write_string(&sb, after)
 	}
+
 	if cut {
 		version := v.buf.version
-		if v.kind.replace == nil || !v.kind.replace(v, "") do apply(v, .Other, ranges, {""})
-		if v.kind.edited != nil && v.buf.version != version do v.kind.edited(v)
+		if v.kind.replace == nil || !v.kind.replace(v, "") {
+			apply(v, .Other, ranges, {""})
+		}
+		if v.kind.edited != nil && v.buf.version != version {
+			v.kind.edited(v)
+		}
 	}
 	return strings.to_string(sb)
 }
 
+
 // Pastes text, with its line endings made the document's. With as many lines
-// as carets, each caret gets one.
+// as carets, each caret gets one
 paste :: proc(v: ^View, text: string) {
 	if len(text) == 0 do return
+
 	text, _ := strings.replace_all(text, "\r\n", "\n", context.temp_allocator)
 	if v.buf.crlf do text, _ = strings.replace_all(text, "\n", "\r\n", context.temp_allocator)
-	version := v.buf.version
-	defer if v.kind.edited != nil && v.buf.version != version do v.kind.edited(v)
-	if v.kind.replace != nil && v.kind.replace(v, text) do return
 
+	version := v.buf.version
+	defer if v.kind.edited != nil && v.buf.version != version {
+		v.kind.edited(v)
+	}
+	if v.kind.replace != nil && v.kind.replace(v, text) {
+		return
+	}
+
+	// One line per caret, or the whole text at each
 	parts := strings.split(text, buffer.newline(&v.buf), context.temp_allocator)
 	if len(v.sels) > 1 && len(parts) == len(v.sels) {
 		apply(v, .Other, selection_ranges(v), parts)
@@ -291,10 +350,12 @@ paste :: proc(v: ^View, text: string) {
 	}
 }
 
+
 // Replaces [lo, hi) with text of the same length as one undo step, leaving the
-// selections where they are (toggling a task box).
+// selections where they are (toggling a task box)
 replace_in_place :: proc(v: ^View, lo, hi: int, text: string) {
 	assert(hi - lo == len(text))
+
 	buffer.begin(&v.buf, .Other, now(), v.sels[:])
 	buffer.replace(&v.buf, lo, hi - lo, text)
 	buffer.end(&v.buf, v.sels[:])

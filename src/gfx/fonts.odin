@@ -18,18 +18,19 @@ import ttf "../../vendor/sdl3/ttf"
 // the first time the list is needed (to load a configured family that isn't
 // bundled, which shows the bundled font until then) and again each time the font
 // list opens, so fonts installed meanwhile appear; the old list stays in use
-// until the new one is ready.
+// until the new one is ready
 
-BUNDLED_FAMILY :: "IBM Plex Mono"
+
+BUNDLED_FAMILY    :: "IBM Plex Mono"
 BUNDLED_MD_FAMILY :: "Instrument Sans"
 BUNDLED_PLEX_SANS :: "IBM Plex Sans"
 
-// Where to load a font from.
+// Where to load a font from
 Font_Source :: struct {
-	data: []u8,   // a bundled font, or
-	path: string, // a font file
-	// Face in a collection; for a variable font, plus the named instance << 16.
-	face: i64,
+	data:             []u8,   // a bundled font, or
+	path:             string, // a font file
+	// Face in a collection; for a variable font, plus the named instance << 16
+	face:             i64,
 	synthetic_italic: bool, // slant an upright face (the family has no italic)
 }
 
@@ -57,12 +58,36 @@ BUNDLED_FACES := [?]Font_Face {
 }
 
 BUNDLED_MD_FACES := [?]Font_Face {
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Regular.ttf")}, 400, false},
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-SemiBold.ttf")}, 600, false},
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Bold.ttf")}, 700, false},
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Italic.ttf")}, 400, true},
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-BoldItalic.ttf")}, 700, true},
-	{{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Medium.ttf")}, 500, false},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Regular.ttf")},
+		400,
+		false,
+	},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-SemiBold.ttf")},
+		600,
+		false,
+	},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Bold.ttf")},
+		700,
+		false,
+	},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Italic.ttf")},
+		400,
+		true,
+	},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-BoldItalic.ttf")},
+		700,
+		true,
+	},
+	{
+		{data = #load("../../assets/fonts/Instrument_Sans/static/InstrumentSans-Medium.ttf")},
+		500,
+		false,
+	},
 }
 
 BUNDLED_PLEX_SANS_FACES := [?]Font_Face {
@@ -73,7 +98,7 @@ BUNDLED_PLEX_SANS_FACES := [?]Font_Face {
 	{{data = #load("../../assets/fonts/IBMPlexSans-BoldItalic.ttf")}, 700, true},
 }
 
-// The faces rendered Markdown is drawn with.
+// The faces rendered Markdown is drawn with
 Md_Face :: enum {
 	Regular,
 	Italic,
@@ -83,17 +108,17 @@ Md_Face :: enum {
 }
 
 System_Fonts :: struct {
-	scan:      ^Font_Scan,
-	scan_ms:   f64,                  // how long the scan took
-	families:  [dynamic]Font_Family, // sorted by name; replaced when a scan finishes
-	scanned:   bool,                 // a scan has finished
+	scan:     ^Font_Scan,
+	scan_ms:  f64,                  // how long the scan took
+	families: [dynamic]Font_Family, // sorted by name; replaced when a scan finishes
+	scanned:  bool,                 // a scan has finished
 }
 
-// Lists the files under `root` (see walk_files in the app's fs_walk.odin).
+// Lists the files under `root` (see walk_files in the app's fs_walk.odin)
 Walk_Visit :: proc(path: string, user: rawptr) -> bool
 Walk_Files :: proc(root: string, ignore: []string, cancel: ^bool, user: rawptr, visit: Walk_Visit)
 
-// Shared with the scanning thread.
+// Shared with the scanning thread
 Font_Scan :: struct {
 	walk:     Walk_Files,
 	thread:   ^thread.Thread,
@@ -105,13 +130,15 @@ Font_Scan :: struct {
 	finished: time.Tick,
 }
 
+
 // The folders fonts are installed in. Not in the temp allocator, which the
-// directory walk frees as it goes.
+// directory walk frees as it goes
 when ODIN_OS == .Windows {
 	@(private = "file")
 	font_dirs :: proc() -> [dynamic]string {
 		windir := os.get_env("WINDIR", context.temp_allocator)
 		local := os.get_env("LOCALAPPDATA", context.temp_allocator)
+
 		dirs := make([dynamic]string)
 		append(&dirs, strings.concatenate({windir != "" ? windir : `C:\Windows`, `\Fonts`}))
 		if local != "" do append(&dirs, strings.concatenate({local, `\Microsoft\Windows\Fonts`}))
@@ -121,6 +148,7 @@ when ODIN_OS == .Windows {
 	@(private = "file")
 	font_dirs :: proc() -> [dynamic]string {
 		home := os.get_env("HOME", context.temp_allocator)
+
 		dirs := make([dynamic]string)
 		append(&dirs, strings.clone("/System/Library/Fonts"), strings.clone("/Library/Fonts"))
 		if home != "" do append(&dirs, strings.concatenate({home, "/Library/Fonts"}))
@@ -130,6 +158,7 @@ when ODIN_OS == .Windows {
 	@(private = "file")
 	font_dirs :: proc() -> [dynamic]string {
 		home := os.get_env("HOME", context.temp_allocator)
+
 		dirs := make([dynamic]string)
 		append(&dirs, strings.clone("/usr/share/fonts"), strings.clone("/usr/local/share/fonts"))
 		if home != "" {
@@ -140,37 +169,54 @@ when ODIN_OS == .Windows {
 	}
 }
 
+
+// --- Installed fonts ---------------------------------------------------------------
+
 // Starts looking for installed fonts on a background thread, unless a scan is
-// running or (without `again`) one has already finished. `walk` lists the files.
+// running or (without `again`) one has already finished. `walk` lists the files
 fonts_scan :: proc(sf: ^System_Fonts, walk: Walk_Files, again := false) {
-	if sf.scan != nil || (sf.scanned && !again) do return
+	if sf.scan != nil || (sf.scanned && !again) {
+		return
+	}
+
 	sf.scan = new(Font_Scan)
 	sf.scan.walk = walk
 	sf.scan.started = time.tick_now()
-	sf.scan.thread = thread.create_and_start_with_poly_data(sf.scan, scan_fonts, init_context = runtime.default_context())
+	sf.scan.thread = thread.create_and_start_with_poly_data(
+		sf.scan,
+		scan_fonts,
+		init_context = runtime.default_context(),
+	)
 }
+
 
 fonts_scanning :: proc(sf: ^System_Fonts) -> bool {
 	return sf.scan != nil
 }
 
-// Takes the scan's results once it has finished. Returns true on that frame.
+
+// Takes the scan's results once it has finished. Returns true on that frame
 fonts_poll :: proc(sf: ^System_Fonts) -> bool {
 	s := sf.scan
 	if s == nil do return false
+
 	done: bool
 	if sync.guard(&s.mutex) do done = s.done
 	if !done do return false
+
 	thread.join(s.thread)
 	thread.destroy(s.thread)
+
 	families_destroy(&sf.families)
 	sf.families = s.found
 	sf.scan_ms = time.duration_milliseconds(time.tick_diff(s.started, s.finished))
 	sf.scanned = true
+
 	free(s)
 	sf.scan = nil
 	return true
 }
+
 
 fonts_destroy :: proc(sf: ^System_Fonts) {
 	if s := sf.scan; s != nil {
@@ -180,9 +226,11 @@ fonts_destroy :: proc(sf: ^System_Fonts) {
 		families_destroy(&s.found)
 		free(s)
 	}
+
 	families_destroy(&sf.families)
 	sf^ = {}
 }
+
 
 @(private = "file")
 families_destroy :: proc(families: ^[dynamic]Font_Family) {
@@ -194,37 +242,55 @@ families_destroy :: proc(families: ^[dynamic]Font_Family) {
 	delete(families^)
 }
 
+
+// --- Choosing faces ----------------------------------------------------------------
+
 // The editor font names to choose from: the bundled one, then the installed
-// monospace ones.
+// monospace ones
 font_family_names :: proc(sf: ^System_Fonts) -> []string {
 	names := make([dynamic]string, 0, len(sf.families) + 1, context.temp_allocator)
 	append(&names, BUNDLED_FAMILY)
-	for f in sf.families do if f.monospace do append(&names, f.name)
+
+	for f in sf.families {
+		if f.monospace do append(&names, f.name)
+	}
 	return names[:]
 }
 
+
 // The Markdown font names to choose from: the bundled one, then every
-// installed family.
+// installed family
 markdown_family_names :: proc(sf: ^System_Fonts) -> []string {
 	names := make([dynamic]string, 0, len(sf.families) + 2, context.temp_allocator)
 	append(&names, BUNDLED_MD_FAMILY, BUNDLED_PLEX_SANS, BUNDLED_FAMILY)
+
 	for f in sf.families do append(&names, f.name)
 	return names[:]
 }
 
-// Whether `family` is known to be unavailable, so a bundled font is shown instead.
+
+// Whether `family` is known to be unavailable, so a bundled font is shown instead
 font_family_missing :: proc(sf: ^System_Fonts, family: string) -> bool {
-	if is_bundled_family(family) || !sf.scanned do return false
-	for f in sf.families do if f.name == family do return false
+	if is_bundled_family(family) || !sf.scanned {
+		return false
+	}
+
+	for f in sf.families {
+		if f.name == family do return false
+	}
 	return true
 }
 
+
 is_bundled_family :: proc(family: string) -> bool {
-	return family == BUNDLED_FAMILY || family == BUNDLED_MD_FAMILY || family == BUNDLED_PLEX_SANS
+	return family == BUNDLED_FAMILY ||
+	       family == BUNDLED_MD_FAMILY ||
+	       family == BUNDLED_PLEX_SANS
 }
 
+
 // The faces of `family`, or nil (with found = false) while the installed fonts
-// haven't been scanned or don't include it.
+// haven't been scanned or don't include it
 @(private = "file")
 family_faces :: proc(sf: ^System_Fonts, family: string) -> (faces: []Font_Face, found: bool) {
 	switch family {
@@ -232,85 +298,116 @@ family_faces :: proc(sf: ^System_Fonts, family: string) -> (faces: []Font_Face, 
 	case BUNDLED_MD_FAMILY: return BUNDLED_MD_FACES[:], true
 	case BUNDLED_PLEX_SANS: return BUNDLED_PLEX_SANS_FACES[:], true
 	}
-	for &f in sf.families do if f.name == family do return f.faces[:], true
+
+	for &f in sf.families {
+		if f.name == family do return f.faces[:], true
+	}
 	return nil, false
 }
+
 
 // The faces to draw the editor with: the family's regular, bold and italic
 // styles at the weights nearest the requested one. found is false (and the
 // bundled family is used) while the installed fonts haven't been scanned or
-// don't include it.
-font_family_sources :: proc(sf: ^System_Fonts, family: string, weight: int) -> (regular, bold, italic: Font_Source, found: bool) {
+// don't include it
+font_family_sources :: proc(
+	sf: ^System_Fonts,
+	family: string,
+	weight: int,
+) -> (
+	regular, bold, italic: Font_Source,
+	found: bool,
+) {
 	faces: []Font_Face
 	faces, found = family_faces(sf, family)
 	if !found do faces = BUNDLED_FACES[:]
+
 	r := nearest_face(faces, weight)
-	// Bold is two steps heavier than the text, and at least 700.
+	// Bold is two steps heavier than the text, and at least 700
 	b := nearest_face(faces, max(weight + 200, 700), heavier_than = r.weight)
-	return r.source, b.source, nearest_face(faces, weight, italic = true).source, found
+	i := nearest_face(faces, weight, italic = true)
+	return r.source, b.source, i.source, found
 }
 
-// The faces to draw rendered Markdown with, from `family` or the bundled one.
-markdown_family_sources :: proc(sf: ^System_Fonts, family: string) -> (sources: [Md_Face]Font_Source, found: bool) {
+
+// The faces to draw rendered Markdown with, from `family` or the bundled one
+markdown_family_sources :: proc(
+	sf: ^System_Fonts,
+	family: string,
+) -> (
+	sources: [Md_Face]Font_Source,
+	found: bool,
+) {
 	faces: []Font_Face
 	faces, found = family_faces(sf, family)
 	if !found do faces = BUNDLED_MD_FACES[:]
+
 	regular := nearest_face(faces, 400)
+	heavier := regular.weight
 	sources[.Regular] = regular.source
 	sources[.Italic] = nearest_face(faces, 400, italic = true).source
-	sources[.SemiBold] = nearest_face(faces, 600, heavier_than = regular.weight).source
-	sources[.Bold] = nearest_face(faces, 700, heavier_than = regular.weight).source
-	sources[.Bold_Italic] = nearest_face(faces, 700, heavier_than = regular.weight, italic = true).source
+	sources[.SemiBold] = nearest_face(faces, 600, heavier_than = heavier).source
+	sources[.Bold] = nearest_face(faces, 700, heavier_than = heavier).source
+	sources[.Bold_Italic] = nearest_face(faces, 700, heavier_than = heavier, italic = true).source
 	return
 }
 
+
 // The face nearest `weight` in the wanted style. Without italic faces, an
-// upright one is slanted.
+// upright one is slanted
 @(private = "file")
-nearest_face :: proc(faces: []Font_Face, weight: int, heavier_than := 0, italic := false) -> Font_Face {
+nearest_face :: proc(
+	faces: []Font_Face,
+	weight: int,
+	heavier_than := 0,
+	italic := false,
+) -> Font_Face {
 	best := faces[0]
 	best_d := max(int)
 	for f in faces {
 		d := abs(f.weight - weight)
-		// Fall back to lighter faces only when nothing heavier exists.
+		// Fall back to lighter faces only when nothing heavier exists
 		if f.weight <= heavier_than do d += 1000
 		if f.italic != italic do d += 10_000
 		if d < best_d do best, best_d = f, d
 	}
-	if italic && !best.italic do best.synthetic_italic = true
+
+	if italic && !best.italic {
+		best.synthetic_italic = true
+	}
 	return best
 }
 
-// --- Scanning thread --------------------------------------------------------------
+
+// --- Scanning thread ---------------------------------------------------------------
+
+@(private = "file")
+Scan_State :: struct {
+	scan:  ^Font_Scan,
+	found: ^[dynamic]Font_Family,
+}
+
 
 @(private = "file")
 scan_fonts :: proc(s: ^Font_Scan) {
-	State :: struct {
-		scan:  ^Font_Scan,
-		found: ^[dynamic]Font_Family,
-	}
-	visit :: proc(path: string, user: rawptr) -> bool {
-		st := (^State)(user)
-		ext := strings.to_lower(os.ext(path), context.temp_allocator)
-		if ext == ".ttf" || ext == ".otf" || ext == ".ttc" || ext == ".otc" do add_font_file(st.found, path)
-		return !sync.atomic_load(&st.scan.cancel)
-	}
-
+	// Every font file in the font folders
 	found := make([dynamic]Font_Family)
-	st := State{s, &found}
+	st := Scan_State{s, &found}
 	dirs := font_dirs()
 	for dir in dirs {
-		s.walk(dir, nil, &s.cancel, &st, visit)
+		s.walk(dir, nil, &s.cancel, &st, visit_font_file)
 		delete(dir)
 	}
 	delete(dirs)
-	slice.sort_by(found[:], proc(a, b: Font_Family) -> bool {
-		return strings.compare(strings.to_lower(a.name, context.temp_allocator), strings.to_lower(b.name, context.temp_allocator)) < 0
-	})
+
+	// Families by name, faces by weight
+	slice.sort_by(found[:], family_name_less)
 	for &f in found {
-		slice.sort_by(f.faces[:], proc(a, b: Font_Face) -> bool {return a.weight < b.weight})
+		slice.sort_by(f.faces[:], face_weight_less)
 	}
 	free_all(context.temp_allocator)
+
+	// Hand them over
 	sync.guard(&s.mutex)
 	s.found = found
 	s.done = true
@@ -318,8 +415,34 @@ scan_fonts :: proc(s: ^Font_Scan) {
 	if wake != nil do wake(nil)
 }
 
+
+@(private = "file")
+visit_font_file :: proc(path: string, user: rawptr) -> bool {
+	st := (^Scan_State)(user)
+	ext := strings.to_lower(os.ext(path), context.temp_allocator)
+	if ext == ".ttf" || ext == ".otf" || ext == ".ttc" || ext == ".otc" {
+		add_font_file(st.found, path)
+	}
+	return !sync.atomic_load(&st.scan.cancel)
+}
+
+
+@(private = "file")
+family_name_less :: proc(a, b: Font_Family) -> bool {
+	a_name := strings.to_lower(a.name, context.temp_allocator)
+	b_name := strings.to_lower(b.name, context.temp_allocator)
+	return strings.compare(a_name, b_name) < 0
+}
+
+
+@(private = "file")
+face_weight_less :: proc(a, b: Font_Face) -> bool {
+	return a.weight < b.weight
+}
+
+
 // Adds the faces in one font file, including the named instances (Light,
-// Bold, ...) of a variable font.
+// Bold, ...) of a variable font
 @(private = "file")
 add_font_file :: proc(found: ^[dynamic]Font_Family, path: string) {
 	cpath := strings.clone_to_cstring(path, context.temp_allocator)
@@ -328,80 +451,115 @@ add_font_file :: proc(found: ^[dynamic]Font_Family, path: string) {
 		font := open_face(cpath, i64(face))
 		if font == nil do return
 		defer ttf.CloseFont(font)
+
 		if face == 0 do faces = max(int(ttf.GetNumFontFaces(font)), 1)
 		if !has_ascii(font) do continue
 		add_face(found, font, path, i64(face), int(ttf.GetFontWeight(font)))
 
 		// FreeType ignores the instance bits for a font without variations, so
-		// one whose first two instances look like the face itself has none.
+		// one whose first two instances look like the face itself has none
 		base := string(ttf.GetFontStyleName(font))
 		for instance := 1; instance < 64; instance += 1 {
 			index := i64(instance) << 16 | i64(face)
 			inst := open_face(cpath, index)
 			if inst == nil do break
+
 			style := string(ttf.GetFontStyleName(inst))
 			if instance <= 2 && style == base {
 				ttf.CloseFont(inst)
 				if instance == 2 do break
 				continue
 			}
+
 			weight, named := weight_from_style(style)
-			add_face(found, inst, path, index, named ? weight : int(ttf.GetFontWeight(inst)))
+			inst_weight := named ? weight : int(ttf.GetFontWeight(inst))
+			add_face(found, inst, path, index, inst_weight)
 			ttf.CloseFont(inst)
 		}
 	}
 }
 
-// Some CJK fonts are fixed width without having Latin letters.
+
+// Some CJK fonts are fixed width without having Latin letters
 @(private = "file")
 has_ascii :: proc(font: ^ttf.Font) -> bool {
-	for r in "aZ09{}" do if !ttf.FontHasGlyph(font, u32(r)) do return false
+	for r in "aZ09{}" {
+		if !ttf.FontHasGlyph(font, u32(r)) do return false
+	}
 	return true
 }
+
 
 @(private = "file")
 open_face :: proc(path: cstring, index: i64) -> ^ttf.Font {
 	props := sdl.CreateProperties()
 	defer sdl.DestroyProperties(props)
+
 	_ = sdl.SetStringProperty(props, ttf.PROP_FONT_CREATE_FILENAME_STRING, path)
 	_ = sdl.SetFloatProperty(props, ttf.PROP_FONT_CREATE_SIZE_FLOAT, 12)
 	_ = sdl.SetNumberProperty(props, ttf.PROP_FONT_CREATE_FACE_NUMBER, index)
 	return ttf.OpenFontWithProperties(props)
 }
 
+
 @(private = "file")
-add_face :: proc(found: ^[dynamic]Font_Family, font: ^ttf.Font, path: string, index: i64, weight: int) {
+add_face :: proc(
+	found: ^[dynamic]Font_Family,
+	font: ^ttf.Font,
+	path: string,
+	index: i64,
+	weight: int,
+) {
 	name := string(ttf.GetFontFamilyName(font))
 	style := strings.to_lower(string(ttf.GetFontStyleName(font)), context.temp_allocator)
-	if name == "" || is_bundled_family(name) do return
+	if name == "" || is_bundled_family(name) {
+		return
+	}
 	italic := strings.contains(style, "italic") || strings.contains(style, "oblique")
+
+	// Its family, added if new
 	family: ^Font_Family
-	for &f in found do if f.name == name do family = &f
+	for &f in found {
+		if f.name == name do family = &f
+	}
 	if family == nil {
 		append(found, Font_Family{name = strings.clone(name)})
 		family = &found[len(found) - 1]
 	}
-	if !italic && ttf.FontIsFixedWidth(font) do family.monospace = true
+	if !italic && ttf.FontIsFixedWidth(font) {
+		family.monospace = true
+	}
+
+	// The face, unless the family has one of that weight and style
 	weight := clamp(weight, 100, 900)
-	for f in family.faces do if f.weight == weight && f.italic == italic do return
+	for f in family.faces {
+		if f.weight == weight && f.italic == italic {
+			return
+		}
+	}
 	append(&family.faces, Font_Face{{path = strings.clone(path), face = index}, weight, italic})
 }
 
-// The weight a style name such as "SemiBold" or "Extra Light" stands for.
+
+// The weight a style name such as "SemiBold" or "Extra Light" stands for
 @(private = "file")
 weight_from_style :: proc(style: string) -> (int, bool) {
-	s, _ := strings.replace_all(strings.to_lower(style, context.temp_allocator), " ", "", context.temp_allocator)
+	lower := strings.to_lower(style, context.temp_allocator)
+	s, _ := strings.replace_all(lower, " ", "", context.temp_allocator)
 	s, _ = strings.replace_all(s, "-", "", context.temp_allocator)
+
 	NAMES := [?]struct {
 		name:   string,
 		weight: int,
 	} {
-		// Longer names first, so "extrabold" isn't taken for "bold".
+		// Longer names first, so "extrabold" isn't taken for "bold"
 		{"extralight", 200}, {"ultralight", 200}, {"semilight", 350}, {"demilight", 350},
 		{"extrabold", 800}, {"ultrabold", 800}, {"semibold", 600}, {"demibold", 600},
 		{"hairline", 100}, {"thin", 100}, {"light", 300}, {"regular", 400}, {"normal", 400},
 		{"book", 400}, {"medium", 500}, {"bold", 700}, {"black", 900}, {"heavy", 900},
 	}
-	for n in NAMES do if strings.contains(s, n.name) do return n.weight, true
+	for n in NAMES {
+		if strings.contains(s, n.name) do return n.weight, true
+	}
 	return 0, false
 }

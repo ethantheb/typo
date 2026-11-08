@@ -4,7 +4,8 @@ package buffer
 // (a randomized balanced binary tree keyed by position). Each node caches the
 // byte length and line-feed count of its subtree, so offset/line lookups and
 // split/merge are O(log pieces). Nodes live in one pool and refer to each other
-// by index, which keeps the tree compact and allocation-free in steady state.
+// by index, which keeps the tree compact and allocation-free in steady state
+
 
 Source :: enum u8 {
 	Original, // the file as loaded; never modified
@@ -28,27 +29,34 @@ Node :: struct {
 	lf:          int, // subtree line-feed count
 }
 
+
 @(private)
 new_node :: proc(b: ^Buffer, piece: Piece) -> u32 {
+	// Next random priority (xorshift)
 	b.rng ~= b.rng << 13
 	b.rng ~= b.rng >> 17
 	b.rng ~= b.rng << 5
+
 	node := Node{piece = piece, priority = b.rng, len = piece.length, lf = piece.lf}
 	if n, ok := pop_safe(&b.free); ok {
 		b.nodes[n] = node
 		return n
 	}
+
 	append(&b.nodes, node)
 	return u32(len(b.nodes) - 1)
 }
 
+
 @(private)
 free_subtree :: proc(b: ^Buffer, t: u32) {
 	if t == NIL do return
+
 	free_subtree(b, b.nodes[t].left)
 	free_subtree(b, b.nodes[t].right)
 	append(&b.free, t)
 }
+
 
 @(private)
 update :: proc(b: ^Buffer, t: u32) {
@@ -58,30 +66,35 @@ update :: proc(b: ^Buffer, t: u32) {
 	n.lf = l.lf + n.piece.lf + r.lf
 }
 
+
 @(private)
 merge :: proc(b: ^Buffer, x, y: u32) -> u32 {
 	if x == NIL do return y
 	if y == NIL do return x
+
 	if b.nodes[x].priority > b.nodes[y].priority {
 		b.nodes[x].right = merge(b, b.nodes[x].right, y)
 		update(b, x)
 		return x
 	}
+
 	b.nodes[y].left = merge(b, x, b.nodes[y].left)
 	update(b, y)
 	return y
 }
 
+
 // Splits t into the first `offset` bytes and the rest, cutting a piece in two
-// if the offset falls inside it.
+// if the offset falls inside it
 @(private)
 split :: proc(b: ^Buffer, t: u32, offset: int) -> (l, r: u32) {
 	if t == NIL do return NIL, NIL
+
 	left_len := b.nodes[b.nodes[t].left].len
 	piece := b.nodes[t].piece
 
 	switch {
-	// Recursive splits can allocate (and so move) nodes: assign results after the call.
+	// Recursive splits can allocate (and so move) nodes: assign results after the call
 	case offset <= left_len:
 		sl, sr := split(b, b.nodes[t].left, offset)
 		b.nodes[t].left = sr
@@ -110,30 +123,37 @@ split :: proc(b: ^Buffer, t: u32, offset: int) -> (l, r: u32) {
 	}
 }
 
-// Appends the pieces of t, in order, to out.
+
+// Appends the pieces of t, in order, to out
 @(private)
 collect :: proc(b: ^Buffer, t: u32, out: ^[dynamic]Piece) {
 	if t == NIL do return
+
 	collect(b, b.nodes[t].left, out)
 	append(out, b.nodes[t].piece)
 	collect(b, b.nodes[t].right, out)
 }
 
+
 // If the last piece of t is the most recent text in the add store, grows it by
 // `piece` (which must directly follow it) and returns true. This makes
-// sequential typing extend one node instead of creating one per keystroke.
+// sequential typing extend one node instead of creating one per keystroke
 @(private)
 try_extend_last :: proc(b: ^Buffer, t: u32, piece: Piece) -> bool {
 	if t == NIL do return false
+
 	n := &b.nodes[t]
 	if n.right != NIL {
 		if !try_extend_last(b, n.right, piece) do return false
 	} else {
 		p := &n.piece
-		if p.source != .Added || p.start + p.length != piece.start do return false
+		if p.source != .Added || p.start + p.length != piece.start {
+			return false
+		}
 		p.length += piece.length
 		p.lf += piece.lf
 	}
+
 	update(b, t)
 	return true
 }

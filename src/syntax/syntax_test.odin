@@ -9,6 +9,7 @@ import "../buffer"
 
 // Run with: python build.py --test  (builds the tree-sitter library first)
 
+
 SAMPLE :: `package demo
 
 import "core:fmt"
@@ -25,12 +26,14 @@ add :: proc(a: int, b: int) -> int {
 }
 `
 
+
 @(private = "file")
 make_buffer :: proc(s: string) -> buffer.Buffer {
 	b: buffer.Buffer
 	buffer.buffer_init(&b, transmute([]u8)strings.clone(s))
 	return b
 }
+
 
 @(private = "file")
 highlight_all :: proc(h: ^Highlighter, b: ^buffer.Buffer) -> []Highlight {
@@ -39,7 +42,8 @@ highlight_all :: proc(h: ^Highlighter, b: ^buffer.Buffer) -> []Highlight {
 	return out
 }
 
-// Highlight of the n-th occurrence (0-based) of `needle` in `text`, at its first byte.
+
+// Highlight of the n-th occurrence (0-based) of `needle` in `text`, at its first byte
 @(private = "file")
 hl_at :: proc(hl: []Highlight, text, needle: string, nth := 0, offset := 0) -> Highlight {
 	pos := -1
@@ -52,6 +56,7 @@ hl_at :: proc(hl: []Highlight, text, needle: string, nth := 0, offset := 0) -> H
 	}
 	return hl[pos + offset]
 }
+
 
 @(private = "file")
 check_sample :: proc(t: ^testing.T, hl: []Highlight, structural: bool) {
@@ -67,67 +72,83 @@ check_sample :: proc(t: ^testing.T, hl: []Highlight, structural: bool) {
 	testing.expect_value(t, hl_at(hl, SAMPLE, "return"), Highlight.Keyword)
 	testing.expect_value(t, hl_at(hl, SAMPLE, `\n`), Highlight.Escape)
 	testing.expect_value(t, hl_at(hl, SAMPLE, "Point"), Highlight.Type)
+
+	// Only a parser knows these from context
 	if structural {
-		// Only a parser knows these from context.
 		testing.expect_value(t, hl_at(hl, SAMPLE, "add ::"), Highlight.Function)
 		testing.expect_value(t, hl_at(hl, SAMPLE, "a: int"), Highlight.Parameter)
 		testing.expect_value(t, hl_at(hl, SAMPLE, "x, y"), Highlight.Property)
 	}
 }
 
+
 @(test)
 test_tree_sitter_odin :: proc(t: ^testing.T) {
 	b := make_buffer(SAMPLE)
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	highlighter_open(&h, &b, "demo.odin")
 	defer highlighter_close(&h)
+
 	testing.expect_value(t, h.backend, Backend.Tree_Sitter)
 	check_sample(t, highlight_all(&h, &b), true)
 }
+
 
 @(test)
 test_lexer_odin :: proc(t: ^testing.T) {
 	b := make_buffer(SAMPLE)
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	h.lang = .Odin
 	h.backend = .Lexer
 	lexer_open(&h.lx, .Odin)
 	defer highlighter_close(&h)
+
 	check_sample(t, highlight_all(&h, &b), false)
 }
 
+
 // After random edits, the incrementally re-parsed tree highlights exactly like
-// a fresh parse of the same text.
+// a fresh parse of the same text
 @(test)
 test_tree_sitter_incremental :: proc(t: ^testing.T) {
 	rand.reset(31337)
 	b := make_buffer(SAMPLE)
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	highlighter_open(&h, &b, "demo.odin")
 	defer highlighter_close(&h)
 
 	snippets := []string{"x", " ", "\n", "/*", "*/", `"`, "proc", "::", "{", "}", "// c\n", "123"}
 	for step in 0 ..< 200 {
+		// A random edit, sometimes undone
 		n := buffer.length(&b)
 		offset := rand.int_max(n + 1)
 		buffer.begin(&b, .Other, u64(step) << 40, {})
-		buffer.replace(&b, offset, min(rand.int_max(4), n - offset), rand.choice(snippets))
+		remove := min(rand.int_max(4), n - offset)
+		buffer.replace(&b, offset, remove, rand.choice(snippets))
 		buffer.end(&b, {})
 		if rand.int_max(5) == 0 do buffer.undo(&b)
 		highlighter_update(&h, &b, buffer.take_changes(&b))
 
+		// Compared with a fresh parse
 		incremental := highlight_all(&h, &b)
 		text := string(buffer.read_alloc(&b, 0, buffer.length(&b)))
 		fresh_b := make_buffer(text)
 		fresh: Highlighter
 		highlighter_open(&fresh, &fresh_b, "demo.odin")
 		expected := highlight_all(&fresh, &fresh_b)
-		if !testing.expect_value(t, string(transmute([]u8)incremental), string(transmute([]u8)expected)) {
+
+		got := string(transmute([]u8)incremental)
+		want := string(transmute([]u8)expected)
+		if !testing.expect_value(t, got, want) {
 			log.infof("step %d text:\n%s", step, text)
 		}
+
 		highlighter_close(&fresh)
 		buffer.buffer_destroy(&fresh_b)
 		free_all(context.temp_allocator)
@@ -135,32 +156,26 @@ test_tree_sitter_incremental :: proc(t: ^testing.T) {
 	}
 }
 
-// Lexer state carries across checkpoints, and edits/undo invalidate correctly.
+
+// Lexer state carries across checkpoints, and edits/undo invalidate correctly
 @(test)
 test_lexer_checkpoints :: proc(t: ^testing.T) {
 	sb := strings.builder_make()
 	defer strings.builder_destroy(&sb)
 	for _ in 0 ..< 3000 do strings.write_string(&sb, "x := 1 // line\n")
+
 	b := make_buffer(strings.to_string(sb))
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	h.lang = .Odin
 	h.backend = .Lexer
 	lexer_open(&h.lx, .Odin)
 	defer highlighter_close(&h)
 
-	line_hl :: proc(h: ^Highlighter, b: ^buffer.Buffer, line: int) -> Highlight {
-		out: [1]Highlight
-		// Pretend the view is there, and give the catch-up enough frames.
-		highlight_range(h, b, buffer.line_start(b, line), out[:])
-		for _ in 0 ..< 100 do highlighter_update(h, b, buffer.take_changes(b))
-		highlight_range(h, b, buffer.line_start(b, line), out[:])
-		return out[0]
-	}
-
 	testing.expect_value(t, line_hl(&h, &b, 2500), Highlight.None) // "x"
 
-	// Open a block comment at the top: everything below becomes comment.
+	// Open a block comment at the top: everything below becomes comment
 	buffer.begin(&b, .Other, 0, {})
 	buffer.replace(&b, 0, 0, "/*")
 	buffer.end(&b, {})
@@ -172,6 +187,21 @@ test_lexer_checkpoints :: proc(t: ^testing.T) {
 	testing.expect_value(t, line_hl(&h, &b, 2500), Highlight.None)
 }
 
+
+// The highlight at the start of a line, once the lexer has caught up with it
+@(private = "file")
+line_hl :: proc(h: ^Highlighter, b: ^buffer.Buffer, line: int) -> Highlight {
+	out: [1]Highlight
+
+	// Pretend the view is there, and give the catch-up enough frames
+	highlight_range(h, b, buffer.line_start(b, line), out[:])
+	for _ in 0 ..< 100 do highlighter_update(h, b, buffer.take_changes(b))
+
+	highlight_range(h, b, buffer.line_start(b, line), out[:])
+	return out[0]
+}
+
+
 PY_SAMPLE :: `# a comment
 @dataclass
 class Point:
@@ -181,28 +211,34 @@ class Point:
         return f"{self.x}" + 'y' if True else None  # trailing
 `
 
+
 @(test)
 test_lexer_python :: proc(t: ^testing.T) {
 	b := make_buffer(PY_SAMPLE)
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	highlighter_open(&h, &b, "point.py")
 	defer highlighter_close(&h)
 	testing.expect_value(t, h.backend, Backend.Lexer) // no Python grammar yet
+
 	hl := highlight_all(&h, &b)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "a comment"), Highlight.Comment)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "@dataclass"), Highlight.Attribute)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "class Point"), Highlight.Keyword)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "Doc"), Highlight.String)
-	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "spanning"), Highlight.String) // second line of """
+	// The second line of """
+	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "spanning"), Highlight.String)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "def"), Highlight.Keyword)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "self"), Highlight.Variable_Builtin)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "2"), Highlight.Number)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "'y'"), Highlight.String)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "True"), Highlight.Constant)
 	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "trailing"), Highlight.Comment)
-	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "return"), Highlight.Keyword) // after the """ closed
+	// After the """ closed
+	testing.expect_value(t, hl_at(hl, PY_SAMPLE, "return"), Highlight.Keyword)
 }
+
 
 TOML_SAMPLE :: `# settings
 [appearance]
@@ -224,14 +260,17 @@ last = 0x1F
 [[servers.alpha]]
 `
 
+
 @(test)
 test_tree_sitter_toml :: proc(t: ^testing.T) {
 	b := make_buffer(TOML_SAMPLE)
 	defer buffer.buffer_destroy(&b)
+
 	h: Highlighter
 	highlighter_open(&h, &b, "settings.toml")
 	defer highlighter_close(&h)
 	testing.expect_value(t, h.backend, Backend.Tree_Sitter)
+
 	hl := highlight_all(&h, &b)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "settings"), Highlight.Comment)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "appearance"), Highlight.Type) // table names
@@ -242,10 +281,12 @@ test_tree_sitter_toml :: proc(t: ^testing.T) {
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, `"quoted key"`), Highlight.String)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "inner"), Highlight.Property)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, `\path`), Highlight.String)
-	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "1979"), Highlight.String) // dates are @string.special
+	// Dates are @string.special
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "1979"), Highlight.String)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "-inf"), Highlight.Number)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "Ctrl+Y"), Highlight.String)
-	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "key", nth = 1), Highlight.Property) // in the inline table
+	// The key in the inline table
+	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "key", nth = 1), Highlight.Property)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "after"), Highlight.Property)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "true"), Highlight.Constant)
 	testing.expect_value(t, hl_at(hl, TOML_SAMPLE, "multi"), Highlight.String)

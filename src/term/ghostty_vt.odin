@@ -3,16 +3,17 @@ package term
 // Bindings to libghostty-vt (include/ghostty/vt.h at the commit pinned in
 // build.py) for what typo uses. The C API is not yet stable: check these
 // against the headers when GHOSTTY_COMMIT changes (test_abi_matches_manifest
-// catches size and key-value mismatches).
+// catches size and key-value mismatches)
 
 import "core:c"
 
-// The static library build.py builds.
+// The static library build.py builds
 when ODIN_OS == .Windows {
 	foreign import vt "../../build/obj/ghostty-vt/lib/ghostty-vt-static.lib"
 } else {
 	foreign import vt "../../build/obj/ghostty-vt/lib/libghostty-vt.a"
 }
+
 
 Result :: enum c.int {
 	Success        = 0,
@@ -25,20 +26,21 @@ Result :: enum c.int {
 	Rejected       = -7,
 }
 
-Terminal :: distinct rawptr
-Render_State :: distinct rawptr
-Row_Iterator :: distinct rawptr
-Row_Cells :: distinct rawptr
-Key_Event :: distinct rawptr
-Key_Encoder :: distinct rawptr
-Mouse_Event :: distinct rawptr
+Terminal      :: distinct rawptr
+Render_State  :: distinct rawptr
+Row_Iterator  :: distinct rawptr
+Row_Cells     :: distinct rawptr
+Key_Event     :: distinct rawptr
+Key_Encoder   :: distinct rawptr
+Mouse_Event   :: distinct rawptr
 Mouse_Encoder :: distinct rawptr
 
 Color_Rgb :: struct {
 	r, g, b: u8,
 }
 
-// --- Styles -------------------------------------------------------------------
+
+// --- Styles ------------------------------------------------------------------------
 
 Style_Color_Tag :: enum c.int {
 	None    = 0,
@@ -71,7 +73,8 @@ Style :: struct {
 	underline:       c.int, // 0 = none; otherwise single, double, curly, dotted, dashed
 }
 
-// --- Cells --------------------------------------------------------------------
+
+// --- Cells -------------------------------------------------------------------------
 
 Cell :: distinct u64
 
@@ -88,23 +91,24 @@ Cell_Data :: enum c.int {
 	Has_Text  = 4,
 }
 
-// --- Terminal -----------------------------------------------------------------
+
+// --- Terminal ----------------------------------------------------------------------
 
 Terminal_Option :: enum c.int {
-	Userdata           = 0,
-	Write_Pty          = 1,
-	Bell               = 2,
-	Title_Changed      = 5,
-	Size               = 6,
-	Color_Foreground   = 11,
-	Color_Background   = 12,
-	Color_Cursor       = 13,
-	Color_Palette      = 14,
-	Selection          = 21,
-	Default_Cursor_Blink = 23,
-	Mode_Default       = 33,
-	Mode               = 34,
-	Scrollback_Max_Bytes = 27,
+	Userdata               = 0,
+	Write_Pty              = 1,
+	Bell                   = 2,
+	Title_Changed          = 5,
+	Size                   = 6,
+	Color_Foreground       = 11,
+	Color_Background       = 12,
+	Color_Cursor           = 13,
+	Color_Palette          = 14,
+	Selection              = 21,
+	Default_Cursor_Blink   = 23,
+	Mode_Default           = 33,
+	Mode                   = 34,
+	Scrollback_Max_Bytes   = 27,
 	Resize_Pull_Scrollback = 40,
 }
 
@@ -136,10 +140,10 @@ Scroll_Viewport :: struct {
 	},
 }
 
-// A DEC private mode number (ANSI modes set bit 15), as in modes.h.
+// A DEC private mode number (ANSI modes set bit 15), as in modes.h
 Mode :: distinct u16
 
-MODE_CURSOR_KEYS :: Mode(1) // DECCKM: application cursor keys
+MODE_CURSOR_KEYS     :: Mode(1) // DECCKM: application cursor keys
 MODE_CURSOR_BLINKING :: Mode(12)
 MODE_BRACKETED_PASTE :: Mode(2004)
 
@@ -150,7 +154,8 @@ Mode_Config :: struct {
 
 Write_Pty_Fn :: #type proc "c" (t: Terminal, userdata: rawptr, data: [^]u8, len: c.size_t)
 
-// --- Render state -------------------------------------------------------------
+
+// --- Render state ------------------------------------------------------------------
 
 Render_Dirty :: enum c.int {
 	False   = 0,
@@ -181,14 +186,14 @@ Row_Data :: enum c.int {
 }
 
 Row_Cells_Data :: enum c.int {
-	Raw            = 1,
-	Style          = 2,
-	Graphemes_Len  = 3,
-	Graphemes_Buf  = 4,
-	Bg_Color       = 5,
-	Fg_Color       = 6,
-	Selected       = 7,
-	Has_Styling    = 8,
+	Raw           = 1,
+	Style         = 2,
+	Graphemes_Len = 3,
+	Graphemes_Buf = 4,
+	Bg_Color      = 5,
+	Fg_Color      = 6,
+	Selected      = 7,
+	Has_Styling   = 8,
 }
 
 Render_Cursor :: struct {
@@ -218,7 +223,8 @@ Row_Selection :: struct {
 	end_x:   u16,
 }
 
-// --- Grid positions and selection ------------------------------------------
+
+// --- Grid positions and selection --------------------------------------------------
 
 Point_Tag :: enum c.int {
 	Active   = 0,
@@ -238,7 +244,7 @@ Point :: struct {
 	},
 }
 
-// A cell reference; only valid until the terminal is next modified.
+// A cell reference; only valid until the terminal is next modified
 Grid_Ref :: struct {
 	size: c.size_t,
 	node: rawptr,
@@ -268,7 +274,7 @@ Selection_Format_Options :: struct {
 }
 
 Selection_Gesture :: distinct rawptr
-Gesture_Event :: distinct rawptr
+Gesture_Event     :: distinct rawptr
 
 Gesture_Event_Type :: enum c.int {
 	Press           = 0,
@@ -283,7 +289,7 @@ Gesture_Event_Option :: enum c.int {
 	Repeat_Distance    = 2,
 	Time_Ns            = 3,
 	Repeat_Interval_Ns = 4,
-	Geometry = 8,
+	Geometry           = 8,
 }
 
 Surface_Position :: struct {
@@ -297,7 +303,8 @@ Gesture_Geometry :: struct {
 	screen_height: u32,
 }
 
-// --- Input encoding -----------------------------------------------------------
+
+// --- Input encoding ----------------------------------------------------------------
 
 Key_Action :: enum c.int {
 	Release = 0,
@@ -306,12 +313,13 @@ Key_Action :: enum c.int {
 }
 
 Mods :: distinct u16
+
 MOD_SHIFT :: Mods(1 << 0)
-MOD_CTRL :: Mods(1 << 1)
-MOD_ALT :: Mods(1 << 2)
+MOD_CTRL  :: Mods(1 << 1)
+MOD_ALT   :: Mods(1 << 2)
 MOD_SUPER :: Mods(1 << 3)
 
-// Values follow GhosttyKey (key/event.h); only the keys typo maps are named.
+// Values follow GhosttyKey (key/event.h); only the keys typo maps are named
 Key :: enum c.int {
 	Unidentified = 0,
 	Backquote, Backslash, Bracket_Left, Bracket_Right, Comma,
@@ -325,7 +333,8 @@ Key :: enum c.int {
 	Delete, End, Help, Home, Insert, Page_Down, Page_Up,
 	Arrow_Down, Arrow_Left, Arrow_Right, Arrow_Up,
 	Num_Lock,
-	Numpad_0, Numpad_1, Numpad_2, Numpad_3, Numpad_4, Numpad_5, Numpad_6, Numpad_7, Numpad_8, Numpad_9,
+	Numpad_0, Numpad_1, Numpad_2, Numpad_3, Numpad_4,
+	Numpad_5, Numpad_6, Numpad_7, Numpad_8, Numpad_9,
 	Numpad_Add, Numpad_Backspace, Numpad_Clear, Numpad_Clear_Entry, Numpad_Comma, Numpad_Decimal,
 	Numpad_Divide, Numpad_Enter, Numpad_Equal, Numpad_Memory_Add, Numpad_Memory_Clear,
 	Numpad_Memory_Recall, Numpad_Memory_Store, Numpad_Memory_Subtract, Numpad_Multiply,
@@ -375,11 +384,18 @@ Mouse_Encoder_Option :: enum c.int {
 	Track_Last_Cell    = 4,
 }
 
+
+// --- Procedures --------------------------------------------------------------------
+
 @(default_calling_convention = "c", link_prefix = "ghostty_")
 foreign vt {
 	terminal_new :: proc(allocator: rawptr, terminal: ^Terminal, cols, rows: u16) -> Result ---
 	terminal_free :: proc(terminal: Terminal) ---
-	terminal_resize :: proc(terminal: Terminal, cols, rows: u16, cell_width_px, cell_height_px: u32) -> Result ---
+	terminal_resize :: proc(
+		terminal: Terminal,
+		cols, rows: u16,
+		cell_width_px, cell_height_px: u32,
+	) -> Result ---
 	terminal_set :: proc(terminal: Terminal, option: Terminal_Option, value: rawptr) -> Result ---
 	terminal_get :: proc(terminal: Terminal, data: Terminal_Data, out: rawptr) -> Result ---
 	terminal_vt_write :: proc(terminal: Terminal, data: [^]u8, len: c.size_t) ---
@@ -397,7 +413,11 @@ foreign vt {
 	render_state_row_cells_new :: proc(allocator: rawptr, cells: ^Row_Cells) -> Result ---
 	render_state_row_cells_free :: proc(cells: Row_Cells) ---
 	render_state_row_cells_next :: proc(cells: Row_Cells) -> bool ---
-	render_state_row_cells_get :: proc(cells: Row_Cells, data: Row_Cells_Data, out: rawptr) -> Result ---
+	render_state_row_cells_get :: proc(
+		cells: Row_Cells,
+		data: Row_Cells_Data,
+		out: rawptr,
+	) -> Result ---
 
 	cell_get :: proc(cell: Cell, data: Cell_Data, out: rawptr) -> Result ---
 
@@ -411,7 +431,13 @@ foreign vt {
 	key_encoder_new :: proc(allocator: rawptr, encoder: ^Key_Encoder) -> Result ---
 	key_encoder_free :: proc(encoder: Key_Encoder) ---
 	key_encoder_setopt_from_terminal :: proc(encoder: Key_Encoder, terminal: Terminal) ---
-	key_encoder_encode :: proc(encoder: Key_Encoder, event: Key_Event, out_buf: [^]u8, out_buf_size: c.size_t, out_len: ^c.size_t) -> Result ---
+	key_encoder_encode :: proc(
+		encoder: Key_Encoder,
+		event: Key_Event,
+		out_buf: [^]u8,
+		out_buf_size: c.size_t,
+		out_len: ^c.size_t,
+	) -> Result ---
 
 	mouse_event_new :: proc(allocator: rawptr, event: ^Mouse_Event) -> Result ---
 	mouse_event_free :: proc(event: Mouse_Event) ---
@@ -422,36 +448,73 @@ foreign vt {
 	mouse_event_set_position :: proc(event: Mouse_Event, position: Mouse_Position) ---
 	mouse_encoder_new :: proc(allocator: rawptr, encoder: ^Mouse_Encoder) -> Result ---
 	mouse_encoder_free :: proc(encoder: Mouse_Encoder) ---
-	mouse_encoder_setopt :: proc(encoder: Mouse_Encoder, option: Mouse_Encoder_Option, value: rawptr) ---
+	mouse_encoder_setopt :: proc(
+		encoder: Mouse_Encoder,
+		option: Mouse_Encoder_Option,
+		value: rawptr,
+	) ---
 	mouse_encoder_setopt_from_terminal :: proc(encoder: Mouse_Encoder, terminal: Terminal) ---
-	mouse_encoder_encode :: proc(encoder: Mouse_Encoder, event: Mouse_Event, out_buf: [^]u8, out_buf_size: c.size_t, out_len: ^c.size_t) -> Result ---
+	mouse_encoder_encode :: proc(
+		encoder: Mouse_Encoder,
+		event: Mouse_Event,
+		out_buf: [^]u8,
+		out_buf_size: c.size_t,
+		out_len: ^c.size_t,
+	) -> Result ---
 
-	// The built-in 256-color palette (out must hold 256 entries).
+	// The built-in 256-color palette (out must hold 256 entries)
 	color_palette_default :: proc(out: [^]Color_Rgb) ---
 
 	terminal_grid_ref :: proc(terminal: Terminal, point: Point, out_ref: ^Grid_Ref) -> Result ---
-	terminal_selection_format_alloc :: proc(terminal: Terminal, allocator: rawptr, options: Selection_Format_Options, out_ptr: ^[^]u8, out_len: ^c.size_t) -> Result ---
+	terminal_selection_format_alloc :: proc(
+		terminal: Terminal,
+		allocator: rawptr,
+		options: Selection_Format_Options,
+		out_ptr: ^[^]u8,
+		out_len: ^c.size_t,
+	) -> Result ---
 	selection_gesture_new :: proc(allocator: rawptr, out_gesture: ^Selection_Gesture) -> Result ---
 	selection_gesture_free :: proc(gesture: Selection_Gesture, terminal: Terminal) ---
-	selection_gesture_event :: proc(gesture: Selection_Gesture, terminal: Terminal, event: Gesture_Event, out_selection: ^Selection) -> Result ---
-	selection_gesture_event_new :: proc(allocator: rawptr, out_event: ^Gesture_Event, type: Gesture_Event_Type) -> Result ---
+	selection_gesture_event :: proc(
+		gesture: Selection_Gesture,
+		terminal: Terminal,
+		event: Gesture_Event,
+		out_selection: ^Selection,
+	) -> Result ---
+	selection_gesture_event_new :: proc(
+		allocator: rawptr,
+		out_event: ^Gesture_Event,
+		type: Gesture_Event_Type,
+	) -> Result ---
 	selection_gesture_event_free :: proc(event: Gesture_Event) ---
-	selection_gesture_event_set :: proc(event: Gesture_Event, option: Gesture_Event_Option, value: rawptr) -> Result ---
+	selection_gesture_event_set :: proc(
+		event: Gesture_Event,
+		option: Gesture_Event_Option,
+		value: rawptr,
+	) -> Result ---
 
-	// JSON manifest of the library's C types (sizes, alignments, enum values).
+	// JSON manifest of the library's C types (sizes, alignments, enum values)
 	type_json :: proc() -> cstring ---
 
-	paste_encode :: proc(data: [^]u8, data_len: c.size_t, bracketed: bool, buf: [^]u8, buf_len: c.size_t, out_written: ^c.size_t) -> Result ---
+	paste_encode :: proc(
+		data: [^]u8,
+		data_len: c.size_t,
+		bracketed: bool,
+		buf: [^]u8,
+		buf_len: c.size_t,
+		out_written: ^c.size_t,
+	) -> Result ---
 }
 
-// Frees memory the library allocated (e.g. formatted selection text).
+// Frees memory the library allocated (e.g. formatted selection text)
 @(default_calling_convention = "c")
 foreign vt {
 	@(link_name = "ghostty_free")
 	ghostty_free :: proc(allocator: rawptr, ptr: rawptr, len: c.size_t) ---
 }
 
-// Sized structs must carry their own size, like GHOSTTY_INIT_SIZED in C.
+
+// Sized structs must carry their own size, like GHOSTTY_INIT_SIZED in C
 init_sized :: proc($T: typeid) -> (v: T) {
 	v.size = size_of(T)
 	return

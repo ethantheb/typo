@@ -13,6 +13,7 @@ import sdl "../vendor/sdl3"
 // Unit tests for the main package: editing operations, matching and settings,
 // without a window. Run with: python build.py --test
 
+
 @(private = "file")
 make_editor :: proc(text: string) -> (e: Editor) {
 	g.settings.font_size = 15
@@ -23,100 +24,139 @@ make_editor :: proc(text: string) -> (e: Editor) {
 	return
 }
 
+
 @(private = "file")
 destroy_editor :: proc(e: ^Editor) {
 	buffer.buffer_destroy(&e.buf)
 	delete(e.sels)
 }
 
+
 @(private = "file")
 contents :: proc(e: ^Editor) -> string {
 	return string(buffer.read_alloc(&e.buf, 0, buffer.length(&e.buf)))
 }
 
+
+// A path for a test file in the temp directory
+@(private = "file")
+temp_test_path :: proc(name: string) -> string {
+	dir := os.temp_directory(context.temp_allocator) or_else "."
+	return fmt.tprintf("%s/%s-%d", dir, name, os.get_pid())
+}
+
+
 @(test)
 test_multi_cursor_edits :: proc(t: ^testing.T) {
 	e := make_editor("one\ntwo\nthree")
 	defer destroy_editor(&e)
+
 	textedit.add_cursor_vertical(&e, +1)
 	textedit.add_cursor_vertical(&e, +1)
 	testing.expect_value(t, len(e.sels), 3)
+
 	textedit.insert(&e, "> ")
 	testing.expect_value(t, contents(&e), "> one\n> two\n> three")
+
 	textedit.delete_text(&e, -1, word = false)
 	testing.expect_value(t, contents(&e), ">one\n>two\n>three")
+
 	textedit.undo(&e)
 	testing.expect_value(t, contents(&e), "> one\n> two\n> three")
+
 	textedit.single_cursor(&e)
 	testing.expect_value(t, len(e.sels), 1)
 }
+
 
 @(test)
 test_newline_keeps_indent :: proc(t: ^testing.T) {
 	e := make_editor("\tif x {")
 	defer destroy_editor(&e)
+
 	textedit.move(&e, .Doc_End, false)
 	editor_handle_key(&e, {key = sdl.K_RETURN})
 	textedit.insert(&e, "y")
 	testing.expect_value(t, contents(&e), "\tif x {\n\ty")
 }
 
+
 @(test)
 test_movement :: proc(t: ^testing.T) {
 	e := make_editor("    foo_bar(baz)\r\nnext")
 	defer destroy_editor(&e)
 	testing.expect(t, e.buf.crlf)
+
 	textedit.move(&e, .Home, false) // to the first non-blank
 	testing.expect_value(t, e.sels[0].head, 4)
+
 	textedit.move(&e, .Word_Right, false)
 	testing.expect_value(t, e.sels[0].head, 11) // after foo_bar
+
 	textedit.move(&e, .End, false)
 	testing.expect_value(t, e.sels[0].head, 16)
+
 	textedit.move(&e, .Right, false) // over "\r\n" in one step
 	testing.expect_value(t, e.sels[0].head, 18)
+
 	textedit.move(&e, .Up, true)
 	testing.expect_value(t, e.sels[0], Selection{18, 0, 0})
 }
 
+
 @(test)
 test_fuzzy :: proc(t: ^testing.T) {
 	defer fuzzy_destroy()
+
 	_, ok := fuzzy_score("edv", "src/editor_view.odin")
 	testing.expect(t, ok)
 	_, ok = fuzzy_score("xyz", "src/editor_view.odin")
 	testing.expect(t, !ok)
-	// Consecutive matches at a boundary beat scattered ones.
+
+	// Consecutive matches at a boundary beat scattered ones
 	a, _ := fuzzy_score("term", "src/terminal.odin")
 	b, _ := fuzzy_score("term", "src/theme_error_map.odin")
 	testing.expect(t, a > b)
+
+	// The matched characters
 	path := "src/terminal_edit.odin"
 	picked := strings.builder_make(context.temp_allocator)
-	for m, i in fuzzy_positions("ted", path) do if m do strings.write_byte(&picked, path[i])
+	for m, i in fuzzy_positions("ted", path) {
+		if m do strings.write_byte(&picked, path[i])
+	}
 	testing.expect_value(t, strings.to_string(picked), "ted")
 }
 
+
 @(test)
 test_shell_display_name :: proc(t: ^testing.T) {
+	git_bash := `"C:\Program Files\Git\bin\bash.exe" --login`
+
 	testing.expect_value(t, shell_display_name("pwsh -NoLogo"), "PowerShell")
-	testing.expect_value(t, shell_display_name(`"C:\Program Files\Git\bin\bash.exe" --login`), "bash")
+	testing.expect_value(t, shell_display_name(git_bash), "bash")
 	testing.expect_value(t, shell_display_name("/bin/zsh"), "zsh")
 	testing.expect_value(t, shell_display_name(""), "Terminal")
 }
+
 
 @(test)
 test_relative_to_root :: proc(t: ^testing.T) {
 	g.workspace.root = `C:\work`
 	defer g.workspace.root = ""
+
 	testing.expect_value(t, relative_to_root(`C:\work\src\a.odin`), `src\a.odin`)
 	testing.expect_value(t, relative_to_root(`C:\workshop\a.odin`), `C:\workshop\a.odin`)
+
 	g.workspace.root = `C:\`
 	testing.expect_value(t, relative_to_root(`C:\a.odin`), `a.odin`)
 }
 
-// Directories come first, then files, each sorted case-insensitively.
+
+// Directories come first, then files, each sorted case-insensitively
 @(test)
 test_workspace_open :: proc(t: ^testing.T) {
-	root := fmt.tprintf("%s/typo-workspace-test-%d", os.temp_directory(context.temp_allocator) or_else ".", os.get_pid())
+	// A folder with a subfolder and two files
+	root := temp_test_path("typo-workspace-test")
 	root = os.get_absolute_path(root, context.temp_allocator) or_else root
 	_ = os.make_directory_all(fmt.tprintf("%s/sub", root))
 	_ = os.write_entire_file(fmt.tprintf("%s/b.txt", root), "")
@@ -126,9 +166,11 @@ test_workspace_open :: proc(t: ^testing.T) {
 	ws: Workspace
 	workspace_open(&ws, root)
 	defer workspace_destroy(&ws)
+
 	names := [?]string{"sub", "A.txt", "b.txt"}
 	testing.expect_value(t, len(ws.visible), len(names))
 	if len(ws.visible) != len(names) do return
+
 	for name, i in names {
 		node := ws.nodes[ws.visible[i]]
 		testing.expect_value(t, node.name, name)
@@ -137,12 +179,14 @@ test_workspace_open :: proc(t: ^testing.T) {
 	}
 }
 
+
 // Valid values load, invalid ones fall back to their defaults and are
-// reported, and saving then loading gives the same settings.
+// reported, and saving then loading gives the same settings
 @(test)
 test_settings_round_trip :: proc(t: ^testing.T) {
-	path := fmt.tprintf("%s/typo-settings-test-%d.toml", os.temp_directory(context.temp_allocator) or_else ".", os.get_pid())
+	path := fmt.tprintf("%s.toml", temp_test_path("typo-settings-test"))
 	defer os.remove(path)
+
 	_ = os.write_entire_file(path, `
 [appearance]
 theme = "one-light"
@@ -156,11 +200,14 @@ shell = "  bash  "
 save = ["Ctrl+Shift+S", "F2"]
 undo = "Nonsense+Q"
 `)
+
+	// Load
 	s: Settings
 	settings_reset_all(&s)
 	s.path = strings.clone(path)
 	defer settings_destroy(&s)
 	settings_load(&s)
+
 	testing.expect_value(t, s.theme, "one-light")
 	testing.expect_value(t, s.font_size, SETTINGS[.Font_Size].default.(int))
 	testing.expect_value(t, s.line_height, 1.5)
@@ -170,13 +217,16 @@ undo = "Nonsense+Q"
 	testing.expect(t, strings.contains(s.error, "font.size"))
 	testing.expect(t, strings.contains(s.error, "Nonsense+Q"))
 
+	// Save, and load again
 	settings_save(&s)
 	testing.expect_value(t, s.error, "") // the saved file has no problems
+
 	again: Settings
 	settings_reset_all(&again)
 	again.path = strings.clone(path)
 	defer settings_destroy(&again)
 	settings_load(&again)
+
 	testing.expect_value(t, again.error, "")
 	testing.expect_value(t, again.theme, s.theme)
 	testing.expect_value(t, again.line_height, s.line_height)
@@ -185,31 +235,39 @@ undo = "Nonsense+Q"
 	testing.expect_value(t, again.bindings, s.bindings)
 }
 
+
 @(test)
 test_number_settings :: proc(t: ^testing.T) {
 	s: Settings
 	settings_reset_all(&s)
 	defer settings_destroy(&s)
+
 	setting_step(&s, .Line_Height, +1)
 	testing.expect_value(t, format_decimal(s.line_height), "1.4")
+
 	setting_step(&s, .Font_Weight, -1)
 	testing.expect_value(t, s.font_weight, 400)
+
 	for _ in 0 ..< 100 do setting_step(&s, .Letter_Spacing, -1)
 	testing.expect_value(t, s.letter_spacing, SETTINGS[.Letter_Spacing].min)
+
 	testing.expect_value(t, format_decimal(0), "0.0")
 	testing.expect_value(t, format_decimal(-0.25), "-0.25")
 	testing.expect_value(t, format_decimal(2), "2.0")
 }
 
-// A fresh install writes the defaults; they must load back without problems.
+
+// A fresh install writes the defaults; they must load back without problems
 @(test)
 test_default_settings_are_valid :: proc(t: ^testing.T) {
-	path := fmt.tprintf("%s/typo-defaults-test-%d.toml", os.temp_directory(context.temp_allocator) or_else ".", os.get_pid())
+	path := fmt.tprintf("%s.toml", temp_test_path("typo-defaults-test"))
 	defer os.remove(path)
+
 	s: Settings
 	settings_reset_all(&s)
 	s.path = strings.clone(path)
 	defer settings_destroy(&s)
+
 	settings_save(&s)
 	settings_load(&s)
 	testing.expect_value(t, s.error, "")

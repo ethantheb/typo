@@ -7,10 +7,11 @@ package buffer
 // pieces (the original file is a single piece of arbitrary size). Storing every
 // line start would cost 8 bytes per line; instead we keep one cumulative count
 // per BLOCK_SIZE bytes, so a query scans at most two partial blocks while the
-// index costs ~0.8% of the data size.
+// index costs ~0.8% of the data size
+
 
 BLOCK_SHIFT :: 10 // 1 KB
-BLOCK_SIZE :: 1 << BLOCK_SHIFT
+BLOCK_SIZE  :: 1 << BLOCK_SHIFT
 
 Store :: struct {
 	data:     [dynamic]u8,
@@ -18,11 +19,13 @@ Store :: struct {
 	total_lf: int,
 }
 
-// Takes ownership of `data` (no copy).
+
+// Takes ownership of `data` (no copy)
 store_init :: proc(s: ^Store, data: [dynamic]u8) {
 	s.data = data
 	index_range(s, 0, len(s.data))
 }
+
 
 store_destroy :: proc(s: ^Store) {
 	delete(s.data)
@@ -30,13 +33,15 @@ store_destroy :: proc(s: ^Store) {
 	s^ = {}
 }
 
-// Appends text and returns the offset it starts at.
+
+// Appends text and returns the offset it starts at
 store_append :: proc(s: ^Store, text: []u8) -> int {
 	start := len(s.data)
 	append(&s.data, ..text)
 	index_range(s, start, len(s.data))
 	return start
 }
+
 
 @(private)
 index_range :: proc(s: ^Store, from, to: int) {
@@ -45,14 +50,16 @@ index_range :: proc(s: ^Store, from, to: int) {
 		if pos & (BLOCK_SIZE - 1) == 0 {
 			append(&s.block_lf, s.total_lf)
 		}
+
 		next := min((pos | (BLOCK_SIZE - 1)) + 1, to)
 		s.total_lf += count_lf(s.data[pos:next])
 		pos = next
 	}
 }
 
+
 count_lf :: proc(b: []u8) -> int {
-	// Simple enough for LLVM to vectorize in optimized builds.
+	// Simple enough for LLVM to vectorize in optimized builds
 	n := 0
 	for c in b {
 		n += int(c == '\n')
@@ -60,7 +67,8 @@ count_lf :: proc(b: []u8) -> int {
 	return n
 }
 
-// Number of '\n' in data[:x].
+
+// Number of '\n' in data[:x]
 lf_before :: proc(s: ^Store, x: int) -> int {
 	k := x >> BLOCK_SHIFT
 	if k >= len(s.block_lf) {
@@ -69,7 +77,8 @@ lf_before :: proc(s: ^Store, x: int) -> int {
 	return s.block_lf[k] + count_lf(s.data[k << BLOCK_SHIFT:x])
 }
 
-// Number of '\n' in data[a:b].
+
+// Number of '\n' in data[a:b]
 lf_count :: proc(s: ^Store, a, b: int) -> int {
 	if b - a <= BLOCK_SIZE {
 		return count_lf(s.data[a:b])
@@ -77,9 +86,10 @@ lf_count :: proc(s: ^Store, a, b: int) -> int {
 	return lf_before(s, b) - lf_before(s, a)
 }
 
-// Offset of the n-th (0-based) '\n' in the store. n must be < total_lf.
+
+// Offset of the n-th (0-based) '\n' in the store. n must be < total_lf
 find_lf :: proc(s: ^Store, n: int) -> int {
-	// Largest block k with block_lf[k] <= n; the line feed lies in block k.
+	// Largest block k with block_lf[k] <= n; the line feed lies in block k
 	lo, hi := 0, len(s.block_lf) - 1
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
@@ -89,6 +99,8 @@ find_lf :: proc(s: ^Store, n: int) -> int {
 			hi = mid - 1
 		}
 	}
+
+	// Count line feeds from the block's start
 	remaining := n - s.block_lf[lo]
 	for i in lo << BLOCK_SHIFT ..< len(s.data) {
 		if s.data[i] == '\n' {
@@ -96,5 +108,6 @@ find_lf :: proc(s: ^Store, n: int) -> int {
 			remaining -= 1
 		}
 	}
+
 	panic("find_lf: line feed index out of range")
 }

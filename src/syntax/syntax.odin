@@ -11,7 +11,8 @@ import "../buffer"
 //  - Lexer: a line-based tokenizer that only looks at what is on screen (plus
 //    sparse state checkpoints), so it works at any file size.
 // Both produce one Highlight per byte of a requested range, so the renderer
-// doesn't care which one ran (and LSP semantic tokens could overlay either).
+// doesn't care which one ran (and LSP semantic tokens could overlay either)
+
 
 Highlight :: enum u8 {
 	None,
@@ -49,7 +50,7 @@ Language :: enum u8 {
 }
 
 // Tree-sitter re-parses synchronously after each edit, which grows with file
-// size; larger files use the lexer to keep frames short.
+// size; larger files use the lexer to keep frames short
 TREE_SITTER_MAX_BYTES :: 512 << 10
 
 Backend :: enum u8 {
@@ -64,6 +65,9 @@ Highlighter :: struct {
 	ts:      TS_State,
 	lx:      Lexer_State,
 }
+
+
+// --- Languages ---------------------------------------------------------------------
 
 language_for_path :: proc(path: string) -> Language {
 	ext := strings.to_lower(filepath.ext(path), context.temp_allocator)
@@ -94,22 +98,37 @@ language_for_path :: proc(path: string) -> Language {
 	return .None
 }
 
+
 @(private = "file")
 LANGUAGE_ALIASES := [?]struct {
 	name: string,
 	lang: Language,
 } {
-	{"javascript", .JavaScript}, {"typescript", .TypeScript}, {"rust", .Rust}, {"golang", .Go},
-	{"python", .Python}, {"csharp", .CSharp}, {"c#", .CSharp}, {"c++", .Cpp},
+	{"javascript", .JavaScript},
+	{"typescript", .TypeScript},
+	{"rust", .Rust},
+	{"golang", .Go},
+	{"python", .Python},
+	{"csharp", .CSharp},
+	{"c#", .CSharp},
+	{"c++", .Cpp},
 }
 
+
 // The language named by a code fence's info string: a name ("python") or an
-// extension ("py").
+// extension ("py")
 language_for_name :: proc(name: string) -> Language {
 	if name == "" do return .None
-	for a in LANGUAGE_ALIASES do if strings.equal_fold(name, a.name) do return a.lang
+
+	for a in LANGUAGE_ALIASES {
+		if strings.equal_fold(name, a.name) do return a.lang
+	}
+
 	return language_for_path(strings.concatenate({".", name}, context.temp_allocator))
 }
+
+
+// --- Highlighter -------------------------------------------------------------------
 
 highlighter_open :: proc(h: ^Highlighter, b: ^buffer.Buffer, path: string) {
 	highlighter_close(h)
@@ -124,6 +143,7 @@ highlighter_open :: proc(h: ^Highlighter, b: ^buffer.Buffer, path: string) {
 	}
 }
 
+
 highlighter_close :: proc(h: ^Highlighter) {
 	switch h.backend {
 	case .Tree_Sitter: ts_close(&h.ts)
@@ -133,8 +153,9 @@ highlighter_close :: proc(h: ^Highlighter) {
 	h^ = {}
 }
 
+
 // Applies the buffer's edits since the last call (buffer.take_changes) and
-// continues background work. Call once per frame before drawing.
+// continues background work. Call once per frame before drawing
 highlighter_update :: proc(h: ^Highlighter, b: ^buffer.Buffer, changes: []buffer.Change) {
 	switch h.backend {
 	case .Tree_Sitter:
@@ -146,16 +167,19 @@ highlighter_update :: proc(h: ^Highlighter, b: ^buffer.Buffer, changes: []buffer
 	}
 }
 
+
 // Whether the highlighter still has background work (lexer checkpoints to
-// rebuild after an edit) and wants more frames to do it in.
+// rebuild after an edit) and wants more frames to do it in
 highlighter_busy :: proc(h: ^Highlighter, b: ^buffer.Buffer) -> bool {
 	return h.backend == .Lexer && lexer_behind(&h.lx, b)
 }
 
-// Fills out[i] with the highlight of byte start+i, for [start, start+len(out)).
+
+// Fills out[i] with the highlight of byte start+i, for [start, start+len(out))
 highlight_range :: proc(h: ^Highlighter, b: ^buffer.Buffer, start: int, out: []Highlight) {
 	for &x in out do x = .None
 	if len(out) == 0 do return
+
 	switch h.backend {
 	case .Tree_Sitter: ts_highlight(&h.ts, b, start, out)
 	case .Lexer:       lexer_highlight(&h.lx, b, start, out)
@@ -163,35 +187,56 @@ highlight_range :: proc(h: ^Highlighter, b: ^buffer.Buffer, start: int, out: []H
 	}
 }
 
+
 // Maps a tree-sitter capture name to a Highlight using the longest known
 // dotted prefix ("function.call" -> Function). Includes the older
 // nvim-treesitter names that grammar queries still use. ok=false means the
-// capture should not paint anything (e.g. @spell).
+// capture should not paint anything (e.g. @spell)
 highlight_for_capture :: proc(name: string) -> (hl: Highlight, ok: bool) {
 	name := name
 	for {
 		switch name {
-		case "comment":                                return .Comment, true
+		case "comment":
+			return .Comment, true
 		case "keyword", "conditional", "repeat", "include", "storageclass", "preproc", "exception":
 			return .Keyword, true
-		case "keyword.operator":                       return .Keyword, true
-		case "string", "character":                    return .String, true
-		case "string.escape", "escape":                return .Escape, true
-		case "number", "float":                        return .Number, true
-		case "boolean", "constant", "constant.builtin": return .Constant, true
-		case "type", "type.builtin":                   return .Type, true
-		case "function", "method", "constructor":      return .Function, true
-		case "function.macro":                         return .Constant, true
-		case "variable.builtin":                       return .Variable_Builtin, true
-		case "variable":                               return .None, true
-		case "parameter", "variable.parameter":        return .Parameter, true
-		case "field", "property", "variable.member":   return .Property, true
-		case "namespace", "module":                    return .Namespace, true
-		case "operator":                               return .Operator, true
-		case "punctuation":                            return .Punctuation, true
-		case "attribute":                              return .Attribute, true
-		case "label":                                  return .Label, true
+		case "keyword.operator":
+			return .Keyword, true
+		case "string", "character":
+			return .String, true
+		case "string.escape", "escape":
+			return .Escape, true
+		case "number", "float":
+			return .Number, true
+		case "boolean", "constant", "constant.builtin":
+			return .Constant, true
+		case "type", "type.builtin":
+			return .Type, true
+		case "function", "method", "constructor":
+			return .Function, true
+		case "function.macro":
+			return .Constant, true
+		case "variable.builtin":
+			return .Variable_Builtin, true
+		case "variable":
+			return .None, true
+		case "parameter", "variable.parameter":
+			return .Parameter, true
+		case "field", "property", "variable.member":
+			return .Property, true
+		case "namespace", "module":
+			return .Namespace, true
+		case "operator":
+			return .Operator, true
+		case "punctuation":
+			return .Punctuation, true
+		case "attribute":
+			return .Attribute, true
+		case "label":
+			return .Label, true
 		}
+
+		// Try the name without its last part
 		dot := strings.last_index_byte(name, '.')
 		if dot < 0 do return .None, false
 		name = name[:dot]
