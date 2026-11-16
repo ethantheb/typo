@@ -30,7 +30,7 @@ developed using AI and really shouldn't be used at this point.
 
 #### But hey, go ahead and install it if you want
 Developed on Windows only currently.
-It may be buildable on Linux/MacOS, no promises.
+It may be buildable on Linux/MacOS, but I wouldn't try it.
 
 ```
 python build.py --install
