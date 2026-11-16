@@ -1,9 +1,9 @@
-package editor
+package fuzzy
 
-// A small fzy-style scorer for the file finder: the query must appear as a
-// case-insensitive subsequence; consecutive matches and matches at word/path
-// boundaries score higher, gaps cost a little. Byte-based, which suits file
-// names. Runs on the main thread only (the score matrices are shared)
+// A small fzy-style scorer (the finder's lists, completions): the query must
+// appear as a case-insensitive subsequence; consecutive matches and matches at
+// word/path boundaries score higher, gaps cost a little. Byte-based, which suits
+// file names and identifiers. One thread only (the score matrices are shared)
 
 
 @(private = "file") SCORE_GAP_LEADING       :: -0.005
@@ -94,7 +94,7 @@ compute :: proc(needle, haystack: string, D, M: []f32) #no_bounds_check {
 scratch: [dynamic]f32
 
 
-fuzzy_destroy :: proc() {
+destroy :: proc() {
 	delete(scratch)
 	scratch = nil
 }
@@ -107,7 +107,7 @@ matrices :: proc(n, m: int) -> (D, M: []f32) {
 }
 
 
-fuzzy_score :: proc(needle, haystack: string) -> (score: f32, ok: bool) {
+score :: proc(needle, haystack: string) -> (score: f32, ok: bool) {
 	if len(needle) == 0 do return 0, true
 	if len(needle) > len(haystack) || len(haystack) > MAX_MATCH_LEN {
 		return 0, false
@@ -123,7 +123,7 @@ fuzzy_score :: proc(needle, haystack: string) -> (score: f32, ok: bool) {
 
 
 // Which bytes of haystack the best match used, for highlighting
-fuzzy_positions :: proc(
+positions :: proc(
 	needle, haystack: string,
 	allocator := context.temp_allocator,
 ) -> []bool {

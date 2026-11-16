@@ -141,6 +141,34 @@ pane_live :: proc(p: ^Pane) -> bool {
 }
 
 
+// The open editor of a file, if any (paths compare without case on Windows)
+editor_with_path :: proc(path: string) -> ^Editor {
+	for p in g.panes.open {
+		e, is_editor := p.content.(^Editor)
+		if is_editor && same_path(e.path, path) {
+			return e
+		}
+	}
+	return nil
+}
+
+
+same_path :: proc(a, b: string) -> bool {
+	when ODIN_OS == .Windows {
+		return strings.equal_fold(a, b)
+	} else {
+		return a == b
+	}
+}
+
+
+// Whether something covers the editors (the finder, the settings, a dialog, the
+// menu): popups at their caret close
+editors_covered :: proc() -> bool {
+	return g.finder.open || g.settings_window.open || g.dialog.open || g.menu.open
+}
+
+
 focused_editor :: proc() -> ^Editor {
 	p := g.panes.focused
 	if p == nil do return nil
@@ -294,6 +322,25 @@ panes_open_file :: proc(path: string) -> ^Pane {
 }
 
 
+// Opens a file in a new pane to the right of the one in use, leaving that one
+// open (e.g. a log beside the code), or shows the pane it is already in
+panes_open_file_beside :: proc(path: string) -> ^Pane {
+	p := pane_for_file(path)
+	ps := &g.panes
+
+	beside := ps.focused
+	if beside == nil || beside == p || !pane_shown(beside) {
+		pane_show(p)
+	} else if !pane_shown(p) {
+		pane_move(p, {kind = .Split, target = beside, side = .Right})
+	}
+
+	pane_focus(p)
+	workspace_reveal(&g.workspace, path)
+	return p
+}
+
+
 // The pane a file is open in, opening it (not shown) if it isn't
 pane_for_file :: proc(path: string) -> ^Pane {
 	if p := pane_with_file(path); p != nil {
@@ -318,6 +365,19 @@ panes_add_terminal :: proc() -> ^Pane {
 panes_new_terminal :: proc() -> ^Pane {
 	p := panes_add_terminal()
 	pane_show(p)
+	return p
+}
+
+
+// Starts a terminal whose shell runs `command` and stays open, shown and
+// focused
+panes_run_in_terminal :: proc(command: string) -> ^Pane {
+	p := panes_add_terminal()
+	t := p.content.(^Terminal)
+	t.command = strings.clone(command)
+
+	pane_show(p)
+	pane_focus(p)
 	return p
 }
 
@@ -453,6 +513,7 @@ pane_close :: proc(p: ^Pane, ask := true) -> bool {
 	if ps.drag.pane == p do drag_clear()
 	if g.rename.pane == p do rename_end()
 	if g.menu.pane == p do menu_close()
+	if g.find.pane == p do find_close()
 	if op, ok := g.pending.(Pane_Op); ok && op.pane == p {
 		g.pending = nil
 	}
@@ -808,7 +869,7 @@ panes_frame :: proc() {
 
 	busy := ps.divider.tile != nil || ps.drag.active
 	for p in ps.open {
-		live := interactive && pane_live(p) && !busy
+		live := interactive && pane_live(p) && !busy && !find_bar_hovered(p)
 		switch c in p.content {
 		case ^Editor:
 			if p.visible do editor_frame(c, body_id(p), live)
@@ -1213,6 +1274,8 @@ pane_element :: proc(p: ^Pane) {
 		case ^Terminal:
 			custom_element(body_id(p), c)
 		}
+
+		find_bar_ui(p)
 	}
 }
 

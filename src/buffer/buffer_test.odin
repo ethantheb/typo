@@ -324,3 +324,21 @@ test_chunk_at :: proc(t: ^testing.T) {
 		testing.expect_value(t, string(chunk), whole[offset:][:len(chunk)])
 	}
 }
+
+
+// An untracked replace changes the text and line index but records nothing
+@(test)
+test_replace_untracked :: proc(t: ^testing.T) {
+	b := make_buffer("one\ntwo\nthree")
+	defer buffer_destroy(&b)
+
+	replace_untracked(&b, 2, 3, "e and\nt")
+	testing.expect_value(t, contents(&b), "one and\ntwo\nthree")
+	testing.expect_value(t, line_count(&b), 3)
+	testing.expect_value(t, line_start(&b, 2), 12)
+
+	replace_untracked(&b, 0, length(&b), "")
+	testing.expect_value(t, contents(&b), "")
+	testing.expect_value(t, len(b.changes), 0)
+	testing.expect_value(t, len(b.history.groups), 0)
+}

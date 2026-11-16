@@ -38,6 +38,10 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 		status_bar()
 		finder_ui()
 		settings_window_ui()
+		lsp_hover_ui()
+		lsp_completion_ui()
+		lsp_rename_ui()
+		lsp_popup_ui()
 		context_menu_ui()
 		dialog_ui()
 	}
@@ -241,8 +245,9 @@ status_bar :: proc() {
 			label(pane_title(p), gfx.theme.text, FONT_SIZE_SMALL)
 		}
 
-		// The window, on the right
+		// The language servers and the window, on the right
 		push_right()
+		lsp_status_item()
 		size := fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, gfx.scale)
 		label(size, gfx.theme.text_dim, FONT_SIZE_SMALL)
 		if g.settings.show_fps {
@@ -361,10 +366,18 @@ update_mouse_cursor :: proc() {
 	}
 
 	switch {
-	case g.dialog.open, g.menu.open && pointer_in(clay.ID("ContextMenu")):
+	case g.dialog.open,
+	     g.menu.open && pointer_in(clay.ID("ContextMenu")),
+	     g.lsp.popup.open && pointer_in(clay.ID("LspPopup")),
+	     lsp_hover_covers_pointer(),
+	     lsp_completion_covers_pointer():
 		// The arrow over popups that cover what is under them
+	case lsp_rename_covers_pointer():
+		if pointer_in(clay.ID("SymbolRename")) do want = .TEXT
 	case g.finder.open:
 		if pointer_in(clay.ID("FinderInput")) do want = .TEXT
+	case g.find.open && pointer_in(clay.ID("FindBar")):
+		if pointer_in(clay.ID("FindField")) do want = .TEXT
 	case g.settings_window.open && !ui_interactive():
 		if settings_window_over_text() do want = .TEXT
 	case ps.drag.active:

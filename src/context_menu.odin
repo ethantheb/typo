@@ -5,10 +5,13 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "gfx"
+import "langs"
+import "textedit"
 
-// The right-click menu: on a file or folder in the tree, on a pane's title, or
-// on a terminal on the shelf. A chosen item runs at the start of the next frame
-// (context_menu_frame). A press outside the menu, or Esc, closes it
+// The right-click menu: on a file or folder in the tree, on a pane's title, on
+// a terminal on the shelf, or on an editor's text. A chosen item runs at the
+// start of the next frame (context_menu_frame). A press outside the menu, or
+// Esc, closes it
 
 
 Menu_Command :: enum {
@@ -19,57 +22,80 @@ Menu_Command :: enum {
 	Rename_Terminal,
 	Restart_Terminal,
 	Close_Pane,
+	Editor_Command, // runs the item's `command` in the editor
 }
 
 Menu_Item :: struct {
-	label:  string,
-	icon:   gfx.Icon,
-	cmd:    Menu_Command,
-	danger: bool,
+	label:     string,
+	icon:      gfx.Icon,
+	cmd:       Menu_Command,
+	danger:    bool,
+	command:   Command, // of an Editor_Command item, its shortcut shown beside it
+	disabled:  bool,
+	separator: bool, // a line between groups, not an item
 }
 
 Context_Menu :: struct {
 	open:   bool,
 	at:     [2]f32,
-	items:  [4]Menu_Item,
+	items:  [MENU_MAX_ITEMS]Menu_Item,
 	count:  int,
 	path:   string,       // owned; the file or folder it is for
 	pane:   ^Pane,        // the pane it is for
 	place:  Rename_Place, // where it was opened, where Rename edits the name
 	chosen: Maybe(Menu_Command),
+	chosen_index: int,    // the item chosen
 	opened: u64,          // frame
 }
 
-MENU_WIDTH      :: 180
-MENU_ROW_HEIGHT :: 28
+MENU_WIDTH            :: 180
+MENU_WIDTH_SHORTCUTS  :: 240 // with shortcuts beside the items
+MENU_ROW_HEIGHT       :: 28
+MENU_SEPARATOR_HEIGHT :: 9
+MENU_MAX_ITEMS        :: 9
 
 @(private = "file")
 FILE_ITEMS := [?]Menu_Item {
-	{"Rename", .Pencil, .Rename_File, false},
-	{"Delete", .Trash,  .Delete_File, true},
+	{label = "Rename", icon = .Pencil, cmd = .Rename_File},
+	{label = "Delete", icon = .Trash,  cmd = .Delete_File, danger = true},
 }
 
 // A folder; with path the workspace root, the empty space under the tree
 @(private = "file")
 FOLDER_ITEMS := [?]Menu_Item {
-	{"New file",   .File_Plus,   .New_File,    false},
-	{"New folder", .Folder_Plus, .New_Folder,  false},
-	{"Rename",     .Pencil,      .Rename_File, false},
-	{"Delete",     .Trash,       .Delete_File, true},
+	{label = "New file",   icon = .File_Plus,   cmd = .New_File},
+	{label = "New folder", icon = .Folder_Plus, cmd = .New_Folder},
+	{label = "Rename",     icon = .Pencil,      cmd = .Rename_File},
+	{label = "Delete",     icon = .Trash,       cmd = .Delete_File, danger = true},
 }
 
 @(private = "file")
 TERMINAL_ITEMS := [?]Menu_Item {
-	{"Rename",  .Pencil,  .Rename_Terminal,  false},
-	{"Restart", .Restart, .Restart_Terminal, false},
-	{"Close",   .Close,   .Close_Pane,       false},
+	{label = "Rename",  icon = .Pencil,  cmd = .Rename_Terminal},
+	{label = "Restart", icon = .Restart, cmd = .Restart_Terminal},
+	{label = "Close",   icon = .Close,   cmd = .Close_Pane},
 }
 
 @(private = "file")
 FILE_PANE_ITEMS := [?]Menu_Item {
-	{"Rename", .Pencil, .Rename_File, false},
-	{"Delete", .Trash,  .Delete_File, true},
-	{"Close",  .Close,  .Close_Pane,  false},
+	{label = "Rename", icon = .Pencil, cmd = .Rename_File},
+	{label = "Delete", icon = .Trash,  cmd = .Delete_File, danger = true},
+	{label = "Close",  icon = .Close,  cmd = .Close_Pane},
+}
+
+// On an editor's text, each running its command (open_editor_menu sets them up
+// and turns off what doesn't apply)
+@(private = "file")
+EDITOR_ITEMS := [?]Menu_Item {
+	{label = "Go to definition", icon = .Go_To,      command = .Go_To_Definition},
+	{label = "Find references",  icon = .Search,     command = .Find_References},
+	{label = "Rename symbol",    icon = .Pencil,     command = .Rename_Symbol},
+	{separator = true},
+	{label = "Cut",              icon = .Scissors,   command = .Cut},
+	{label = "Copy",             icon = .Copy,       command = .Copy},
+	{label = "Paste",            icon = .Clipboard,  command = .Paste},
+	{separator = true},
+	{label = "Select all",       icon = .Select_All, command = .Select_All},
 }
 
 
@@ -134,6 +160,18 @@ context_menu_frame :: proc() {
 		}
 	}
 
+	// An editor's text
+	for p in g.panes.open {
+		e, is_editor := p.content.(^Editor)
+		if !is_editor || !pane_live(p) || e.status != .Text {
+			continue
+		}
+		if pointer_in(clay.ID("PaneBody", p.id)) && editor_text_hit(e, g.mouse_pos) {
+			open_editor_menu(p, e)
+			return
+		}
+	}
+
 	// A file or folder in the tree, or the space under it
 	if index, ok := tree_row_under_pointer(); ok {
 		node := g.workspace.nodes[index]
@@ -145,11 +183,53 @@ context_menu_frame :: proc() {
 }
 
 
+// The menu on an editor's text: a click outside the selection first moves the
+// caret there, as in other editors, so the items act on what was clicked
+@(private = "file")
+open_editor_menu :: proc(p: ^Pane, e: ^Editor) {
+	offset := e.kind.offset_at(e, g.mouse_pos)
+	inside := false
+	for s in e.sels {
+		lo, hi := textedit.sel_lo(s), textedit.sel_hi(s)
+		if lo != hi && offset >= lo && offset <= hi {
+			inside = true
+		}
+	}
+	if !inside {
+		textedit.show_caret(e, false)
+		textedit.set_single_selection(e, {offset, offset, -1})
+		textedit.normalize(e)
+	}
+	pane_focus(p)
+
+	// What applies here
+	has_selection := false
+	for s in e.sels {
+		if s.anchor != s.head do has_selection = true
+	}
+	items := EDITOR_ITEMS
+	for &item in items {
+		if !item.separator do item.cmd = .Editor_Command
+		#partial switch item.command {
+		case .Go_To_Definition: item.disabled = langs.client_with(&e.lsp, .Definition) == nil
+		case .Find_References:  item.disabled = langs.client_with(&e.lsp, .References) == nil
+		case .Rename_Symbol:    item.disabled = langs.client_with(&e.lsp, .Rename) == nil
+		case .Cut, .Copy:       item.disabled = !has_selection
+		}
+	}
+	menu_open(items[:], "", p, .Title)
+}
+
+
 @(private = "file")
 run_menu_command :: proc(cmd: Menu_Command) {
 	m := &g.menu
 
 	switch cmd {
+	case .Editor_Command:
+		// The item's command, in the editor the menu is on
+		e, is_editor := m.pane.content.(^Editor)
+		if is_editor do editor_run_command(e, m.items[m.chosen_index].command)
 	case .New_File:        create_start(m.path, folder = false)
 	case .New_Folder:      create_start(m.path, folder = true)
 	case .Rename_File:     rename_start_file(m.path, m.place, m.pane)
@@ -165,6 +245,22 @@ run_menu_command :: proc(cmd: Menu_Command) {
 }
 
 
+@(private = "file")
+menu_separator :: proc() {
+	if clay.UI()({
+		layout = {
+			sizing = {clay.SizingGrow(), clay.SizingFixed(MENU_SEPARATOR_HEIGHT)},
+			padding = {left = 8, right = 8, top = 4},
+		},
+	}) {
+		if clay.UI()({
+			layout = {sizing = {clay.SizingGrow(), clay.SizingFixed(1)}},
+			backgroundColor = gfx.theme.border,
+		}) {}
+	}
+}
+
+
 context_menu_ui :: proc() {
 	m := &g.menu
 	if !m.open do return
@@ -172,10 +268,16 @@ context_menu_ui :: proc() {
 	g.in_popup = true
 	defer g.in_popup = false
 
+	// Wider with shortcuts beside the items
+	width: f32 = MENU_WIDTH
+	h: f32 = 8 + (m.path != "" ? 26 : 0)
+	for item in m.items[:m.count] {
+		if item.cmd == .Editor_Command do width = MENU_WIDTH_SHORTCUTS
+		h += item.separator ? MENU_SEPARATOR_HEIGHT : MENU_ROW_HEIGHT
+	}
+
 	// Below the pointer, or above it where there is no room below
-	header: f32 = m.path != "" ? 26 : 0
-	h := f32(m.count) * MENU_ROW_HEIGHT + 8 + header
-	x := clamp(m.at.x, 4, f32(g.window_w) - MENU_WIDTH - 4)
+	x := clamp(m.at.x, 4, f32(g.window_w) - width - 4)
 	y := m.at.y
 	if y + h > f32(g.window_h) - 4 {
 		y = max(m.at.y - h, 4)
@@ -183,7 +285,7 @@ context_menu_ui :: proc() {
 
 	if clay.UI(clay.ID("ContextMenu"))({
 		layout = {
-			sizing = {width = clay.SizingFixed(MENU_WIDTH)},
+			sizing = {width = clay.SizingFixed(width)},
 			layoutDirection = .TopToBottom,
 			padding = {4, 4, 4, 4},
 		},
@@ -208,7 +310,19 @@ context_menu_ui :: proc() {
 		}
 
 		for item, i in m.items[:m.count] {
+			if item.separator {
+				menu_separator()
+				continue
+			}
+
+			// Its colors: red for a danger, faint while it doesn't apply
 			id := clay.ID("MenuItem", u32(i))
+			text_color := item.danger ? gfx.theme.error : gfx.theme.text
+			icon_color := item.danger ? gfx.theme.error : gfx.theme.text_dim
+			if item.disabled {
+				text_color, icon_color = gfx.theme.text_faint, gfx.theme.text_faint
+			}
+
 			if clay.UI(id)({
 				layout = {
 					sizing = {clay.SizingGrow(), clay.SizingFixed(MENU_ROW_HEIGHT)},
@@ -216,14 +330,21 @@ context_menu_ui :: proc() {
 					childGap = 9,
 					childAlignment = {y = .Center},
 				},
-				backgroundColor = clay.Hovered() ? gfx.theme.hover : {},
+				backgroundColor = clay.Hovered() && !item.disabled ? gfx.theme.hover : {},
 				cornerRadius = clay.CornerRadiusAll(5),
 			}) {
-				icon(item.icon, item.danger ? gfx.theme.error : gfx.theme.text_dim, 14)
-				label(item.label, item.danger ? gfx.theme.error : gfx.theme.text, FONT_SIZE_SIDEBAR)
+				icon(item.icon, icon_color, 14)
+				label(item.label, text_color, FONT_SIZE_SIDEBAR)
+				if item.cmd == .Editor_Command {
+					push_right()
+					label(first_chord_label(item.command), gfx.theme.text_faint, FONT_SIZE_SMALL)
+				}
 			}
 
-			if clicked(id) do m.chosen = item.cmd
+			if clicked(id) && !item.disabled {
+				m.chosen = item.cmd
+				m.chosen_index = i
+			}
 		}
 	}
 }

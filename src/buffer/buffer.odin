@@ -292,6 +292,15 @@ chunks :: proc(b: ^Buffer, allocator := context.temp_allocator) -> [][]u8 {
 
 // --- Raw edits (no history) --------------------------------------------------------
 
+// Replaces [offset, offset+remove_len) with text, without undo history or the
+// change log: for a copy of a document kept in step elsewhere (a language
+// server's)
+replace_untracked :: proc(b: ^Buffer, offset, remove_len: int, text: string) {
+	remove_range(b, offset, remove_len, nil)
+	if len(text) > 0 do insert_text(b, offset, text)
+}
+
+
 // Inserts text at offset and returns the piece describing it
 @(private)
 insert_text :: proc(b: ^Buffer, offset: int, text: string) -> Piece {

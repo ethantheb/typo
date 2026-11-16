@@ -6,6 +6,7 @@ import "core:strings"
 import "core:unicode/utf8"
 
 import "buffer"
+import "langs"
 import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
@@ -25,6 +26,8 @@ TEXT_KIND := textedit.Kind {
 	frame_end   = text_frame_end,
 	draw        = draw_text_view,
 	offset_at   = text_offset_at,
+	char_at     = text_char_at,
+	char_rect   = text_char_rect,
 	over_text   = text_over_text,
 	max_scroll  = text_max_scroll,
 	scroll_step = text_scroll_step,
@@ -34,7 +37,9 @@ TEXT_KIND := textedit.Kind {
 	page_height = text_page_height,
 	edit_key    = text_edit_key,
 	text_input  = text_input,
+	press       = text_press,
 	drag_x      = text_drag_x,
+	pointer     = text_pointer,
 }
 
 TEXT_MARGIN :: 8 // logical pixels between the gutter and the text
@@ -80,6 +85,94 @@ text_offset_at :: proc(v: ^textedit.View, p: [2]f32) -> int {
 }
 
 
+// The character under a point: the column it is in, not the nearest boundary,
+// and nothing past the line's end
+@(private = "file")
+text_char_at :: proc(v: ^textedit.View, p: [2]f32) -> (offset: int, ok: bool) {
+	e := editor_of(v)
+
+	y := f64(p.y - e.view.y) + e.scroll_y
+	if y < 0 do return
+	line := int(y) / editor_line_height()
+	if line >= buffer.line_count(&e.buf) do return
+
+	x := p.x - e.view.x - e.gutter_w - TEXT_MARGIN + e.scroll_x
+	if x < 0 do return
+	col := int(x / e.char_w)
+
+	// The line up to that column: a column takes at most 4 bytes, so a long
+	// line isn't read whole every frame the pointer is over it
+	start := buffer.line_start(&e.buf, line)
+	end := buffer.line_end(&e.buf, line)
+	n := min(end - start, (col + 1) * 4)
+	text := string(buffer.read_alloc(&e.buf, start, start + n))
+
+	i := textedit.byte_at_col(text, col)
+	if i >= len(text) do return
+	return start + i, true
+}
+
+
+// Where the character at `offset` is drawn, in logical window coordinates
+@(private = "file")
+text_char_rect :: proc(v: ^textedit.View, offset: int) -> (r: gfx.Rect, ok: bool) {
+	e := editor_of(v)
+	lh := editor_line_height()
+
+	line := buffer.offset_to_line(&e.buf, offset)
+	y := e.view.y + f32(f64(line * lh) - e.scroll_y)
+	if y + f32(lh) < e.view.y || y > e.view.y + e.view.h {
+		return
+	}
+
+	text, start := textedit.line_text(e, line)
+	col := textedit.visual_col(text, offset - start)
+	x := e.view.x + e.gutter_w + TEXT_MARGIN - e.scroll_x + f32(col) * e.char_w
+	return {x, y, e.char_w, f32(lh)}, true
+}
+
+
+// Ctrl+click goes to the definition of what was clicked
+@(private = "file")
+text_press :: proc(v: ^textedit.View, p: [2]f32, mods: sdl.Keymod, clicks: int) -> bool {
+	e := editor_of(v)
+	if mods & sdl.KMOD_CTRL == {} || clicks != 1 {
+		return false
+	}
+
+	lo, _, on_symbol := definition_link(e, p)
+	if !on_symbol do return false
+
+	textedit.set_single_selection(e, {lo, lo, -1})
+	lsp_go_to_definition(e, lo)
+	return true
+}
+
+
+// A hand over a symbol while Ctrl is held, where a click goes to its definition
+@(private = "file")
+text_pointer :: proc(v: ^textedit.View, p: [2]f32, over_text: bool) -> textedit.Pointer {
+	e := editor_of(v)
+	ctrl := sdl.GetModState() & sdl.KMOD_CTRL != {}
+	if ctrl && over_text {
+		_, _, on_symbol := definition_link(e, p)
+		if on_symbol do return .Hand
+	}
+	return .Text
+}
+
+
+// The word under a point, if a server can say where it is defined
+@(private = "file")
+definition_link :: proc(e: ^Editor, p: [2]f32) -> (lo, hi: int, ok: bool) {
+	offset := text_char_at(e, p) or_return
+	if langs.client_with(&e.lsp, .Definition) == nil do return
+
+	lo, hi = textedit.word_at(e, offset)
+	return lo, hi, hi > lo && textedit.is_word_byte(buffer.byte_at(&e.buf, offset))
+}
+
+
 @(private = "file")
 text_over_text :: proc(v: ^textedit.View, p: [2]f32) -> bool {
 	e := editor_of(v)
@@ -111,8 +204,13 @@ text_reveal :: proc(v: ^textedit.View) {
 	lh := f64(editor_line_height())
 	top := f64(line) * lh
 	ty, tx := e.target_y, e.target_x
-	if top < ty do ty = top
-	if top + lh > ty + f64(e.view.h) do ty = top + lh - f64(e.view.h)
+	h := f64(e.view.h)
+	outside := top < ty || top + lh > ty + h
+	switch {
+	case outside && e.center: ty = top + lh / 2 - h / 2
+	case top < ty:            ty = top
+	case top + lh > ty + h:   ty = top + lh - h
+	}
 
 	// Sideways: the caret's column
 	text, start := textedit.line_text(e, line)
@@ -297,6 +395,15 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 	primary := e.sels[e.primary]
 	primary_line := buffer.offset_to_line(&e.buf, primary.head)
 
+	// The symbol under the pointer while Ctrl is held, underlined as a link
+	link_lo, link_hi := -1, -1
+	ctrl := sdl.GetModState() & sdl.KMOD_CTRL != {}
+	if ctrl && editor_text_hit(e, g.mouse_pos) && ui_interactive() {
+		if lo, hi, ok := definition_link(e, g.mouse_pos); ok {
+			link_lo, link_hi = lo, hi
+		}
+	}
+
 	lines := visible_lines(e, first, last, hl_start, hl_end)
 	for l, i in lines {
 		line := first + i
@@ -306,6 +413,16 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 
 		if line == primary_line && primary.anchor == primary.head {
 			gfx.fill_rect(b.x + gutter, y, b.w - gutter, lh, gfx.theme.current_line)
+		}
+
+		// Marks (search matches)
+		for j := textedit.first_mark_at(e, l.start); j < len(e.marks); j += 1 {
+			lo, hi := e.marks[j][0], e.marks[j][1]
+			if lo > end do break
+
+			x1 := col_x(l.text, max(lo, l.start) - l.start, text_x, adv)
+			x2 := col_x(l.text, min(hi, end) - l.start, text_x, adv)
+			gfx.fill_rect(x1, y, x2 - x1, lh, gfx.theme.find_match)
 		}
 
 		// Selections. One continuing past the line end also covers one extra
@@ -341,6 +458,28 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 				strike_w := f32(utf8.rune_count(run.text)) * adv
 				gfx.fill_rect(x, strike_y, strike_w, max(math.round(scale), 1), color)
 			}
+		}
+
+		// Problems, underlined with a wave (an empty one under the character after it)
+		for j := textedit.first_problem_at(e, l.start); j < len(e.problems); j += 1 {
+			pr := e.problems[j]
+			if pr.lo > end do break
+
+			hi := max(pr.hi, pr.lo + 1)
+			if hi <= l.start do continue
+
+			x1 := col_x(l.text, clamp(pr.lo, l.start, end) - l.start, text_x, adv)
+			x2 := col_x(l.text, clamp(hi, l.start, end) - l.start, text_x, adv)
+			if x2 <= x1 do x2 = x1 + math.round(adv)
+			draw_wave(x1, x2, y + lh, scale, pr.severity)
+		}
+
+		// The Ctrl+click link
+		if link_lo < end && link_hi > l.start {
+			x1 := col_x(l.text, max(link_lo, l.start) - l.start, text_x, adv)
+			x2 := col_x(l.text, min(link_hi, end) - l.start, text_x, adv)
+			thickness := max(math.round(scale), 1)
+			gfx.fill_rect(x1, y + lh - 2 * thickness, x2 - x1, thickness, gfx.theme.md_link)
 		}
 
 		// Carets
@@ -415,6 +554,31 @@ visible_lines :: proc(e: ^Editor, first, last, lo, hi: int) -> []Visible_Line {
 		pos = min(end + 1, len(text))
 	}
 	return out
+}
+
+
+// A problem's underline from x1 to x2, ending at `bottom` (the row's bottom): a
+// wave in its severity's color, dots for a hint
+@(private = "file")
+draw_wave :: proc(x1, x2, bottom, scale: f32, severity: textedit.Severity) {
+	s := max(math.round(scale), 1)
+	color := severity_color(severity)
+	top := bottom - 3 * s
+
+	if severity == .Hint {
+		for x := x1; x < x2; x += 2 * s {
+			gfx.fill_rect(x, top + s, s, s, color)
+		}
+		return
+	}
+
+	WAVE :: [4]f32{0, 1, 2, 1}
+	wave := WAVE
+	i := 0
+	for x := x1; x < x2; x += s {
+		gfx.fill_rect(x, top + wave[i % 4] * s, s, s, color)
+		i += 1
+	}
 }
 
 

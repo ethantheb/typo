@@ -3,6 +3,7 @@ package editor
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 
 import "buffer"
@@ -12,6 +13,12 @@ import sdl "../vendor/sdl3"
 
 // Unit tests for the main package: editing operations, matching and settings,
 // without a window. Run with: python build.py --test
+
+
+// Tests run on several threads; those that change the app's state in `g`
+// (settings, find, language servers, the workspace) take turns with this
+@(private)
+app_state_lock: sync.Mutex
 
 
 @(private = "file")
@@ -105,30 +112,6 @@ test_movement :: proc(t: ^testing.T) {
 
 
 @(test)
-test_fuzzy :: proc(t: ^testing.T) {
-	defer fuzzy_destroy()
-
-	_, ok := fuzzy_score("edv", "src/editor_view.odin")
-	testing.expect(t, ok)
-	_, ok = fuzzy_score("xyz", "src/editor_view.odin")
-	testing.expect(t, !ok)
-
-	// Consecutive matches at a boundary beat scattered ones
-	a, _ := fuzzy_score("term", "src/terminal.odin")
-	b, _ := fuzzy_score("term", "src/theme_error_map.odin")
-	testing.expect(t, a > b)
-
-	// The matched characters
-	path := "src/terminal_edit.odin"
-	picked := strings.builder_make(context.temp_allocator)
-	for m, i in fuzzy_positions("ted", path) {
-		if m do strings.write_byte(&picked, path[i])
-	}
-	testing.expect_value(t, strings.to_string(picked), "ted")
-}
-
-
-@(test)
 test_shell_display_name :: proc(t: ^testing.T) {
 	git_bash := `"C:\Program Files\Git\bin\bash.exe" --login`
 
@@ -141,6 +124,7 @@ test_shell_display_name :: proc(t: ^testing.T) {
 
 @(test)
 test_relative_to_root :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
 	g.workspace.root = `C:\work`
 	defer g.workspace.root = ""
 
@@ -260,6 +244,7 @@ test_number_settings :: proc(t: ^testing.T) {
 // A fresh install writes the defaults; they must load back without problems
 @(test)
 test_default_settings_are_valid :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
 	path := fmt.tprintf("%s.toml", temp_test_path("typo-defaults-test"))
 	defer os.remove(path)
 

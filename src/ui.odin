@@ -39,11 +39,14 @@ pointer_in :: proc(id: clay.ElementId) -> bool {
 // window usable outside it
 ui_interactive :: proc() -> bool {
 	switch {
-	case g.dialog.open, g.menu.open: return g.in_popup
-	case g.in_modal:                 return true
-	case g.finder.open:              return false
-	case settings_window_docked():   return !pointer_in(clay.ID("Settings"))
-	case g.settings_window.open:     return false
+	case g.dialog.open, g.menu.open, g.lsp.popup.open: return g.in_popup
+	case lsp_hover_covers_pointer():                  return g.in_popup
+	case lsp_completion_covers_pointer():             return g.in_popup
+	case lsp_rename_covers_pointer():                 return g.in_popup
+	case g.in_modal:                                  return true
+	case g.finder.open:                               return false
+	case settings_window_docked():                    return !pointer_in(clay.ID("Settings"))
+	case g.settings_window.open:                      return false
 	}
 	return true
 }

@@ -35,12 +35,18 @@ Deleting :: struct {
 }
 Reset_Settings :: struct {}
 Notice :: struct {}
+Removing_Server :: struct {
+	name: string, // owned; a server the settings added
+}
+Applying_Edit :: struct {} // a language server's edit of files that aren't open
 
 Dialog_Purpose :: union {
 	Unsaved_Step,
 	Deleting,
 	Reset_Settings,
 	Notice,
+	Removing_Server,
+	Applying_Edit,
 }
 
 Dialog :: struct {
@@ -89,8 +95,9 @@ dialog_close :: proc() {
 
 	delete(d.title)
 	delete(d.message)
-	if del, is_delete := d.purpose.(Deleting); is_delete {
-		delete(del.path)
+	#partial switch p in d.purpose {
+	case Deleting:        delete(p.path)
+	case Removing_Server: delete(p.name)
 	}
 
 	serial := d.serial
@@ -106,7 +113,6 @@ dialog_destroy :: proc() {
 
 
 // A message with an OK button
-@(private = "file")
 show_notice :: proc(title, message: string) {
 	dialog_show(title, message, .Alert, {{"OK", .Primary}}, 0, 0, Notice{})
 }
@@ -144,6 +150,12 @@ dialog_apply :: proc(choice: int) {
 			settings_reset_all(&g.settings)
 			settings_changed()
 		}
+
+	case Removing_Server:
+		if confirmed do settings_remove_server(p.name)
+
+	case Applying_Edit:
+		lsp_edit_confirmed(confirmed)
 
 	case Unsaved_Step:
 		unsaved_answer((^Pane)(p), choice)
@@ -458,5 +470,19 @@ ask_reset_settings :: proc() {
 		focus = 1,
 		cancel = 1,
 		purpose = Reset_Settings{},
+	)
+}
+
+
+// Asks before removing a server the settings added
+ask_remove_server :: proc(name: string) {
+	dialog_show(
+		"Remove server",
+		fmt.tprintf("Remove the language server \"%s\" from the settings?", name),
+		.Trash,
+		{{"Remove", .Danger}, {"Cancel", .Normal}},
+		focus = 1,
+		cancel = 1,
+		purpose = Removing_Server{strings.clone(name)},
 	)
 }

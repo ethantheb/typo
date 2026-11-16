@@ -271,8 +271,9 @@ editor_reveal :: proc(e: ^Editor) {
 		return
 	}
 
-	e.reveal = false
 	e.kind.reveal(e)
+	e.reveal = false
+	e.center = false
 	clamp_scroll(e)
 }
 

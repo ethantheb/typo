@@ -212,6 +212,32 @@ char_class :: proc(c: u8) -> Char_Class {
 }
 
 
+// Letters, digits, '_' and the bytes of non-ASCII characters
+is_word_byte :: proc(c: u8) -> bool {
+	return char_class(c) == .Word
+}
+
+
+// The word around an offset (the one it is in, or ends), on its line, looking at
+// most `max_len` bytes each way; empty if there is none
+word_span :: proc(v: ^View, offset: int, max_len := 256) -> (lo, hi: int) {
+	line := buffer.offset_to_line(&v.buf, offset)
+	from := max(buffer.line_start(&v.buf, line), offset - max_len)
+	to := min(buffer.line_end(&v.buf, line), offset + max_len)
+	text := buffer.read_alloc(&v.buf, from, to)
+
+	a := offset - from
+	b := a
+	for a > 0 && is_word_byte(text[a - 1]) {
+		a -= 1
+	}
+	for b < len(text) && is_word_byte(text[b]) {
+		b += 1
+	}
+	return from + a, from + b
+}
+
+
 // Word boundary left/right of `offset`, staying within the line unless already
 // at its edge (then it moves to the adjacent line)
 word_boundary :: proc(v: ^View, offset: int, dir: int) -> int {
@@ -308,6 +334,74 @@ apply :: proc(v: ^View, kind: buffer.Edit_Kind, ranges: [][2]int, texts: []strin
 	normalize(v)
 	buffer.end(&v.buf, v.sels[:])
 	v.reveal = true
+}
+
+
+// One replacement of apply_edits, in the text as it was before any of them
+Text_Edit :: struct {
+	lo, hi:  int,
+	text:    string,
+	selects: bool,   // a selection goes inside the inserted text:
+	sel:     [2]int, // its anchor and head, as offsets in `text`
+	primary: bool,   // that selection is the primary one
+}
+
+
+// Makes edits (sorted, not overlapping) as one undo step. The selections become
+// the ones the edits ask for; if none do, the selections stay where they were in
+// the text, moved by the edits (`reveal` scrolls to the primary one)
+apply_edits :: proc(v: ^View, kind: buffer.Edit_Kind, edits: []Text_Edit, reveal := true) {
+	if len(edits) == 0 do return
+
+	selects := false
+	for e in edits {
+		if e.selects do selects = true
+	}
+
+	buffer.begin(&v.buf, kind, now(), v.sels[:])
+	if selects {
+		clear(&v.sels)
+	} else {
+		for &s in v.sels {
+			s = {moved_offset(s.anchor, edits), moved_offset(s.head, edits), -1}
+		}
+	}
+
+	primary := v.primary
+	delta := 0
+	for e in edits {
+		lo, hi := e.lo + delta, e.hi + delta
+		buffer.replace(&v.buf, lo, hi - lo, e.text)
+		if e.selects {
+			if e.primary do primary = len(v.sels)
+			append(&v.sels, Selection{lo + e.sel[0], lo + e.sel[1], -1})
+		}
+		delta += len(e.text) - (hi - lo)
+	}
+
+	v.primary = selects ? primary : v.primary
+	normalize(v)
+	buffer.end(&v.buf, v.sels[:])
+	if reveal do v.reveal = true
+}
+
+
+// Where an offset is after edits (sorted, in the text before them): moved by the
+// edits before it; inside a replaced range, at the same distance into the new
+// text (at most its end). An insertion at the offset goes after it
+@(private = "file")
+moved_offset :: proc(offset: int, edits: []Text_Edit) -> int {
+	delta := 0
+	for e in edits {
+		if e.lo > offset || (e.lo == e.hi && e.lo == offset) {
+			break
+		}
+		if offset < e.hi {
+			return e.lo + delta + min(offset - e.lo, len(e.text))
+		}
+		delta += len(e.text) - (e.hi - e.lo)
+	}
+	return offset + delta
 }
 
 

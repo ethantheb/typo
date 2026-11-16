@@ -74,6 +74,9 @@ IS_WINDOWS = platform.system() == "Windows"
 EXE        = OUT / ("typo.exe" if IS_WINDOWS else "typo")
 PERF_EXE   = OUT / ("typo-perf.exe" if IS_WINDOWS else "typo-perf")
 
+# A language server for the tests and the perf suite (src/lsp/fake_server)
+FAKE_LSP_EXE = OUT / ("fake_lsp.exe" if IS_WINDOWS else "fake_lsp")
+
 TEST_PACKAGES = [
     "src/buffer",
     "src/syntax",
@@ -83,6 +86,9 @@ TEST_PACKAGES = [
     "src/gfx",
     "src/textedit",
     "src/mdview",
+    "src/lsp",
+    "src/fuzzy",
+    "src/langs",
     "src",
 ]
 
@@ -499,6 +505,10 @@ def tell_how_to_add_to_path(dest):
 # --- Tests ------------------------------------------------------------------------
 
 
+def build_fake_lsp():
+    check(["odin", "build", "src/lsp/fake_server", f"-out:{FAKE_LSP_EXE}", "-o:speed"])
+
+
 def run_unit_tests():
     """Returns True if every package's tests pass."""
     ok = True
@@ -544,6 +554,7 @@ def main():
     fetch_conpty()
 
     if args.test or args.perf:
+        build_fake_lsp()
         ok = run_unit_tests() if args.test else True
         ok &= run_perf()
         print("\nAll tests passed." if ok else "\nTests FAILED.")

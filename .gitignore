@@ -3,4 +3,5 @@ build/
 *.exe
 *.res
 resume.txt
+todo.md
 __pycache__/

@@ -8,6 +8,9 @@ import "core:strings"
 import "core:time"
 
 import "buffer"
+import "fuzzy"
+import "langs"
+import "lsp"
 import "markdown"
 import "syntax"
 import "term"
@@ -45,6 +48,7 @@ Perf :: struct {
 	phase_t0:         time.Tick,
 	cpu0:             i64,
 	frames:           [dynamic]Frame_Time, // of the current phase
+	lsp_times:        [dynamic]f64,        // language server work on the UI thread, per frame
 	frame_t0:         time.Tick,           // when the current frame's work began
 	marks:            [Frame_Part]time.Tick,
 	first_present_ns: i64,
@@ -73,6 +77,11 @@ Phase :: struct {
 	step:        proc(p: ^Perf, frame: int) -> bool,
 	// p95 limit (ms) on the CPU time of the phase's frames; 0 = frames not reported
 	frame_limit: f64,
+	// Limit (ms) on the slowest frame after the first; 0 = none
+	max_limit:   f64,
+	// Limit (ms) on the language server work done on the UI thread in any frame
+	// (lsp_frame, document sync); 0 = not reported
+	lsp_limit:   f64,
 	idle:        bool, // let the app sleep between frames
 }
 
@@ -89,12 +98,15 @@ PHASES := [?]Phase {
 	{name = "idle with a file open", step = phase_idle, idle = true},
 	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8},
 	{name = "clicking places the caret", step = phase_click_caret},
+	{name = "moving lines", step = phase_move_lines},
+	{name = "find in a file (tree-sitter)", step = phase_find, frame_limit = 8},
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
 	{name = "resizing the window (tree-sitter)", step = phase_resize, frame_limit = 8},
 	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
 	{name = "clicking places the caret (rendered)", step = phase_click_caret},
+	{name = "find in Markdown (rendered)", step = phase_find, frame_limit = 8},
 	{
 		name        = "moving through a table and code block (rendered)",
 		step        = phase_move_markdown,
@@ -114,6 +126,7 @@ PHASES := [?]Phase {
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
+	{name = "settings sections collapsing", step = phase_settings_collapse, frame_limit = 8},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
@@ -121,15 +134,52 @@ PHASES := [?]Phase {
 	{name = "open 64 MB file (lexer)", step = phase_open_large, frame_limit = 8},
 	{name = "jumping through 64 MB file", step = phase_jump_large, frame_limit = 12},
 	{name = "typing in 64 MB file", step = phase_type, frame_limit = 8},
+	{name = "find in 64 MB file", step = phase_find, frame_limit = 12},
 	{name = "8 MB single-line file", step = phase_long_line, frame_limit = 25},
 	{name = "terminal full-screen redraws", step = phase_terminal_redraw, frame_limit = 12},
 	{name = "terminal shell output (4 MB)", step = phase_terminal_output, frame_limit = 16},
+	{name = "find in the terminal", step = phase_find_terminal, frame_limit = 16},
 	{
 		name        = "typing beside other panes (tree-sitter)",
 		step        = phase_panes_typing,
 		frame_limit = 8,
 	},
 	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
+	{
+		name = "language server (typing)",
+		step = phase_lsp_typing,
+		frame_limit = 8,
+		max_limit = 16,
+		lsp_limit = 1,
+	},
+	{
+		name = "scrolling with 10,000 problems",
+		step = phase_lsp_problems,
+		frame_limit = 8,
+		max_limit = 16,
+		lsp_limit = 1,
+	},
+	{name = "hover, go to definition, editor menu", step = phase_lsp_features, lsp_limit = 1},
+	{
+		name        = "symbols and references in the finder",
+		step        = phase_lsp_finder,
+		frame_limit = 8,
+		lsp_limit   = 1,
+	},
+	{
+		name        = "completion and signature help",
+		step        = phase_lsp_completion,
+		frame_limit = 8,
+		lsp_limit   = 1,
+	},
+	{name = "renaming a symbol, a server's edit", step = phase_lsp_rename, lsp_limit = 1},
+	{name = "language server popup", step = phase_lsp_popup, lsp_limit = 1},
+	{
+		name        = "language servers in the settings, installing one",
+		step        = phase_lsp_settings,
+		frame_limit = 8,
+		lsp_limit   = 1,
+	},
 	{name = "idle with the terminal focused", step = phase_idle, idle = true},
 }
 
@@ -164,6 +214,7 @@ perf_end :: proc() {
 	delete(p.md_text)
 	delete(p.large_text)
 	delete(p.frames)
+	delete(p.lsp_times)
 	for f in p.failures do delete(f)
 	delete(p.failures)
 	free(p)
@@ -204,7 +255,9 @@ perf_frame :: proc() -> (done, ok: bool) {
 			prev = p.marks[part]
 		}
 		append(&p.frames, t)
+		append(&p.lsp_times, time.duration_milliseconds(langs.state.ui_time))
 	}
+	langs.state.ui_time = 0
 
 	// This frame's step, moving on to the next phase when one finishes
 	for p.phase < len(PHASES) {
@@ -236,6 +289,7 @@ perf_frame :: proc() -> (done, ok: bool) {
 start_phase :: proc(p: ^Perf) {
 	fmt.printfln("\n%s", PHASES[p.phase].name)
 	clear(&p.frames)
+	clear(&p.lsp_times)
 
 	gpu_counter_start(&p.gpu) // first: querying the counters costs CPU time
 	p.phase_t0 = time.tick_now()
@@ -245,7 +299,13 @@ start_phase :: proc(p: ^Perf) {
 
 @(private = "file")
 finish_phase :: proc(p: ^Perf) {
-	limit := PHASES[p.phase].frame_limit
+	phase := PHASES[p.phase]
+	if phase.lsp_limit > 0 {
+		worst := slice.max(p.lsp_times[:]) if len(p.lsp_times) > 0 else 0
+		result(p, "language servers, UI thread, worst", worst, "ms", phase.lsp_limit)
+	}
+
+	limit := phase.frame_limit
 	if limit == 0 || len(p.frames) < 2 {
 		return
 	}
@@ -267,7 +327,7 @@ finish_phase :: proc(p: ^Perf) {
 
 	result(p, fmt.tprintf("frames (%d) median CPU", len(cpu)), percentile(cpu, 0.5), "ms")
 	result(p, "frames p95 CPU", percentile(cpu, 0.95), "ms", limit)
-	result(p, "frames max CPU", cpu[len(cpu) - 1], "ms")
+	result(p, "frames max CPU", cpu[len(cpu) - 1], "ms", phase.max_limit)
 	result(p, "frames p95 present", percentile(present, 0.95), "ms")
 
 	gpu := gpu_counter_read(&p.gpu)
@@ -640,7 +700,7 @@ phase_fuzzy :: proc(p: ^Perf, frame: int) -> bool {
 	t := time.tick_now()
 	matched := 0
 	for path in paths {
-		_, ok := fuzzy_score("modcompfile77", path)
+		_, ok := fuzzy.score("modcompfile77", path)
 		if ok do matched += 1
 	}
 	result(p, fmt.tprintf("score %dk paths", N / 1000), ms_since(t), "ms", 400)
@@ -927,7 +987,7 @@ phase_finder :: proc(p: ^Perf, frame: int) -> bool {
 
 	case:
 		found := len(f.results) > 0 &&
-		         strings.has_suffix(f.files[f.results[0].file], "code.odin")
+		         strings.has_suffix(f.files[f.results[0].index], "code.odin")
 		check(p, "finds code.odin", found)
 		finder_toggle()
 		return true
@@ -1003,13 +1063,118 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 		for info in SETTINGS {
 			if info.name == "" do file_only += 1
 		}
-		listed := len(Command) + len(Setting) - file_only
-		check(p, "lists every setting and command", len(w.items) == listed)
+		listed := len(Command) + len(Setting) - file_only + len(server_rows()) + 1
+		listed += len(Section) // their headers
+		check(p, "lists every setting, command and language server", len(w.items) == listed)
 
 		settings_window_toggle()
 		return true
 	}
 	return false
+}
+
+
+// Collapses the keybindings from their header (Enter), the first section by a
+// click (which leaves nothing focused), then every section (Collapse all); a
+// search still finds settings in collapsed sections; Expand all shows them
+// again, and ← and → collapse and expand the focused section
+@(private = "file")
+phase_settings_collapse :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	w := &g.settings_window
+	if frame == 0 {
+		settings_window_toggle()
+		step, p.mark_frame = 1, frame
+		return false
+	}
+	waited := frame - p.mark_frame
+
+	switch step {
+	case 1: // once the panel has arrived: Enter on the keybindings' header
+		if g.animating && waited < 600 {
+			return false
+		}
+
+		focus_item(Section.Keybindings)
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 2: // its rows go, focus stays on it
+		if waited < 2 do return false
+
+		collapsed := g.settings.collapsed_sections == "keybindings"
+		check(p, "a section collapses", collapsed && count_items(Command) == 0)
+		on_header := w.focus >= 0 && w.focus < len(w.items)
+		on_header = on_header && w.items[w.focus] == Setting_Item(Section.Keybindings)
+		check(p, "focus stays on its header", on_header)
+
+		// The list at its top, for the first section's header
+		data := clay.GetScrollContainerData(clay.ID("SettingsList"))
+		if data.found do data.scrollPosition.y = 0
+		next_step(p, &step, frame)
+
+	case 3: // with a row in it focused, click the first section's header
+		if waited < 2 do return false
+
+		focus_item(Setting.Restore_Session)
+		click_element(clay.ID("SectionHeader", u32(Section.General)))
+		next_step(p, &step, frame)
+
+	case 4: // it collapses, and nothing is focused; then Collapse all
+		if waited < 2 do return false
+
+		collapsed := g.settings.collapsed_sections == "general, keybindings"
+		check(p, "a click collapses a section", collapsed)
+		check(p, "a click doesn't focus the header", w.open && w.focus == -1)
+		click_element(clay.ID("SettingsCollapseAll"))
+		next_step(p, &step, frame)
+
+	case 5: // only the headers; a search still finds settings
+		if waited < 2 do return false
+
+		check(p, "Collapse all leaves only the headers", count_items(Section) == len(w.items))
+		append(&w.search, "font")
+		next_step(p, &step, frame)
+
+	case 6: // then Expand all
+		if waited < 2 do return false
+
+		found := count_items(Setting) > 0 && count_items(Section) == 0
+		check(p, "a search shows settings in collapsed sections", found)
+		clear(&w.search)
+		next_step(p, &step, frame)
+
+	case 7:
+		if waited < 2 do return false
+		click_element(clay.ID("SettingsCollapseAll"))
+		next_step(p, &step, frame)
+
+	case 8: // everything again; ← collapses the focused section and → expands it
+		if waited < 2 do return false
+
+		expanded := g.settings.collapsed_sections == "" && count_items(Command) == len(Command)
+		check(p, "Expand all shows every section", expanded)
+		focus_item(Section.Font)
+		press(sdl.K_LEFT)
+		check(p, "← collapses a section", g.settings.collapsed_sections == "font")
+		press(sdl.K_RIGHT)
+		check(p, "→ expands it", g.settings.collapsed_sections == "")
+		if w.open do settings_window_toggle()
+		return true
+	}
+	return false
+}
+
+
+// How many rows of the settings list shown last frame are a T
+@(private = "file")
+count_items :: proc($T: typeid) -> int {
+	n := 0
+	for item in g.settings_window.items {
+		_, ok := item.(T)
+		if ok do n += 1
+	}
+	return n
 }
 
 
@@ -1283,6 +1448,172 @@ menu_still_showing :: proc(since: time.Tick) -> bool {
 element_center :: proc(id: clay.ElementId) -> (c: [2]f32, ok: bool) {
 	r := element_rect(id) or_return
 	return {r.x + r.w / 2, r.y + r.h / 2}, true
+}
+
+
+// Move line down and up move the caret's line past the next one and back
+@(private = "file")
+phase_move_lines :: proc(p: ^Perf, frame: int) -> bool {
+	e := focused_editor()
+
+	third, _ := textedit.line_text(e, 3)
+	fourth, _ := textedit.line_text(e, 4)
+	third = strings.clone(third, context.temp_allocator)
+	fourth = strings.clone(fourth, context.temp_allocator)
+
+	start := buffer.line_start(&e.buf, 3)
+	textedit.set_single_selection(e, {start, start, -1})
+
+	run_command(.Move_Line_Down)
+	now_third, _ := textedit.line_text(e, 3)
+	now_fourth, _ := textedit.line_text(e, 4)
+	check(p, "Move line down swaps it with the next", now_third == fourth && now_fourth == third)
+
+	run_command(.Move_Line_Up)
+	back, _ := textedit.line_text(e, 3)
+	check(p, "Move line up puts it back", back == third)
+	return true
+}
+
+
+// Opens the find bar on the focused editor, types a query and waits for every
+// match; checks the count against a plain count (in files small enough to read
+// whole), moves between matches, turns on match case, and closes the bar
+@(private = "file")
+phase_find :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) counts: [2]int // matches ignoring case and matching it; -1 when not counted
+	@(static) since: time.Tick
+	f := &g.find
+	e := focused_editor()
+
+	if frame == 0 {
+		step = 0
+		query := perf_find_query(e)
+		counts = perf_find_counts(e, query)
+
+		textedit.set_single_selection(e, {0, 0, -1})
+		check(p, "Find opens the bar", run_command(.Find) && f.open && f.typing)
+
+		event: sdl.Event
+		event.type = .TEXT_INPUT
+		event.text.text = strings.clone_to_cstring(query, context.temp_allocator)
+		handle_key_event(&event)
+		return false
+	}
+
+	switch step {
+	case 0: // the whole document searched
+		if !f.done && frame < 600 {
+			return false
+		}
+
+		check(p, "the search finishes", f.done)
+		if counts[0] >= 0 {
+			check(p, "every match is found", len(f.matches) == counts[0])
+		}
+		check(p, "matches are marked", len(e.marks) == len(f.matches))
+		if len(f.matches) > 0 {
+			m := f.matches[max(f.current, 0)]
+			s := e.sels[e.primary]
+			check(p, "a match is selected", f.current >= 0 && s.anchor == m[0] && s.head == m[1])
+		}
+		step, since = 1, time.tick_now()
+
+	case 1: // a moment to see the bar, then between matches
+		if time.tick_since(since) < 600 * time.Millisecond do return false
+
+		if len(f.matches) > 1 {
+			first := f.current
+			press(sdl.K_RETURN)
+			went_on := f.current == (first + 1) % len(f.matches)
+			run_command(.Find_Previous)
+			check(p, "Enter and Find previous move between matches", went_on && f.current == first)
+		}
+		run_command(.Find_Match_Case)
+		step = 2
+
+	case 2: // match case searches again
+		if f.searched != f.options || !f.done {
+			return false
+		}
+
+		if counts[1] >= 0 {
+			check(p, "match case finds fewer", len(f.matches) == counts[1])
+		}
+		run_command(.Find_Match_Case)
+		press(sdl.K_ESCAPE)
+		check(p, "Escape closes the bar", !f.open && e.marks == nil)
+		return true
+	}
+	return false
+}
+
+
+// What each find phase searches for: a common word, or in the 64 MB file one
+// that isn't there, so the whole file is read
+@(private = "file")
+perf_find_query :: proc(e: ^Editor) -> string {
+	switch {
+	case strings.has_suffix(e.path, "notes.md"):   return "the"
+	case strings.has_suffix(e.path, "large.odin"): return "quokka"
+	}
+	return "proc"
+}
+
+
+// The matches a plain count finds ignoring ASCII case and matching it, or -1s
+// for a file too big to read whole in a frame
+@(private = "file")
+perf_find_counts :: proc(e: ^Editor, query: string) -> [2]int {
+	length := buffer.length(&e.buf)
+	if length > 8 << 20 do return {-1, -1}
+
+	text := string(buffer.read_alloc(&e.buf, 0, length))
+	lower := strings.to_lower(text, context.temp_allocator)
+	return {strings.count(lower, query), strings.count(text, query)}
+}
+
+
+// Finds in the terminal after the 4 MB of output: matches through the
+// scrollback, the newest selected, the ones in view marked, then older ones
+@(private = "file")
+phase_find_terminal :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) since: time.Tick
+	f := &g.find
+	t := focused_terminal()
+
+	if frame == 0 {
+		opened := run_command(.Find) && f.open && f.pane.content == Pane_Content(t)
+		check(p, "Find opens the bar on the terminal", opened)
+
+		event: sdl.Event
+		event.type = .TEXT_INPUT
+		event.text.text = "lazy dog"
+		handle_key_event(&event)
+		since = time.tick_now()
+		return false
+	}
+
+	// Until the scrollback is searched, and a moment to see it
+	total, current, complete := find_term_counts(f)
+	waited := time.tick_since(since)
+	if !complete && waited < 20 * time.Second {
+		return false
+	}
+	if waited < 600 * time.Millisecond do return false
+
+	check(p, "matches are found in the scrollback", complete && total > 1)
+	check(p, "the newest match is selected", current == 0)
+	check(p, "matches in view are marked", len(t.marks) > 0)
+
+	run_command(.Find_Next)
+	_, next, _ := find_term_counts(f)
+	check(p, "Find next goes to an older match", next == 1)
+
+	press(sdl.K_ESCAPE)
+	check(p, "Escape closes the bar", !f.open && len(t.marks) == 0)
+	return true
 }
 
 
@@ -1638,4 +1969,1205 @@ phase_panes_moving :: proc(p: ^Perf, frame: int) -> bool {
 	pp.step += 1
 	p.mark_frame = frame
 	return false
+}
+
+
+// --- Language servers --------------------------------------------------------------
+
+// The fake server's client, from the typing phase for the popup phase
+@(private = "file")
+perf_lsp_client: ^langs.Client
+
+@(private = "file")
+PERF_FAKE_SERVER :: "build/fake_lsp.exe" when ODIN_OS == .Windows else "build/fake_lsp"
+
+
+// The fake server (src/lsp/fake_server) set up in settings.toml for Odin files:
+// it starts when code.odin opens and follows typing (each keystroke a
+// didChange of a 400 KB document)
+@(private = "file")
+phase_lsp_typing :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	client := &perf_lsp_client
+
+	if frame == 0 {
+		step = 0
+		client^ = nil
+		fake := lsp.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
+		check(p, "the fake server is built", fake != "")
+		if fake == "" do return true
+
+		// The server, then the file it serves
+		langs.state.active = true
+		o := langs.server_override(&g.settings.servers, "fake")
+		o.command = make([]string, 1)
+		o.command[0] = strings.clone(fake)
+		o.languages = make([]string, 1)
+		o.languages[0] = strings.clone("odin")
+		settings_changed()
+		open_timed(p, "code.odin")
+		p.mark_frame = frame
+		return false
+	}
+
+	e := focused_editor()
+	switch step {
+	case 0: // the server starts
+		for dc in e.lsp.clients {
+			if dc.client.name == "fake" && dc.opened && dc.client.state == .Running {
+				client^ = dc.client
+			}
+		}
+		if client^ == nil {
+			if frame - p.mark_frame > 600 {
+				check(p, "the server starts and gets the file", false)
+				return true
+			}
+			return false
+		}
+		check(p, "the server starts and gets the file", true)
+		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
+		textedit.show_caret(e, true)
+		textedit.set_single_selection(e, {mid, mid, -1})
+		e.reveal = true
+		step, p.mark_frame = 1, frame
+
+	case 1: // typing, the server following
+		text := "the quick brown fox "
+		editor_text_input(e, text[frame % len(text):][:1])
+		if frame - p.mark_frame < 120 do return false
+
+		_, shown := element_rect(clay.ID("LspStatus"))
+		check(p, "the status bar shows it", shown)
+		check(p, "it is still running", client^.state == .Running)
+		return true
+	}
+	return false
+}
+
+
+// A file with a problem on each of its 10,000 lines (the fake server reports
+// each "FIXME"), scrolled a page a frame: every row in view is underlined
+@(private = "file")
+phase_lsp_problems :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) arrived: bool
+	if perf_lsp_client == nil do return true
+
+	if frame == 0 {
+		arrived = false
+		sb := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< 10_000 {
+			fmt.sbprintf(&sb, "value_%d := shared_name + %d // FIXME check it\n", i, i)
+		}
+		_ = os.write_entire_file(path_in_dir(p, "problems.odin"), strings.to_string(sb))
+		open_timed(p, "problems.odin")
+		p.mark_frame = frame
+		return false
+	}
+
+	// The problems arrive
+	e := focused_editor()
+	if !arrived {
+		arrived = len(e.lsp.problems) == 10_000
+		if !arrived && frame - p.mark_frame < 600 {
+			return false
+		}
+		check(p, "the server's 10,000 problems arrive", arrived)
+		if !arrived do return true
+		p.mark_frame = frame
+	}
+
+	textedit.move(e, .Page_Down, false)
+	return frame - p.mark_frame >= 120
+}
+
+
+// With problems.odin open: the pointer resting on a word shows the server's
+// hover and the problem there, and leaving closes it; Go to definition jumps
+// and Go back returns; right-click opens the editor menu, whose Select all
+// works; Next problem goes to one
+@(private = "file")
+phase_lsp_features :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) step_at: time.Tick // when the step began, for waits on the server
+	@(static) from: int          // where Go to definition started
+	if perf_lsp_client == nil do return true
+
+	e := focused_editor()
+	h := &g.lsp.hover
+	waited := frame - p.mark_frame
+	waited_ms := ms_since(step_at)
+
+	if frame == 0 {
+		step = 0
+		textedit.set_single_selection(e, {0, 0, -1})
+		textedit.scroll_to(e, 0)
+		p.mark_frame = frame
+		return false
+	}
+
+	switch step {
+	case 0: // rest the pointer on "FIXME" on line 3
+		if waited < 2 do return false
+		r, ok := e.kind.char_rect(e, line_offset(e, 3, "FIXME", 1))
+		check(p, "the word is in view", ok)
+		g.mouse_pos = {r.x + r.w / 2, r.y + r.h / 2}
+		step, p.mark_frame, step_at = 1, frame, time.tick_now()
+
+	case 1: // after the hover delay, the server's text and the problem
+		_, placed := element_rect(clay.ID("LspHover"))
+		shown := h.open && h.text != "" && placed
+		if !shown && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "resting on a word shows its hover", shown && h.text == "**FIXME**")
+		check(p, "the hover lists the problem there", len(langs.problems_at(&e.lsp, h.offset)) == 1)
+		g.mouse_pos = {4, f32(g.window_h) - 4} // the status bar
+		step, p.mark_frame, step_at = 2, frame, time.tick_now()
+
+	case 2: // it closes once the pointer has been away a moment
+		if h.open && waited_ms < 2000 {
+			return false
+		}
+
+		check(p, "the hover closes when the pointer leaves", !h.open)
+		from = line_offset(e, 500, "shared_name", 3)
+		textedit.set_single_selection(e, {from, from, -1})
+		run_command(.Go_To_Definition)
+		step, p.mark_frame, step_at = 3, frame, time.tick_now()
+
+	case 3: // at the first "shared_name", on line 0
+		target := line_offset(e, 0, "shared_name")
+		e = focused_editor()
+		jumped := e.sels[e.primary].head == target
+		if !jumped && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "Go to definition jumps to it", jumped)
+		run_command(.Go_Back)
+		step, p.mark_frame, step_at = 4, frame, time.tick_now()
+
+	case 4: // back where it started, in the middle of the view
+		back := e.sels[e.primary].head == from && !e.reveal
+		if !back && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "Go back returns", back)
+		lh := f64(editor_line_height())
+		line_middle := 500 * lh + lh / 2
+		view_middle := e.target_y + f64(e.view.h) / 2
+		check(p, "the place is in the middle of the view", abs(line_middle - view_middle) <= lh)
+		r, _ := e.kind.char_rect(e, from)
+		g.mouse_pos, g.right_pressed = {r.x + r.w / 2, r.y + r.h / 2}, true
+		step, p.mark_frame = 5, frame
+
+	case 5: // the editor menu; choose Select all
+		if waited < 2 do return false
+
+		m := &g.menu
+		is_editor_menu := m.open && m.count == 9 && m.items[0].command == .Go_To_Definition
+		check(p, "right-click opens the editor menu", is_editor_menu)
+		check(p, "it offers Go to definition", is_editor_menu && !m.items[0].disabled)
+		references := is_editor_menu && m.items[1].command == .Find_References
+		check(p, "and Find references", references && !m.items[1].disabled)
+		rename := is_editor_menu && m.items[2].command == .Rename_Symbol
+		check(p, "and Rename symbol", rename && !m.items[2].disabled)
+		at, _ := element_center(clay.ID("MenuItem", 8))
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, p.mark_frame = 6, frame
+
+	case 6: // everything is selected
+		if waited < 3 do return false
+
+		s := e.sels[e.primary]
+		all := textedit.sel_lo(s) == 0 && textedit.sel_hi(s) == buffer.length(&e.buf)
+		check(p, "its Select all selects everything", all && !g.menu.open)
+
+		// Next problem: the first FIXME, shown in the hover
+		textedit.set_single_selection(e, {0, 0, -1})
+		run_command(.Next_Problem)
+		at_problem := e.sels[e.primary].head == line_offset(e, 0, "FIXME")
+		check(p, "Next problem goes to one and shows it", at_problem && h.open && h.sticky)
+		lsp_hover_close()
+		return true
+	}
+	return false
+}
+
+
+// With code.odin open (its functions "item_N :: proc" each hold "name :="):
+// Go to symbol in file lists its outline with the caret's symbol selected, a
+// query filters it and Enter goes there; Go to symbol in project asks as the
+// query rests and goes to the one chosen; Find references lists every "total"
+// with its line, pages through them, goes to one, and Go back returns
+@(private = "file")
+phase_lsp_finder :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) step_at: time.Tick
+	@(static) from: int   // where Find references was asked
+	@(static) chosen: int // the reference gone to
+	if perf_lsp_client == nil do return true
+
+	f := &g.finder
+	e := focused_editor()
+	waited := frame - p.mark_frame
+	waited_ms := ms_since(step_at)
+
+	if frame == 0 {
+		step = 0
+		open_timed(p, "code.odin")
+		p.mark_frame, step_at = frame, time.tick_now()
+		return false
+	}
+	if e == nil do return false
+
+	switch step {
+	case 0: // the server has the file; the outline, from item_10's line
+		opened := false
+		for dc in e.lsp.clients {
+			if dc.client == perf_lsp_client && dc.opened {
+				opened = true
+			}
+		}
+		if !opened && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "the server gets code.odin", opened)
+		at := text_offset(e, "item_10 ::")
+		textedit.set_single_selection(e, {at, at, -1})
+		run_command(.Go_To_File_Symbol)
+		step, p.mark_frame, step_at = 1, frame, time.tick_now()
+
+	case 1: // every function and the variable in each; filter, and go to one
+		listed := f.open && len(f.items) > 0 && !finder_busy()
+		if !listed && waited_ms < 3000 {
+			return false
+		}
+
+		functions := strings.count(buffer_text(e), " :: proc")
+		outline := listed && len(f.items) == 2 * functions
+		outline = outline && f.items[0].label == "item_0" && f.items[1].depth == 1
+		check(p, "Go to symbol in file lists the outline", outline)
+		check(p, "with the caret's symbol selected", selected_label() == "item_10")
+
+		type_text("item_42")
+		finder_restart_search()
+		step, p.mark_frame, step_at = 2, frame, time.tick_now()
+
+	case 2:
+		if finder_busy() && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "a query filters it", selected_label() == "item_42")
+		press(sdl.K_RETURN)
+		step, p.mark_frame, step_at = 3, frame, time.tick_now()
+
+	case 3: // there; then the project's symbols
+		e = focused_editor()
+		target := text_offset(e, "item_42 ::")
+		there := e.sels[e.primary].head == target
+		if !there && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "Enter goes to the symbol", there && !f.open)
+		run_command(.Go_To_Symbol)
+		type_text("item_77")
+		finder_restart_search()
+		lsp_finder_query_changed()
+		step, p.mark_frame, step_at = 4, frame, time.tick_now()
+
+	case 4: // asked once the query rested; go to it
+		asked := g.lsp.finder.query == "item_77" && g.lsp.finder.request == 0
+		found := asked && !finder_busy() && selected_label() == "item_77"
+		if !found && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "Go to symbol in project asks for the query", found)
+		press(sdl.K_RETURN)
+		step, p.mark_frame, step_at = 5, frame, time.tick_now()
+
+	case 5: // there; then references to "total"
+		e = focused_editor()
+		target := text_offset(e, "item_77 ::")
+		there := e.sels[e.primary].head == target
+		if !there && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "and goes to the symbol chosen", there && !f.open)
+		from = text_offset(e, "total") + 1
+		textedit.set_single_selection(e, {from, from, -1})
+		run_command(.Find_References)
+		step, p.mark_frame, step_at = 6, frame, time.tick_now()
+
+	case 6: // every one, with its line
+		listed := f.open && len(f.items) > 0 && !finder_busy()
+		if !listed && waited_ms < 5000 {
+			return false
+		}
+
+		uses := count_words(buffer_text(e), "total")
+		check(p, "Find references lists every one", listed && len(f.items) == uses)
+		first := listed ? f.items[0].label : ""
+		check(p, "each with its line", strings.has_prefix(first, "item_0 :: proc"))
+		step, p.mark_frame = 7, frame
+
+	case 7: // page through them, then go to one
+		if waited < 60 {
+			press(sdl.K_PAGEDOWN)
+			return false
+		}
+
+		row := f.results[f.selected].index
+		chosen, _ = f.items[row].target.(int)
+		press(sdl.K_RETURN)
+		step, p.mark_frame, step_at = 8, frame, time.tick_now()
+
+	case 8: // there; then back
+		there := e.sels[e.primary].head == chosen && chosen > from
+		if !there && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "Enter goes to a reference", there && !f.open)
+		run_command(.Go_Back)
+		step, p.mark_frame, step_at = 9, frame, time.tick_now()
+
+	case 9:
+		back := e.sels[e.primary].head == from
+		if !back && waited_ms < 1000 {
+			return false
+		}
+
+		check(p, "Go back returns to where it was asked", back)
+		return true
+	}
+	return false
+}
+
+
+// In code.odin (the fake server completes every word of it): typing a word
+// opens the list, more letters filter it (about 1,500 items) and the chosen
+// item's documentation comes; Enter inserts it. "(" shows the signature, a
+// comma moves to the next parameter, ")" closes it. A snippet goes in as text
+// with its placeholder selected; an item's import goes in with it, and one undo
+// takes both back; Esc closes the list
+@(private = "file")
+phase_lsp_completion :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) step_at: time.Tick
+	@(static) typed: int // of the text being typed
+	if perf_lsp_client == nil do return true
+
+	cs := &g.lsp.completion
+	sig := &g.lsp.signature
+	e := focused_editor()
+	waited := frame - p.mark_frame
+	waited_ms := ms_since(step_at)
+
+	if frame == 0 {
+		step, typed = 0, 0
+		p.mark_frame, step_at = frame, time.tick_now()
+		return false
+	}
+	if e == nil do return false
+
+	switch step {
+	case 0: // a new line in item_0, then the first letter
+		at := text_offset(e, "\treturn total") - 1 // the end of the line before
+		textedit.set_single_selection(e, {at, at, -1})
+		textedit.insert(e, "\n\t")
+		editor_text_input(e, "i")
+		step, p.mark_frame, step_at = 1, frame, time.tick_now()
+
+	case 1: // the list opens; the rest of the word, a letter every few frames
+		if !cs.open {
+			if waited_ms < 3000 do return false
+			check(p, "typing a word opens the list", false)
+			return true
+		}
+
+		word := "tem_42"
+		if typed < len(word) {
+			if waited % 4 == 0 {
+				editor_text_input(e, word[typed:][:1])
+				typed += 1
+			}
+			return false
+		}
+
+		check(p, "typing a word opens the list", true)
+		step, p.mark_frame, step_at = 2, frame, time.tick_now()
+
+	case 2: // the best match chosen, its documentation asked for
+		docs := chosen_completion().documentation
+		if docs == "" && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "typing filters it", chosen_completion().label == "item_42")
+		check(p, "the chosen item's documentation comes", strings.contains(docs, "docs for"))
+		press(sdl.K_RETURN)
+		step, p.mark_frame = 3, frame
+
+	case 3: // inserted once; then a call
+		line, _ := caret_line(e)
+		check(p, "Enter inserts it", line == "\titem_42" && !cs.open)
+		editor_text_input(e, "(")
+		step, p.mark_frame, step_at = 4, frame, time.tick_now()
+
+	case 4: // its signature, the first parameter active
+		if !sig.open && waited_ms < 3000 {
+			return false
+		}
+
+		shown := sig.open && sig.help.label == "item_42(a, b, c)"
+		check(p, "\"(\" shows the signature", shown)
+		check(p, "with the first parameter active", signature_param() == "a")
+		editor_text_input(e, "x")
+		editor_text_input(e, ",")
+		step, p.mark_frame, step_at = 5, frame, time.tick_now()
+
+	case 5:
+		if signature_param() != "b" && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "a comma moves to the next", signature_param() == "b")
+		editor_text_input(e, ")")
+		step, p.mark_frame, step_at = 6, frame, time.tick_now()
+
+	case 6: // closed after the call; then a snippet
+		if sig.open && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "\")\" closes it", !sig.open)
+		textedit.insert(e, "\n\t")
+		type_word(e, "fake_sn")
+		step, p.mark_frame, step_at = 7, frame, time.tick_now()
+
+	case 7:
+		if !cs.open && waited_ms < 3000 {
+			return false
+		}
+		press(sdl.K_RETURN)
+		step, p.mark_frame = 8, frame
+
+	case 8: // as text, its placeholder selected; then an item with an import
+		line, _ := caret_line(e)
+		s := e.sels[e.primary]
+		lo, hi := textedit.sel_lo(s), textedit.sel_hi(s)
+		chosen := string(buffer.read_alloc(&e.buf, lo, hi))
+		check(p, "a snippet goes in as text", line == "\tcall(arg, )")
+		check(p, "with its placeholder selected", chosen == "arg")
+
+		textedit.set_single_selection(e, {hi + 3, hi + 3, -1})
+		textedit.insert(e, "\n\t")
+		type_word(e, "fake_im")
+		step, p.mark_frame, step_at = 9, frame, time.tick_now()
+
+	case 9:
+		if !cs.open && waited_ms < 3000 {
+			return false
+		}
+		press(sdl.K_RETURN)
+		step, p.mark_frame = 10, frame
+
+	case 10: // the import at the top, undone with the item in one step
+		first, _ := textedit.line_text(e, 0)
+		line, _ := caret_line(e)
+		imported := first == "// imported" && line == "\tfake_import"
+		check(p, "an item's import goes in with it", imported)
+		run_command(.Undo)
+		first, _ = textedit.line_text(e, 0)
+		line, _ = caret_line(e)
+		check(p, "one undo takes both back", first == "package perf" && line == "\tfake_im")
+
+		// Then Esc closes a list
+		editor_text_input(e, "p")
+		step, p.mark_frame, step_at = 11, frame, time.tick_now()
+
+	case 11:
+		if !cs.open && waited_ms < 3000 {
+			return false
+		}
+		press(sdl.K_ESCAPE)
+		check(p, "Esc closes the list", !cs.open)
+		return true
+	}
+	return false
+}
+
+
+// In code.odin, with uses.odin beside it on disk: Rename on "total" opens a
+// field with the name selected, Esc drops it; a new name and Enter ask about the
+// file that isn't open, and once confirmed every "total" in both files is
+// renamed, the caret still in the name; one undo takes the open file's back. A
+// server's workspace/applyEdit is made
+@(private = "file")
+phase_lsp_rename :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) step_at: time.Tick
+	@(static) uses: int // of "total" in code.odin
+	if perf_lsp_client == nil do return true
+
+	sr := &g.lsp.rename
+	e := focused_editor()
+	waited_ms := ms_since(step_at)
+	uses_path := path_in_dir(p, "uses.odin")
+
+	if frame == 0 {
+		step = 0
+		text := "package perf\n\nuse_it :: proc() -> f32 {\n\treturn total + total\n}\n"
+		_ = os.write_entire_file(uses_path, text)
+		p.mark_frame, step_at = frame, time.tick_now()
+		return false
+	}
+	if e == nil do return false
+
+	switch step {
+	case 0: // Rename on "total", then Esc
+		uses = count_words(buffer_text(e), "total")
+		at := text_offset(e, "total") + 2
+		textedit.set_single_selection(e, {at, at, -1})
+		run_command(.Rename)
+		step, step_at = 1, time.tick_now()
+
+	case 1:
+		if !sr.open && waited_ms < 3000 {
+			return false
+		}
+
+		field := line_edit_string(&sr.field)
+		all := sr.field.anchor == 0 && sr.field.caret == len(field)
+		check(p, "Rename opens a field with the name selected", sr.open && field == "total" && all)
+		press(sdl.K_ESCAPE)
+		check(p, "Esc drops it", !sr.open && sr.editor == nil)
+
+		run_command(.Rename)
+		step, step_at = 2, time.tick_now()
+
+	case 2: // a new name; Enter
+		if !sr.open && waited_ms < 3000 {
+			return false
+		}
+		type_text("sum_all")
+		press(sdl.K_RETURN)
+		step, step_at = 3, time.tick_now()
+
+	case 3: // the file that isn't open is asked about
+		_, asking := g.dialog.purpose.(Applying_Edit)
+		if !(g.dialog.open && asking) && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "a file that isn't open is asked about", g.dialog.open && asking)
+		press(sdl.K_RETURN)
+		step, step_at = 4, time.tick_now()
+
+	case 4: // both renamed; the caret stays in the name; undo
+		if g.lsp.edits.active && waited_ms < 3000 {
+			return false
+		}
+
+		text := buffer_text(e)
+		renamed := count_words(text, "total") == 0 && count_words(text, "sum_all") == uses
+		check(p, "every use in the open file is renamed", renamed)
+		data, _ := os.read_entire_file(uses_path, context.temp_allocator)
+		check(p, "and in the file on disk", strings.contains(string(data), "sum_all + sum_all"))
+		caret := e.sels[e.primary].head
+		in_name := caret == text_offset(e, "sum_all") + 2
+		check(p, "the caret stays in the name", in_name)
+
+		run_command(.Undo)
+		check(p, "one undo takes it back", count_words(buffer_text(e), "total") == uses)
+
+		// A line for the server's edit to change
+		textedit.insert(e, "\n// FIXME\n")
+		step, step_at = 5, time.tick_now()
+
+	case 5: // the server asks for it (the line went out last frame)
+		params := fmt.tprintf(`{{"uri":%s}}`, lsp.to_json(e.lsp.uri))
+		lsp.request_json(perf_lsp_client.client, "fake/apply", params)
+		step, step_at = 6, time.tick_now()
+
+	case 6:
+		made := strings.contains(buffer_text(e), "// FIXED")
+		if !made && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "a server's workspace/applyEdit is made", made)
+		return true
+	}
+	return false
+}
+
+
+// The completion list's chosen item, or an empty one
+@(private = "file")
+chosen_completion :: proc() -> lsp.Completion {
+	cs := &g.lsp.completion
+	if cs.selected < 0 || cs.selected >= len(cs.shown) {
+		return {}
+	}
+	return cs.items[cs.shown[cs.selected].index]
+}
+
+
+// The signature's active parameter, as text
+@(private = "file")
+signature_param :: proc() -> string {
+	help := g.lsp.signature.help
+	if !g.lsp.signature.open || help.param_lo < 0 {
+		return ""
+	}
+	return help.label[help.param_lo:help.param_hi]
+}
+
+
+// The caret's line
+@(private = "file")
+caret_line :: proc(e: ^Editor) -> (text: string, start: int) {
+	line := buffer.offset_to_line(&e.buf, e.sels[e.primary].head)
+	return textedit.line_text(e, line)
+}
+
+
+// Types a word a letter at a time, as keys would
+@(private = "file")
+type_word :: proc(e: ^Editor, word: string) {
+	for i in 0 ..< len(word) {
+		editor_text_input(e, word[i:i + 1])
+	}
+}
+
+
+// The label of the finder's selected row
+@(private = "file")
+selected_label :: proc() -> string {
+	f := &g.finder
+	if f.selected < 0 || f.selected >= len(f.results) {
+		return ""
+	}
+	return f.items[f.results[f.selected].index].label
+}
+
+
+// An editor's whole text (temp)
+@(private = "file")
+buffer_text :: proc(e: ^Editor) -> string {
+	return string(buffer.read_alloc(&e.buf, 0, buffer.length(&e.buf)))
+}
+
+
+// Where `s` first is in an editor's text, or 0
+@(private = "file")
+text_offset :: proc(e: ^Editor, s: string) -> int {
+	return max(strings.index(buffer_text(e), s), 0)
+}
+
+
+// How many times a word is in text, as a whole word
+@(private = "file")
+count_words :: proc(text, word: string) -> int {
+	n := 0
+	from := 0
+	for {
+		at := strings.index(text[from:], word)
+		if at < 0 do break
+		at += from
+		from = at + len(word)
+
+		before := at == 0 || !is_word_byte(text[at - 1])
+		after := from >= len(text) || !is_word_byte(text[from])
+		if before && after {
+			n += 1
+		}
+	}
+	return n
+}
+
+
+@(private = "file")
+is_word_byte :: proc(c: u8) -> bool {
+	switch c {
+	case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '_':
+		return true
+	}
+	return false
+}
+
+
+// The status bar item's popup with the fake server running: Restart, then
+// Locate… for a server pointed at a missing program and Turn on for one that
+// is off, Turn off for the missing one, then removing the servers from the
+// settings
+@(private = "file")
+phase_lsp_popup :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) running: ^lsp.Client // the fake server's, before another is turned on
+	client := perf_lsp_client
+	if client == nil do return true // the typing phase failed
+
+	if frame == 0 {
+		at, _ := element_center(clay.ID("LspStatus"))
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, p.mark_frame = 2, frame
+		return false
+	}
+
+	e := focused_editor()
+	switch step {
+	case 2: // the popup opens; click Restart
+		if frame - p.mark_frame < 2 do return false
+
+		check(p, "clicking it opens the popup", g.lsp.popup.open)
+		index := 0
+		for c, i in langs.state.clients {
+			if c == client do index = i
+		}
+		at, found := element_center(clay.ID("LspRestart", u32(index)))
+		check(p, "the popup lists it", found)
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, p.mark_frame = 3, frame
+
+	case 3: // it runs again with the file open
+		reopened := false
+		for dc in e.lsp.clients {
+			if dc.client == client && dc.opened {
+				reopened = true
+			}
+		}
+		waited := frame - p.mark_frame
+		restarted := reopened && client.state == .Running && waited > 2
+		if !restarted && waited < 600 {
+			return false
+		}
+
+		check(p, "Restart starts it again", restarted)
+
+		// Two more servers for Odin: one off, one pointed at a program that isn't there
+		off := langs.server_override(&g.settings.servers, "fake-off")
+		off.enabled = false
+		off.command = make([]string, 1)
+		off.command[0] = strings.clone(client.command[0])
+		off.languages = make([]string, 1)
+		off.languages[0] = strings.clone("odin")
+		lost := langs.server_override(&g.settings.servers, "fake-lost")
+		lost.path = strings.clone("C:/no/such/server.exe")
+		lost.languages = make([]string, 1)
+		lost.languages[0] = strings.clone("odin")
+		settings_changed()
+		step, p.mark_frame = 4, frame
+
+	case 4: // the popup lists them (once the missing program was looked for): Turn on one
+		_, locate := element_rect(clay.ID("LspLocate", u32(server_index("fake-lost"))))
+		at, turn_on := element_center(clay.ID("LspTurnOn", u32(server_index("fake-off"))))
+		listed := locate && turn_on
+		if !listed && frame - p.mark_frame < 600 {
+			return false
+		}
+
+		check(p, "a server not found offers Locate", locate)
+		check(p, "a server that is off offers Turn on", turn_on)
+		g.mouse_pos, g.mouse_pressed = at, true
+		running = client.client
+		step, p.mark_frame = 5, frame
+
+	case 5: // it starts
+		started := false
+		for dc in e.lsp.clients {
+			if dc.client.name == "fake-off" && dc.opened && dc.client.state == .Running {
+				started = true
+			}
+		}
+		if !started && frame - p.mark_frame < 600 {
+			return false
+		}
+		check(p, "Turn on starts it", started)
+
+		// The server that ran goes on as it was, with the file open
+		kept := false
+		for dc in e.lsp.clients {
+			if dc.client == client && client.client == running && dc.opened {
+				kept = true
+			}
+		}
+		check(p, "the other server keeps running with the file", kept)
+
+		// Turn off the one not found
+		at, turn_off := element_center(clay.ID("LspTurnOff", u32(server_index("fake-lost"))))
+		check(p, "a server not found offers Turn off", turn_off)
+		g.mouse_pos, g.mouse_pressed = at, true
+		step, p.mark_frame = 6, frame
+
+	case 6: // it is off, offering Turn on
+		lost := langs.server("fake-lost")
+		_, turn_on := element_rect(clay.ID("LspTurnOn", u32(server_index("fake-lost"))))
+		turned_off := lost != nil && !lost.enabled && turn_on
+		if !turned_off && frame - p.mark_frame < 600 {
+			return false
+		}
+
+		check(p, "Turn off turns it off", turned_off)
+		lsp_popup_close()
+
+		// Back to no servers
+		for i := len(g.settings.servers) - 1; i >= 0; i -= 1 {
+			o := &g.settings.servers[i]
+			if !strings.has_prefix(o.name, "fake") do continue
+			langs.server_override_destroy(o)
+			ordered_remove(&g.settings.servers, i)
+		}
+		t := time.tick_now()
+		settings_changed()
+		result(p, "removing it (not waiting)", ms_since(t), "ms", 20)
+		check(p, "removing it from the settings stops it", len(langs.state.clients) == 0)
+		langs.state.active = false
+		return true
+	}
+	return false
+}
+
+
+// The language servers in the settings window, with the fake server: its row
+// says it runs, Off stops it and On starts it again; its page edits a field by
+// keys and Delete puts it back; a server is added and removed; and Install runs
+// a server's install command (the fake server copying itself onto PATH) in a
+// terminal, after which that server starts
+@(private = "file")
+phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) old_path: string
+	@(static) focused: ^Pane
+	@(static) install_pane: ^Pane
+	@(static) terminals: int
+	@(static) settled: time.Tick
+	w := &g.settings_window
+
+	if frame == 0 {
+		fake := lsp.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
+		check(p, "the fake server is built", fake != "")
+		if fake == "" do return true
+		fake, _ = os.get_absolute_path(fake, context.temp_allocator)
+
+		// Install puts a copy in a folder on PATH
+		bin := path_in_dir(p, "bin")
+		old_path = strings.clone(os.get_env("PATH", context.temp_allocator))
+		_ = os.set_env("PATH", fmt.tprintf("%s%c%s", bin, os.Path_List_Separator, old_path))
+		copy_name := ODIN_OS == .Windows ? "fake-install.exe" : "fake-install"
+		target, _ := os.join_path({bin, copy_name}, context.temp_allocator)
+
+		// Two servers for Odin: one runs, one isn't installed yet
+		langs.state.active = true
+		perf_server("fake", fake, "")
+		perf_server("fake-install", "fake-install", fmt.tprintf("%s --copy-to %s", fake, target))
+
+		// And one whose program is a path too long to show whole
+		perf_server("fake-far", "fake-far", "")
+		far_name := strings.repeat("far", 40, context.temp_allocator)
+		far, _ := os.join_path({bin, far_name, far_name}, context.temp_allocator)
+		langs.server_override(&g.settings.servers, "fake-far").path = strings.clone(far)
+		settings_changed()
+
+		focused = g.panes.focused
+		terminals = count_terminals()
+		settings_window_toggle()
+		append(&w.search, "fake")
+		step, p.mark_frame = 1, frame
+		return false
+	}
+
+	waited := frame - p.mark_frame
+
+	switch step {
+	case 1: // the rows: one running, the other offering Install
+		fake := server_row_index("fake")
+		running := false
+		if fake >= 0 {
+			state := server_state(server_rows()[fake])
+			running = strings.has_prefix(state.text, "Running")
+		}
+		install_id := clay.ID("ServerInstall", u32(server_row_index("fake-install")))
+		_, install := element_rect(install_id)
+		locate_id := clay.ID("ServerLocate", u32(server_row_index("fake-far")))
+		_, located := element_rect(locate_id)
+		if !(running && install && located) && waited < 600 {
+			return false
+		}
+
+		check(p, "a running server's row says so", running)
+		check(p, "a server not found offers Install", install)
+		check(p, "rows fit the list, a long path too", rows_fit_list())
+		click_element(clay.ID("SettingOption", (4096 + u32(fake)) * 64)) // Off
+		next_step(p, &step, frame)
+
+	case 2: // Off stops it
+		stopped := perf_client("fake") == nil
+		if !stopped && waited < 600 {
+			return false
+		}
+
+		o := langs.find_server_override(g.settings.servers[:], "fake")
+		check(p, "Off stops it", stopped && o != nil && o.enabled == false)
+		on := clay.ID("SettingOption", (4096 + u32(server_row_index("fake"))) * 64 + 1)
+		click_element(on)
+		next_step(p, &step, frame)
+
+	case 3: // On starts it again; Enter opens its page
+		c := perf_client("fake")
+		started := c != nil && c.state == .Running
+		if !started && waited < 600 {
+			return false
+		}
+
+		check(p, "On starts it again", started)
+		focus_item(Server_Item(server_row_index("fake")))
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 4: // its page: type root markers
+		check(p, "Enter opens its page", w.server_page == "fake")
+
+		// Down to Root markers
+		for _ in langs.Server_Field {
+			if w.server_focus != .Root_Markers do press(sdl.K_DOWN)
+		}
+		press(sdl.K_RETURN)
+		type_text("x.marker, y.marker")
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 5: // applied the next frame; Delete puts the built-in ones back
+		o := langs.find_server_override(g.settings.servers[:], "fake")
+		typed := o != nil && len(o.root_markers) == 2 && o.root_markers[1] == "y.marker"
+		check(p, "a field is edited by keys", typed)
+		press(sdl.K_DELETE)
+		next_step(p, &step, frame)
+
+	case 6: // Esc goes back to the list, cleared to show the row that adds a server
+		o := langs.find_server_override(g.settings.servers[:], "fake")
+		check(p, "Delete puts a field back as built in", o != nil && o.root_markers == nil)
+		press(sdl.K_ESCAPE)
+		check(p, "Esc goes back to the list", w.open && w.server_page == "")
+		clear(&w.search)
+		next_step(p, &step, frame)
+
+	case 7: // add a server
+		focus_item(Add_Server_Item{})
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 8: // its page shows; remove it
+		if waited < 2 do return false
+
+		table := langs.find_server_override(g.settings.servers[:], "server")
+		added := w.server_page == "server" && table != nil
+		check(p, "Add a server opens a new server's page", added)
+		click_element(clay.ID("ServerRemove"))
+		next_step(p, &step, frame)
+
+	case 9: // after asking
+		_, removing := g.dialog.purpose.(Removing_Server)
+		asking := g.dialog.open && removing
+		if !asking && waited < 10 {
+			return false
+		}
+
+		check(p, "Remove asks first", asking)
+		g.dialog.choice = 0
+		next_step(p, &step, frame)
+
+	case 10:
+		table := langs.find_server_override(g.settings.servers[:], "server")
+		gone := table == nil && w.server_page == ""
+		if !gone && waited < 10 {
+			return false
+		}
+
+		check(p, "removing it goes back to the list", gone)
+		append(&w.search, "fake")
+		next_step(p, &step, frame)
+
+	case 11: // Install
+		if waited < 2 do return false
+		click_element(clay.ID("ServerInstall", u32(server_row_index("fake-install"))))
+		next_step(p, &step, frame)
+
+	case 12: // a terminal runs it, and once it is found the server starts
+		last := g.panes.open[len(g.panes.open) - 1]
+		opened := count_terminals() == terminals + 1 && is_terminal(last) && !w.open
+		if !opened && waited < 10 {
+			return false
+		}
+
+		check(p, "Install runs it in a terminal", opened)
+		if opened do install_pane = last
+		next_step(p, &step, frame)
+
+	case 13:
+		c := perf_client("fake-install")
+		started := c != nil && c.state == .Running
+		if !started && waited < 1800 {
+			return false
+		}
+		check(p, "the installed server starts", started)
+
+		// The terminal closes, and the servers go
+		if install_pane != nil do pane_close(install_pane, ask = false)
+		install_pane = nil
+		if focused != nil && slice.contains(g.panes.open[:], focused) {
+			pane_focus(focused)
+		}
+		langs.remove_server_override(&g.settings.servers, "fake")
+		langs.remove_server_override(&g.settings.servers, "fake-install")
+		langs.remove_server_override(&g.settings.servers, "fake-far")
+		settings_changed()
+		langs.state.active = false
+
+		_ = os.set_env("PATH", old_path)
+		delete(old_path)
+		next_step(p, &step, frame)
+
+	case 14: // once the terminal's frame and the servers have gone
+		gone := !g.animating && len(langs.state.retiring) == 0
+		if !gone && waited < 600 {
+			return false
+		}
+		settled = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 15: // and the terminal left has redrawn at its new size
+		return time.tick_since(settled) > 500 * time.Millisecond
+	}
+	return false
+}
+
+
+// The next step of a phase, counting frames from now
+@(private = "file")
+next_step :: proc(p: ^Perf, step: ^int, frame: int) {
+	step^ += 1
+	p.mark_frame = frame
+}
+
+
+// Adds a server for Odin files to the settings, its program a path or a name
+// on PATH
+@(private = "file")
+perf_server :: proc(name, program, install: string) {
+	o := langs.server_override(&g.settings.servers, name)
+	o.command = make([]string, 1)
+	o.command[0] = strings.clone(program)
+	o.languages = make([]string, 1)
+	o.languages[0] = strings.clone("odin")
+	if install != "" do o.install = strings.clone(install)
+}
+
+
+// The client of the server named `name`, if any
+@(private = "file")
+perf_client :: proc(name: string) -> ^langs.Client {
+	for c in langs.state.clients {
+		if c.name == name do return c
+	}
+	return nil
+}
+
+
+@(private = "file")
+server_row_index :: proc(name: string) -> int {
+	for row, i in server_rows() {
+		if row.name == name do return i
+	}
+	return -1
+}
+
+
+// Whether the settings list shown last frame, every row in it and their
+// controls end inside the panel
+@(private = "file")
+rows_fit_list :: proc() -> bool {
+	page, page_ok := element_rect(clay.ID("SettingsPage"))
+	list, list_ok := element_rect(clay.ID("SettingsList"))
+	if !page_ok || !list_ok {
+		return false
+	}
+
+	right := page.x + page.w + 0.5
+	if list.x + list.w > right do return false
+
+	for item in g.settings_window.items {
+		r, found := element_rect(item_row_id(item))
+		if found && r.x + r.w > right {
+			return false
+		}
+	}
+	return true
+}
+
+
+@(private = "file")
+count_terminals :: proc() -> int {
+	n := 0
+	for pane in g.panes.open {
+		if is_terminal(pane) do n += 1
+	}
+	return n
+}
+
+
+// Moves the settings window's keyboard focus to a row shown last frame
+@(private = "file")
+focus_item :: proc(item: Setting_Item) {
+	w := &g.settings_window
+	for x, i in w.items {
+		if x == item do w.focus = i
+	}
+}
+
+
+// A press at the center of an element of last frame's layout
+@(private = "file")
+click_element :: proc(id: clay.ElementId) {
+	at, ok := element_center(id)
+	if !ok do return
+	g.mouse_pos, g.mouse_pressed = at, true
+}
+
+
+// Text typed, as one event
+@(private = "file")
+type_text :: proc(text: string) {
+	event: sdl.Event
+	event.type = .TEXT_INPUT
+	event.text.text = strings.clone_to_cstring(text, context.temp_allocator)
+	handle_key_event(&event)
+}
+
+
+// The offset of `word` in a line, plus `skip`
+@(private = "file")
+line_offset :: proc(e: ^Editor, line: int, word: string, skip := 0) -> int {
+	text, start := textedit.line_text(e, line)
+	return start + strings.index(text, word) + skip
+}
+
+
+// Where a server is in the list, which the popup's element ids use
+@(private = "file")
+server_index :: proc(name: string) -> int {
+	for server, i in langs.state.servers {
+		if server.name == name do return i
+	}
+	return -1
 }

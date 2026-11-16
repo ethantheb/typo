@@ -22,6 +22,12 @@ Kind :: struct {
 
 	// The document offset nearest to a point
 	offset_at:    proc(v: ^View, p: [2]f32) -> int,
+	// The character under a point, if the point is on one (not past a line's
+	// end). Optional; without it a view has no hover
+	char_at:      proc(v: ^View, p: [2]f32) -> (offset: int, ok: bool),
+	// Where the character at `offset` is drawn, in window coordinates (ok is
+	// false when it isn't in view). Optional; popups about the text anchor to it
+	char_rect:    proc(v: ^View, offset: int) -> (r: gfx.Rect, ok: bool),
 	// Whether a point is over the text, where a click places the caret
 	over_text:    proc(v: ^View, p: [2]f32) -> bool,
 	max_scroll:   proc(v: ^View) -> f64,
@@ -250,6 +256,115 @@ add_cursor_vertical :: proc(v: ^View, dir: int) {
 	v.primary = len(v.sels) - 1
 	normalize(v)
 	v.reveal = true
+}
+
+
+// --- Moving lines ------------------------------------------------------------------
+
+// A run of whole lines moved together: the lines one or more selections cover
+@(private = "file")
+Line_Block :: struct {
+	first, last: int,
+}
+
+
+// Moves the lines each selection covers one line up (dir = -1) or down, as one
+// undo step, and the selections with them. Selections on the same or touching
+// lines move as one block. Nothing moves if a block is already at the top or
+// bottom
+move_lines :: proc(v: ^View, dir: int) {
+	b := &v.buf
+
+	// Blocks of lines, and the block each selection is in
+	blocks := make([dynamic]Line_Block, 0, len(v.sels), context.temp_allocator)
+	block_of := make([]int, len(v.sels), context.temp_allocator)
+	for s, i in v.sels {
+		first, last := selected_lines(v, s)
+
+		n := len(blocks)
+		if n > 0 && first <= blocks[n - 1].last + 1 {
+			blocks[n - 1].last = max(blocks[n - 1].last, last)
+		} else {
+			append(&blocks, Line_Block{first, last})
+		}
+		block_of[i] = len(blocks) - 1
+	}
+
+	at_top := dir < 0 && blocks[0].first == 0
+	at_bottom := dir > 0 && blocks[len(blocks) - 1].last == buffer.line_count(b) - 1
+	if at_top || at_bottom {
+		return
+	}
+
+	// Each block swaps with its neighbor line. Every swap keeps the length of
+	// what it replaces, so later blocks' offsets stay valid
+	shifts := make([]int, len(blocks), context.temp_allocator)
+	buffer.begin(b, .Other, now(), v.sels[:])
+	for block, k in blocks {
+		shifts[k] = swap_with_neighbor(b, block, dir)
+	}
+
+	moved := make([]Selection, len(v.sels), context.temp_allocator)
+	for s, i in v.sels {
+		shift := shifts[block_of[i]]
+		moved[i] = {s.anchor + shift, s.head + shift, s.col}
+	}
+	buffer.end(b, moved)
+
+	clear(&v.sels)
+	append(&v.sels, ..moved)
+	normalize(v)
+	v.reveal = true
+}
+
+
+// The lines a selection covers. One ending at the start of a line doesn't take
+// that line
+@(private = "file")
+selected_lines :: proc(v: ^View, s: Selection) -> (first, last: int) {
+	lo, hi := sel_lo(s), sel_hi(s)
+	first = buffer.offset_to_line(&v.buf, lo)
+	last = buffer.offset_to_line(&v.buf, hi)
+
+	if last > first && hi == buffer.line_start(&v.buf, last) {
+		last -= 1
+	}
+	return
+}
+
+
+// Swaps a block of lines with the line above it (dir = -1) or below. Returns how
+// far the block's text moved
+@(private = "file")
+swap_with_neighbor :: proc(b: ^buffer.Buffer, block: Line_Block, dir: int) -> int {
+	other := dir < 0 ? block.first - 1 : block.last + 1
+	top := min(block.first, other)
+	bottom := max(block.last, other)
+
+	lo := buffer.line_start(b, top)
+	hi := buffer.line_end(b, bottom)
+	block_lo := buffer.line_start(b, block.first)
+	block_hi := buffer.line_end(b, block.last)
+	other_lo := buffer.line_start(b, other)
+	other_hi := buffer.line_end(b, other)
+
+	block_text := string(buffer.read_alloc(b, block_lo, block_hi))
+	other_text := string(buffer.read_alloc(b, other_lo, other_hi))
+
+	// The line break between them stays where it is, so mixed line endings
+	// keep their lengths
+	swapped: string
+	if dir < 0 {
+		separator := string(buffer.read_alloc(b, other_hi, block_lo))
+		swapped = strings.concatenate({block_text, separator, other_text}, context.temp_allocator)
+	} else {
+		separator := string(buffer.read_alloc(b, block_hi, other_lo))
+		swapped = strings.concatenate({other_text, separator, block_text}, context.temp_allocator)
+	}
+	buffer.replace(b, lo, hi - lo, swapped)
+
+	// The block moved past the neighbor line and the break between them
+	return (len(swapped) - len(block_text)) * dir
 }
 
 

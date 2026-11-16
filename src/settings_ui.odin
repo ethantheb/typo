@@ -8,10 +8,11 @@ import "syntax"
 import "term"
 import sdl "../vendor/sdl3"
 import "gfx"
+import "langs"
 
 // The settings window: a modal with a search field, then the settings grouped
-// into sections. Every change is applied immediately and written to
-// settings.toml.
+// into sections, which collapse (kept in collapsed_sections). Every change is
+// applied immediately and written to settings.toml.
 //
 // A setting chosen from a list (theme, font) opens the list in the same panel,
 // which moves to the right edge so the editor shows (a Clay transition) while
@@ -36,6 +37,8 @@ Settings_Window :: struct {
 	focus:           int,
 	items:           [dynamic]Setting_Item,
 	reveal:          bool, // scroll the focused row into view
+	refocus:         Maybe(Setting_Item), // focused once listed (rows above it may come or go)
+	collapse_to:     Maybe(bit_set[Section]), // clicked; applied before the next frame's rows
 
 	editing:         Maybe(Setting), // text setting being typed into
 	edit_buf:        [dynamic]u8,
@@ -50,12 +53,21 @@ Settings_Window :: struct {
 	extra_focus:     int,          // keyboard focus: -1 = the list, else a picker_extras index
 	scrollbar_drag:  Maybe(f32),   // of the list shown (see list_scrollbar)
 	dark_themes:     bool,         // the theme list shows dark themes, else light ones
+
+	// A language server's page, shown in place of the list (settings_servers.odin)
+	server_page:     string, // owned; the server's name, or ""
+	server_focus:    langs.Server_Field,
+	server_editing:  Maybe(langs.Server_Field), // being typed into, in edit_buf
+	server_ops:      [dynamic]Server_Op,  // applied next frame
 }
 
 // A row in the settings list
 Setting_Item :: union {
 	Setting,
 	Command,
+	Server_Item,
+	Add_Server_Item,
+	Section, // its header, which collapses it
 }
 
 // Settings adjusted in a picker's panel along with its list, shown below it, so
@@ -84,12 +96,15 @@ MISSING_MD_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_MD_FAMILY
 settings_window_toggle :: proc() {
 	w := &g.settings_window
 	if w.picking do close_picker(commit = false)
+	if w.server_page != "" do close_server_page()
 
 	w.open = !w.open
 	w.opened_at = g.frame
 	w.recording = nil
 	w.editing = nil
 	w.focus = -1
+	w.refocus = nil
+	w.collapse_to = nil
 	clear(&w.search)
 
 	if w.open do g.finder.open = false
@@ -103,11 +118,20 @@ settings_window_destroy :: proc() {
 	delete(w.edit_buf)
 	delete(w.filter)
 	delete(w.original)
+	delete(w.server_page)
+	for op in w.server_ops {
+		delete(op.name)
+		delete(op.value)
+	}
+	delete(w.server_ops)
 }
 
 
 // Whether the pointer is over a text field (for the I-beam cursor)
 settings_window_over_text :: proc() -> bool {
+	for field in langs.Server_Field {
+		if pointer_in(clay.ID("ServerField", u32(field))) do return true
+	}
 	return pointer_in(clay.ID("SettingsSearch")) ||
 	       pointer_in(clay.ID("SettingField")) ||
 	       pointer_in(clay.ID("PickerFilter"))
@@ -119,6 +143,7 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 	w := &g.settings_window
 	if !w.open do return false
 	if w.picking do return picker_handle_event(event)
+	if w.server_page != "" do return server_page_handle_event(event)
 
 	// Typing into a text setting
 	if _, editing := w.editing.?; editing {
@@ -194,9 +219,17 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 
 	case sdl.K_LEFT, sdl.K_RIGHT:
 		// A picker setting is only changed in its list (Enter)
-		if x, ok := focused.(Setting); ok && !SETTINGS[x].picker {
-			setting_step(&g.settings, x, key.key == sdl.K_LEFT ? -1 : +1)
-			settings_changed()
+		dir := key.key == sdl.K_LEFT ? -1 : +1
+		#partial switch x in focused {
+		case Setting:
+			if !SETTINGS[x].picker {
+				setting_step(&g.settings, x, dir)
+				settings_changed()
+			}
+		case Server_Item:
+			server_item_step(x, dir)
+		case Section:
+			set_collapsed(x, dir < 0)
 		}
 
 	case sdl.K_RETURN, sdl.K_KP_ENTER:
@@ -336,6 +369,12 @@ activate_item :: proc(item: Setting_Item) {
 
 	case Command:
 		g.settings_window.recording = x
+
+	case Server_Item, Add_Server_Item:
+		server_item_activate(item)
+
+	case Section:
+		set_collapsed(x, x not_in collapsed_set())
 	}
 }
 
@@ -344,10 +383,16 @@ activate_item :: proc(item: Setting_Item) {
 @(private = "file")
 reset_item :: proc(item: Setting_Item) {
 	switch x in item {
-	case Setting: setting_reset(&g.settings, x)
-	case Command: g.settings.bindings[x] = default_bindings(x)
+	case Setting:
+		setting_reset(&g.settings, x)
+		settings_changed()
+	case Command:
+		g.settings.bindings[x] = default_bindings(x)
+		settings_changed()
+	case Server_Item:
+		server_item_reset(x)
+	case Add_Server_Item, Section:
 	}
-	settings_changed()
 }
 
 
@@ -408,13 +453,109 @@ reveal_focus :: proc() {
 }
 
 
-@(private = "file")
+@(private)
 item_row_id :: proc(item: Setting_Item) -> clay.ElementId {
 	switch x in item {
-	case Setting: return clay.ID("SettingRow", u32(x))
-	case Command: return clay.ID("BindingRow", u32(x))
+	case Setting:         return clay.ID("SettingRow", u32(x))
+	case Command:         return clay.ID("BindingRow", u32(x))
+	case Server_Item:     return clay.ID("ServerRow", u32(x))
+	case Add_Server_Item: return clay.ID("AddServerRow")
+	case Section:         return clay.ID("SectionHeader", u32(x))
 	}
 	return {}
+}
+
+
+// Lists a row as shown this frame (for keyboard focus). Returns its index
+@(private = "file")
+add_item :: proc(item: Setting_Item) -> int {
+	w := &g.settings_window
+	append(&w.items, item)
+	index := len(w.items) - 1
+
+	if w.refocus == item {
+		w.focus = index
+		w.refocus = nil
+		w.reveal = true
+	}
+	return index
+}
+
+
+// --- Collapsed sections ------------------------------------------------------------
+
+// The sections collapsed_sections lists
+@(private)
+collapsed_set :: proc() -> (set: bit_set[Section]) {
+	list := g.settings.collapsed_sections
+	for key in strings.split_iterator(&list, ",") {
+		for k, section in SECTION_KEYS {
+			if strings.trim_space(key) == k do set += {section}
+		}
+	}
+	return
+}
+
+
+// The collapsed sections with one collapsed or expanded
+@(private = "file")
+with_collapsed :: proc(section: Section, collapsed: bool) -> bit_set[Section] {
+	set := collapsed_set()
+	if collapsed {
+		set += {section}
+	} else {
+		set -= {section}
+	}
+	return set
+}
+
+
+// Collapses or expands a section from the keyboard
+@(private = "file")
+set_collapsed :: proc(section: Section, collapsed: bool) {
+	set_collapsed_sections(with_collapsed(section, collapsed), clicked = false)
+}
+
+
+// Makes `set` the collapsed sections, saved to settings.toml. Keyboard focus
+// stays on its row; on a row a section collapsing hides, it goes to that
+// section's header, or after a click, back to the search field (a click
+// doesn't highlight anything). Needs last frame's rows (`items`)
+@(private = "file")
+set_collapsed_sections :: proc(set: bit_set[Section], clicked: bool) {
+	w := &g.settings_window
+	if w.focus >= 0 && w.focus < len(w.items) {
+		item := w.items[w.focus]
+		section := item_section(item)
+		hidden := section in set && item != Setting_Item(section)
+
+		switch {
+		case hidden && clicked: w.focus = -1
+		case hidden:            w.refocus = Setting_Item(section)
+		case:                   w.refocus = item
+		}
+	}
+
+	keys := make([dynamic]string, context.temp_allocator)
+	for section in set {
+		append(&keys, SECTION_KEYS[section])
+	}
+	joined := strings.join(keys[:], ", ", context.temp_allocator)
+	set_string(&g.settings.collapsed_sections, joined)
+	settings_save_later(&g.settings)
+}
+
+
+// The section a row is in
+@(private = "file")
+item_section :: proc(item: Setting_Item) -> Section {
+	switch x in item {
+	case Setting:                      return SETTINGS[x].section
+	case Command:                      return .Keybindings
+	case Server_Item, Add_Server_Item: return .Language_Servers
+	case Section:                      return x
+	}
+	return .General
 }
 
 
@@ -704,10 +845,10 @@ settings_window_ui :: proc() {
 	panel := clay.ID("Settings")
 	arrived := element_at(panel, r)
 	if modal_at(panel, r, backdrop, clip = !arrived, modal = !w.picking) {
-		if w.picking {
-			picker_page(r.w)
-		} else {
-			settings_page(r.w)
+		switch {
+		case w.picking:          picker_page(r.w)
+		case w.server_page != "": server_page(r.w)
+		case:                    settings_page(r.w)
 		}
 	}
 
@@ -745,6 +886,12 @@ picker_rect :: proc() -> gfx.Rect {
 settings_page :: proc(width: f32) {
 	w := &g.settings_window
 	reveal_focus()
+
+	// A click's collapsing, with last frame's rows still listed
+	if set, clicked := w.collapse_to.?; clicked {
+		set_collapsed_sections(set, clicked = true)
+		w.collapse_to = nil
+	}
 	clear(&w.items)
 
 	if clay.UI(clay.ID("SettingsPage"))({
@@ -768,6 +915,7 @@ settings_page :: proc(width: f32) {
 		}) {
 			label("Settings", gfx.theme.text_bright, 16, .SemiBold)
 			push_right()
+			if len(w.search) == 0 do collapse_all_button() // a search shows every section
 			close_id := clay.ID("SettingsClose")
 			if icon_button(close_id, .Close, 26, 18, "Close", "Esc") {
 				settings_window_toggle()
@@ -778,6 +926,21 @@ settings_page :: proc(width: f32) {
 		if g.settings.error != "" do error_banner(g.settings.error)
 		settings_list()
 		footer()
+	}
+}
+
+
+// "Collapse all", or "Expand all" once every section is collapsed
+@(private = "file")
+collapse_all_button :: proc() {
+	none := bit_set[Section]{} // spelled out: a bare {} would be a nil Maybe below
+	all := ~none
+	expand := collapsed_set() == all
+
+	text := expand ? "Expand all" : "Collapse all"
+	tip := expand ? "Show every section's settings" : "Show only the sections' names"
+	if button(clay.ID("SettingsCollapseAll"), text, tip) {
+		g.settings_window.collapse_to = expand ? none : all
 	}
 }
 
@@ -826,6 +989,7 @@ settings_list :: proc() {
 		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
 	}) {
 		query := strings.to_lower(string(g.settings_window.search[:]), context.temp_allocator)
+		collapsed := query == "" ? collapsed_set() : {} // a search shows what it finds
 		shown := 0
 		for key, section in SECTION_KEYS {
 			// The section's rows that match the search
@@ -843,13 +1007,25 @@ settings_list :: proc() {
 					}
 				}
 			}
-			if len(rows) == 0 do continue
+			servers := section == .Language_Servers && servers_match(query)
+			if len(rows) == 0 && !servers {
+				continue
+			}
 
-			// The section, with its rows
+			// The section, with its rows unless collapsed
 			shown += 1
-			if section_header(key) {
+			count := len(rows)
+			if servers do count += len(server_rows())
+			header := Section_Header {
+				section   = section,
+				title     = key,
+				count     = count,
+				collapsed = section in collapsed,
+				toggles   = query == "",
+			}
+			if section_header(header, list) {
 				for item in rows {
-					switch x in item {
+					#partial switch x in item {
 					case Setting:
 						info := SETTINGS[x]
 						if setting_row(x, info.name, info.description, list) {
@@ -861,6 +1037,7 @@ settings_list :: proc() {
 						}
 					}
 				}
+				if servers do servers_list(query, list)
 			}
 		}
 
@@ -874,7 +1051,8 @@ settings_list :: proc() {
 }
 
 
-@(private = "file")
+// Whether a lower-case query is in one of the parts (any case)
+@(private)
 matches :: proc(query: string, parts: ..string) -> bool {
 	if query == "" do return true
 
@@ -887,9 +1065,21 @@ matches :: proc(query: string, parts: ..string) -> bool {
 }
 
 
-// A titled group of rows. Use as: if section_header("name") { rows }
+// A section's header: what it shows, and whether it collapses
+@(private = "file")
+Section_Header :: struct {
+	section:   Section,
+	title:     string,
+	count:     int, // its rows, shown while collapsed
+	collapsed: bool,
+	toggles:   bool, // a click or Enter collapses or expands it (not while searching)
+}
+
+
+// A titled group of rows. Use as: if section_header(...) { rows }; false while
+// it is collapsed
 @(private = "file", deferred_none = close_element)
-section_header :: proc(title: string) -> bool {
+section_header :: proc(h: Section_Header, list: clay.ElementId) -> bool {
 	clay._OpenElement()
 	clay.ConfigureOpenElement({
 		layout = {
@@ -899,25 +1089,62 @@ section_header :: proc(title: string) -> bool {
 		},
 	})
 
-	if clay.UI()({layout = {padding = {left = 4, bottom = 6}}}) {
-		upper := strings.to_upper(title, context.temp_allocator)
-		label(upper, gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
+	upper := strings.to_upper(h.title, context.temp_allocator)
+	if !h.toggles {
+		if clay.UI()({layout = {padding = {left = 4, bottom = 6}}}) {
+			label(upper, gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
+		}
+		return true
 	}
-	return true
+
+	// A row of its own, which collapses or expands the section
+	w := &g.settings_window
+	index := add_item(h.section)
+	focused := index == w.focus
+	id := item_row_id(h.section)
+	if clicked(id, list) {
+		w.collapse_to = with_collapsed(h.section, !h.collapsed)
+	}
+
+	if clay.UI(id)({
+		layout = {
+			sizing = {width = clay.SizingGrow(), height = clay.SizingFixed(26)},
+			padding = {left = 2, right = 8},
+			childGap = 4,
+			childAlignment = {y = .Center},
+		},
+		backgroundColor = focused || clay.Hovered() ? gfx.theme.hover : {},
+		cornerRadius = clay.CornerRadiusAll(5),
+		border = {
+			color = focused ? gfx.theme.accent : {},
+			width = focused ? clay.BorderOutside(1) : {},
+		},
+	}) {
+		icon(h.collapsed ? .Chevron_Right : .Chevron_Down, gfx.theme.text_dim, 14)
+		label(upper, gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
+		if h.collapsed {
+			spacer_x(4)
+			label(fmt.tprintf("%d", h.count), gfx.theme.text_faint, FONT_SIZE_SMALL)
+		}
+	}
+	return !h.collapsed
 }
 
 
-// One row: name and description on the left, its control on the right.
-// Use as: if setting_row(...) { control }
-@(private = "file", deferred_none = close_element)
+// One row: name and description on the left (after a dot of `mark`'s color,
+// if any), its control on the right. `detail` is one more line, cut off where
+// the row ends (it may hold a path, which can't wrap). Use as:
+// if setting_row(...) { control }
+@(private, deferred_none = close_element)
 setting_row :: proc(
 	item: Setting_Item,
 	name, description: string,
 	list: clay.ElementId,
+	mark := clay.Color{},
+	detail := "",
 ) -> bool {
 	w := &g.settings_window
-	append(&w.items, item)
-	index := len(w.items) - 1
+	index := add_item(item)
 	focused := index == w.focus
 
 	id := item_row_id(item)
@@ -939,7 +1166,8 @@ setting_row :: proc(
 		},
 	})
 
-	// Name and description
+	// Name, description, and the detail line
+	state_mark(mark)
 	if clay.UI()({
 		layout = {
 			sizing = {width = clay.SizingGrow()},
@@ -949,12 +1177,25 @@ setting_row :: proc(
 	}) {
 		label(name, gfx.theme.text)
 		if description != "" do paragraph(description, gfx.theme.text_dim)
+		if detail != "" do clipped_line(detail)
 	}
 	return true
 }
 
 
+// A line of dim text, clipped: its width doesn't widen what holds it
 @(private = "file")
+clipped_line :: proc(text: string) {
+	if clay.UI()({
+		layout = {sizing = {width = clay.SizingGrow()}},
+		clip = {horizontal = true},
+	}) {
+		label(text, gfx.theme.text_dim, FONT_SIZE_SMALL)
+	}
+}
+
+
+@(private)
 close_element :: proc() {
 	clay._CloseElement()
 }
@@ -978,7 +1219,7 @@ setting_control :: proc(x: Setting) {
 
 	switch v in setting_value(&g.settings, x) {
 	case ^bool:
-		choice, changed := segmented(x, {"Off", "On"}, int(v^), list)
+		choice, changed := segmented(u32(x), {"Off", "On"}, int(v^), list)
 		if changed {
 			v^ = choice == 1
 			settings_changed()
@@ -1004,7 +1245,7 @@ setting_control :: proc(x: Setting) {
 				if c == v^ do current = i
 			}
 
-			choice, changed := segmented(x, names, current, list)
+			choice, changed := segmented(u32(x), names, current, list)
 			if changed {
 				set_string(v, info.choices[choice])
 				settings_changed()
@@ -1016,10 +1257,12 @@ setting_control :: proc(x: Setting) {
 }
 
 
-// A row of mutually exclusive options. Returns the clicked option if it changed
-@(private = "file")
+// A row of mutually exclusive options; `id_base` tells its options' ids apart
+// from other rows' (a Setting, or past them). Returns the clicked option if it
+// changed
+@(private)
 segmented :: proc(
-	x: Setting,
+	id_base: u32,
 	options: []string,
 	selected: int,
 	within := clay.ElementId{},
@@ -1034,7 +1277,7 @@ segmented :: proc(
 		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 	}) {
 		for option, i in options {
-			id := clay.ID("SettingOption", u32(x) * 64 + u32(i))
+			id := clay.ID("SettingOption", id_base * 64 + u32(i))
 			is_selected := i == selected
 
 			if clay.UI(id)({
@@ -1228,6 +1471,13 @@ footer_hint :: proc() -> string {
 	}
 
 	switch x in w.items[w.focus] {
+	case Section:
+		if x in collapsed_set() do return "↑↓ select  Enter or → expand"
+		return "↑↓ select  Enter or ← collapse"
+	case Server_Item:
+		return "↑↓ select  ←→ off/on  Enter configure  Del reset"
+	case Add_Server_Item:
+		return "↑↓ select  Enter add a server"
 	case Command:
 		return "↑↓ select  Enter rebind  Del reset"
 	case Setting:
@@ -1323,7 +1573,7 @@ picker_page :: proc(width: f32) {
 		// Dark or light themes, and the filter
 		if x == .Theme {
 			shown := w.dark_themes ? 0 : 1
-			choice, changed := segmented(.Theme, {"Dark", "Light"}, shown)
+			choice, changed := segmented(u32(Setting.Theme), {"Dark", "Light"}, shown)
 			if changed do show_dark_themes(choice == 0)
 		}
 		placeholder := x == .Theme ? "Filter themes" : "Filter fonts"

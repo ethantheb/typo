@@ -779,9 +779,14 @@ reveal_caret :: proc(e: ^View) {
 	top := hm_y(&e.mdv.heights, c.line) + f64(r.y)
 	bottom := top + f64(r.h)
 	ty := e.target_y
+	h := f64(e.view.h)
 	margin := f64(body_line_height())
-	if top < ty do ty = max(top - margin, 0)
-	if bottom > ty + f64(e.view.h) do ty = bottom + margin - f64(e.view.h)
+	outside := top < ty || bottom > ty + h
+	switch {
+	case outside && e.center: ty = (top + bottom) / 2 - h / 2
+	case top < ty:            ty = max(top - margin, 0)
+	case bottom > ty + h:     ty = bottom + margin - h
+	}
 	if ty != e.target_y do textedit.scroll_to(e, clamp(ty, 0, max_scroll(e)))
 
 	// Sideways, in a code block

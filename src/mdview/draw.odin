@@ -220,8 +220,10 @@ draw_line :: proc(
 
 	if len(L.edges) > 1 do draw_table_borders(L, left, y, h, scale)
 
-	// Selections
 	end := start + len(text)
+	draw_marks(e, L, text, start, left, y, scale)
+
+	// Selections
 	first_sel := mv.caretless ? len(e.sels) : textedit.first_selection_at(e, start)
 	for j := first_sel; j < len(e.sels); j += 1 {
 		lo, hi := textedit.sel_lo(e.sels[j]), textedit.sel_hi(e.sels[j])
@@ -284,6 +286,53 @@ draw_line :: proc(
 				scale,
 				gfx.theme.caret,
 			)
+		}
+	}
+}
+
+
+// The marks (search matches) on a line, behind its text. Marks in hidden syntax
+// have no width and draw nothing
+@(private = "file")
+draw_marks :: proc(
+	e: ^View,
+	L: ^Line_Layout,
+	text: string,
+	start: int,
+	left, y: f32,
+	scale: f32,
+) {
+	end := start + len(text)
+
+	for j := textedit.first_mark_at(e.tv, start); j < len(e.tv.marks); j += 1 {
+		lo := e.tv.marks[j][0] - start
+		hi := e.tv.marks[j][1] - start
+		if lo > len(text) do break
+
+		lo = max(lo, 0)
+		hi = min(hi, end - start)
+
+		// In a table, by cell
+		if L.kind == .Table {
+			for box in table_selection(L, text, lo, hi) {
+				x0 := screen_x(left, box.x, scale)
+				x1 := screen_x(left, box.x + box.w, scale)
+				box_y := math.round(y + box.y * scale)
+				box_h := math.ceil(box.h * scale)
+				gfx.fill_rect(x0, box_y, x1 - x0, box_h, gfx.theme.find_match)
+			}
+			continue
+		}
+
+		// Elsewhere, by wrapped row
+		for r, ri in L.rows {
+			x1, x2, ok := selection_span(L, text, ri, lo, hi)
+			if !ok do continue
+
+			row_x := screen_x(left, x1, scale)
+			row_y := math.round(y + r.y * scale)
+			row_h := math.ceil(r.h * scale)
+			gfx.fill_rect(row_x, row_y, (x2 - x1) * scale, row_h, gfx.theme.find_match)
 		}
 	}
 }

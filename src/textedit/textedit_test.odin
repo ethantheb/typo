@@ -52,6 +52,48 @@ test_multiple_carets :: proc(t: ^testing.T) {
 }
 
 
+// Edits anywhere, made at once: the selections they ask for, and one undo
+// step putting it all back
+@(test)
+test_apply_edits :: proc(t: ^testing.T) {
+	v := make_view("fo\nfo")
+	defer destroy_view(&v)
+	clear(&v.sels)
+	append(&v.sels, Selection{2, 2, -1}, Selection{5, 5, -1})
+
+	// An insertion at the top, and each "fo" replaced by "foo(x)" with x selected
+	edits := []Text_Edit {
+		{lo = 0, hi = 0, text = "// top\n"},
+		{lo = 0, hi = 2, text = "foo(x)", selects = true, sel = {4, 5}},
+		{lo = 3, hi = 5, text = "foo(x)", selects = true, sel = {4, 5}, primary = true},
+	}
+	apply_edits(&v, .Other, edits)
+	testing.expect_value(t, contents(&v), "// top\nfoo(x)\nfoo(x)")
+	testing.expect_value(t, len(v.sels), 2)
+	if len(v.sels) == 2 {
+		testing.expect_value(t, v.sels[0], Selection{11, 12, -1})
+		testing.expect_value(t, v.sels[1], Selection{18, 19, -1})
+		testing.expect_value(t, v.primary, 1)
+	}
+
+	undo(&v)
+	testing.expect_value(t, contents(&v), "fo\nfo")
+
+	// Edits that select nothing (a rename): the carets stay in their words, at
+	// the same distance in, and move with the text before them
+	clear(&v.sels)
+	append(&v.sels, Selection{1, 1, -1}, Selection{5, 5, -1})
+	renames := []Text_Edit{{lo = 0, hi = 2, text = "bar"}, {lo = 3, hi = 5, text = "bar"}}
+	apply_edits(&v, .Other, renames)
+	testing.expect_value(t, contents(&v), "bar\nbar")
+	testing.expect_value(t, len(v.sels), 2)
+	if len(v.sels) == 2 {
+		testing.expect_value(t, v.sels[0], Selection{1, 1, -1})
+		testing.expect_value(t, v.sels[1], Selection{7, 7, -1})
+	}
+}
+
+
 @(test)
 test_word_at :: proc(t: ^testing.T) {
 	v := make_view("foo_bar  (baz)")
@@ -104,4 +146,51 @@ test_visible_runs :: proc(t: ^testing.T) {
 @(private = "file")
 ascii_glyph :: proc(r: rune) -> bool {
 	return r < 128
+}
+
+
+// Alt+Up/Down: the lines move with their selections, as one undo step
+@(test)
+test_move_lines :: proc(t: ^testing.T) {
+	v := make_view("one\ntwo\nthree\nfour")
+	defer destroy_view(&v)
+
+	// A caret on "two" moves its line up, and stops at the top
+	set_single_selection(&v, {5, 5, -1})
+	move_lines(&v, -1)
+	testing.expect_value(t, contents(&v), "two\none\nthree\nfour")
+	testing.expect_value(t, v.sels[0].head, 1)
+	move_lines(&v, -1)
+	testing.expect_value(t, contents(&v), "two\none\nthree\nfour")
+
+	// A selection ending at a line's start doesn't take that line
+	set_single_selection(&v, {0, 8, -1})
+	move_lines(&v, +1)
+	testing.expect_value(t, contents(&v), "three\ntwo\none\nfour")
+	testing.expect_value(t, v.sels[0], Selection{6, 14, -1})
+
+	// Carets on touching lines move as one block, down to the last line
+	clear(&v.sels)
+	append(&v.sels, Selection{6, 6, -1}, Selection{10, 10, -1})
+	move_lines(&v, +1)
+	testing.expect_value(t, contents(&v), "three\nfour\ntwo\none")
+	move_lines(&v, +1)
+	testing.expect_value(t, contents(&v), "three\nfour\ntwo\none")
+
+	// One undo step back
+	undo(&v)
+	testing.expect_value(t, contents(&v), "three\ntwo\none\nfour")
+}
+
+
+// The line break between the moved lines keeps its length
+@(test)
+test_move_lines_crlf :: proc(t: ^testing.T) {
+	v := make_view("a\r\nbb\r\nc")
+	defer destroy_view(&v)
+
+	set_single_selection(&v, {3, 3, -1})
+	move_lines(&v, +1)
+	testing.expect_value(t, contents(&v), "a\r\nc\r\nbb")
+	testing.expect_value(t, v.sels[0].head, 6)
 }

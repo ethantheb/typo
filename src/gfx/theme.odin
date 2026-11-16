@@ -26,6 +26,7 @@ Theme :: struct {
 	current_line: clay.Color,
 	caret:        clay.Color,
 	backdrop:     clay.Color, // dims the window behind modal popups
+	find_match:   clay.Color, // search matches, behind the text (derived from yellow)
 	// Rendered Markdown, derived from the colors above
 	md_code_bg:   clay.Color, // code blocks and code spans
 	md_mark_bg:   clay.Color, // ==highlighted== text
@@ -534,6 +535,10 @@ theme_from_spec :: proc "contextless" (s: Theme_Spec) -> (t: Theme) {
 	}
 	for c, h in s.syntax do t.syntax[h] = rgb(c)
 	for c, i in s.ansi do t.ansi[i] = rgb(c)
+
+	// A different hue from the selection, which marks the current match
+	t.find_match = t.ansi[3]
+	t.find_match.a = s.dark ? 60 : 80
 
 	// Rendered Markdown
 	t.md_code_bg = mix(t.bg, t.text, s.dark ? 0.07 : 0.05)

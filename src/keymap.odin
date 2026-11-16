@@ -11,12 +11,18 @@ import sdl "../vendor/sdl3"
 Command :: enum {
 	Find_File,
 	Find,
+	Find_Next,
+	Find_Previous,
+	Find_Match_Case,
+	Find_Whole_Word,
+	Find_Regex,
 	Toggle_Sidebar,
 	Toggle_Terminal,
 	New_Terminal,
 	Maximize_Pane,
 	Close_Pane,
 	Rename,
+	Rename_Symbol,
 	Focus_Next_Pane,
 	Open_Settings,
 	Save,
@@ -28,7 +34,20 @@ Command :: enum {
 	Paste,
 	Add_Cursor_Above,
 	Add_Cursor_Below,
+	Move_Line_Up,
+	Move_Line_Down,
 	Toggle_Markdown_View,
+	Go_To_Definition,
+	Find_References,
+	Go_To_File_Symbol,
+	Go_To_Symbol,
+	Trigger_Completion,
+	Show_Signature_Help,
+	Go_Back,
+	Go_Forward,
+	Show_Hover,
+	Next_Problem,
+	Previous_Problem,
 }
 
 Command_Info :: struct {
@@ -40,12 +59,18 @@ Command_Info :: struct {
 COMMANDS := [Command]Command_Info {
 	.Find_File            = {"find_file", "Find file", {"Ctrl+E"}},
 	.Find                 = {"find", "Find", {"Ctrl+F"}},
+	.Find_Next            = {"find_next", "Find next", {"F3"}},
+	.Find_Previous        = {"find_previous", "Find previous", {"Shift+F3"}},
+	.Find_Match_Case      = {"find_match_case", "Find: match case", {"Alt+C"}},
+	.Find_Whole_Word      = {"find_whole_word", "Find: whole word", {"Alt+W"}},
+	.Find_Regex           = {"find_regex", "Find: regular expression", {"Alt+R"}},
 	.Toggle_Sidebar       = {"toggle_sidebar", "Toggle sidebar", {"Ctrl+B"}},
 	.Toggle_Terminal      = {"toggle_terminal", "Toggle terminal", {"Ctrl+`"}},
 	.New_Terminal         = {"new_terminal", "New terminal", {"Ctrl+Shift+`"}},
 	.Maximize_Pane        = {"maximize_pane", "Maximize pane", {"Ctrl+Shift+Return"}},
 	.Close_Pane           = {"close_pane", "Close pane", {"Ctrl+W"}},
-	.Rename               = {"rename", "Rename pane", {"F2"}},
+	.Rename               = {"rename", "Rename symbol or pane", {"F2"}},
+	.Rename_Symbol        = {"rename_symbol", "Rename symbol", {}},
 	.Focus_Next_Pane      = {"focus_next_pane", "Focus next pane", {"Ctrl+Tab"}},
 	.Open_Settings        = {"open_settings", "Open settings", {"Ctrl+,"}},
 	.Save                 = {"save", "Save file", {"Ctrl+S"}},
@@ -57,12 +82,28 @@ COMMANDS := [Command]Command_Info {
 	.Paste                = {"paste", "Paste", {"Ctrl+V"}},
 	.Add_Cursor_Above     = {"add_cursor_above", "Add cursor above", {"Ctrl+Alt+Up"}},
 	.Add_Cursor_Below     = {"add_cursor_below", "Add cursor below", {"Ctrl+Alt+Down"}},
+	.Move_Line_Up         = {"move_line_up", "Move line up", {"Alt+Up"}},
+	.Move_Line_Down       = {"move_line_down", "Move line down", {"Alt+Down"}},
 	.Toggle_Markdown_View = {"toggle_markdown_view", "Toggle Markdown view", {"Ctrl+Shift+V"}},
+	.Go_To_Definition     = {"go_to_definition", "Go to definition", {"F12"}},
+	.Find_References      = {"find_references", "Find references", {"Shift+F12"}},
+	.Go_To_File_Symbol    = {"go_to_file_symbol", "Go to symbol in file", {"Ctrl+Shift+O"}},
+	.Go_To_Symbol         = {"go_to_symbol", "Go to symbol in project", {"Ctrl+T"}},
+	.Trigger_Completion   = {"trigger_completion", "Trigger completion", {"Ctrl+Space"}},
+	.Show_Signature_Help  = {"show_signature_help", "Show signature help", {"Ctrl+Shift+Space"}},
+	.Go_Back              = {"go_back", "Go back", {"Alt+Left"}},
+	.Go_Forward           = {"go_forward", "Go forward", {"Alt+Right"}},
+	.Show_Hover           = {"show_hover", "Show hover", {"Ctrl+K"}},
+	.Next_Problem         = {"next_problem", "Next problem", {"F8"}},
+	.Previous_Problem     = {"previous_problem", "Previous problem", {"Shift+F8"}},
 }
 
 // App commands that still work while the terminal has focus; every other chord
 // goes to the shell
 TERMINAL_COMMANDS :: bit_set[Command]{
+	.Find,
+	.Find_Next,
+	.Find_Previous,
 	.Toggle_Terminal,
 	.New_Terminal,
 	.Maximize_Pane,
@@ -87,6 +128,7 @@ Bindings :: [Command][MAX_CHORDS]Chord
 run_command :: proc(cmd: Command) -> bool {
 	#partial switch cmd {
 	case .Find_File:       finder_toggle()
+	case .Go_To_Symbol:    lsp_find_workspace_symbols()
 	case .Toggle_Sidebar:  g.sidebar_visible = !g.sidebar_visible
 	case .Toggle_Terminal: terminal_toggle()
 	case .New_Terminal:    panes_new_terminal()
@@ -102,7 +144,21 @@ run_command :: proc(cmd: Command) -> bool {
 		pane_close(g.panes.focused)
 
 	case .Rename:
+		// The symbol at the caret, when the editor's server renames
+		e := focused_editor()
+		if e != nil && e.status == .Text && lsp_rename_start(e) {
+			return true
+		}
 		return rename_focused_pane()
+
+	case .Go_Back:
+		return jump_back()
+
+	case .Go_Forward:
+		return jump_forward()
+
+	case .Find, .Find_Next, .Find_Previous, .Find_Match_Case, .Find_Whole_Word, .Find_Regex:
+		return find_run_command(cmd)
 
 	case:
 		e := focused_editor()

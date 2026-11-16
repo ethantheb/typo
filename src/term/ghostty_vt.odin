@@ -276,6 +276,49 @@ Selection_Format_Options :: struct {
 Selection_Gesture :: distinct rawptr
 Gesture_Event     :: distinct rawptr
 
+// Search (search.h): matches in the active area and scrollback, as selections
+Search :: distinct rawptr
+
+Search_Status :: enum c.int {
+	Running       = 0,
+	Feed_Required = 1,
+	Complete      = 2,
+}
+
+Search_Data :: enum c.int {
+	Status           = 0,
+	Needle           = 1,
+	Total_Matches    = 2,
+	Selected_Index   = 3, // 0 is the newest match
+	Selected_Match   = 4,
+	Matches          = 5,
+	Viewport_Matches = 6,
+	Select_Scroll    = 7,
+}
+
+Search_Option :: enum c.int {
+	Needle        = 0,
+	Select_Next   = 1, // toward older content
+	Select_Prev   = 2, // toward newer content
+	Select_Scroll = 3,
+}
+
+Ghostty_String :: struct {
+	ptr: [^]u8,
+	len: c.size_t,
+}
+
+Selection_Buffer :: struct {
+	ptr: [^]Selection,
+	cap: c.size_t,
+	len: c.size_t, // written, or the capacity needed on Out_Of_Space
+}
+
+Point_Coordinate :: struct {
+	x: u16,
+	y: u32,
+}
+
 Gesture_Event_Type :: enum c.int {
 	Press           = 0,
 	Release         = 1,
@@ -491,6 +534,19 @@ foreign vt {
 		event: Gesture_Event,
 		option: Gesture_Event_Option,
 		value: rawptr,
+	) -> Result ---
+
+	search_new :: proc(allocator: rawptr, out_search: ^Search, terminal: Terminal) -> Result ---
+	search_free :: proc(search: Search) ---
+	search_tick :: proc(search: Search, out_status: ^Search_Status) -> Result ---
+	search_feed :: proc(search: Search) -> Result ---
+	search_set :: proc(search: Search, option: Search_Option, value: rawptr) -> Result ---
+	search_get :: proc(search: Search, data: Search_Data, value: rawptr) -> Result ---
+	terminal_point_from_grid_ref :: proc(
+		terminal: Terminal,
+		ref: ^Grid_Ref,
+		tag: Point_Tag,
+		out: ^Point_Coordinate,
 	) -> Result ---
 
 	// JSON manifest of the library's C types (sizes, alignments, enum values)

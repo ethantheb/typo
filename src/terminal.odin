@@ -1,5 +1,6 @@
 package editor
 
+import "core:fmt"
 import "core:math"
 import "core:strings"
 import "core:time"
@@ -25,7 +26,8 @@ TERMINAL_PADDING     :: 8 // logical pixels around the cell grid
 Terminal :: struct {
 	session:     term.Session,
 	initialized: bool,
-	spawned:     bool, // a shell has been started at least once
+	spawned:     bool,   // a shell has been started at least once
+	command:     string, // owned; run in the shell when it first starts
 
 	// Shown in titles, e.g. "PowerShell". A fixed buffer: restarting sets it
 	// while this frame's render commands may still point at it
@@ -40,6 +42,7 @@ Terminal :: struct {
 	view:        gfx.Rect, // cell grid area from the last layout
 	cell_w:      f32,
 	cell_h:      f32,
+	marks:       [dynamic]Term_Mark, // search matches in view, set by find
 	selecting:   bool,   // left button went down on the grid and selects text
 	reporting:   bool,   // left button went down on the grid and is sent to the program
 	last_cell:   [2]int, // cell under the pointer at the last mouse report
@@ -86,19 +89,61 @@ terminal_destroy :: proc(t: ^Terminal) {
 	if t.initialized do term.session_destroy(&t.session)
 	for &row in t.rows do row_destroy(&row)
 	delete(t.rows)
+	delete(t.marks)
+	delete(t.command)
 	t^ = {}
 }
 
 
+// Starts the shell; the first time, running the terminal's command in it if
+// it has one
 terminal_start_shell :: proc(t: ^Terminal) {
 	shell := g.settings.terminal_shell != "" ? g.settings.terminal_shell : term.default_shell()
 	t.shell_len = copy(t.shell_name[:], shell_display_name(shell))
 
-	if !term.session_spawn(&t.session, shell, g.workspace.root, g.settings.bundled_conpty) {
+	line := shell
+	if t.command != "" {
+		line = shell_running(shell, t.command)
+		term.session_print_notice(&t.session, t.command)
+		delete(t.command)
+		t.command = ""
+	}
+
+	if !term.session_spawn(&t.session, line, g.workspace.root, g.settings.bundled_conpty) {
 		notice := "Could not start the shell. Press Enter to try again."
 		term.session_print_notice(&t.session, notice)
 	}
 	t.spawned = true
+}
+
+
+// A command line that starts `shell` running `command`, and leaves the shell
+// open after it (temp)
+shell_running :: proc(shell, command: string) -> string {
+	when ODIN_OS == .Windows {
+		switch strings.to_lower(shell_program(shell), context.temp_allocator) {
+		case "pwsh", "powershell":
+			return fmt.tprintf("%s -NoExit -Command %s", shell, command)
+		case "cmd":
+			// Everything after cmd's /k or /c is its command: add to that
+			for word in strings.fields(shell, context.temp_allocator) {
+				lower := strings.to_lower(word, context.temp_allocator)
+				if lower == "/k" || lower == "/c" {
+					return fmt.tprintf("%s & %s", shell, command)
+				}
+			}
+			return fmt.tprintf("%s /K %s", shell, command)
+		}
+
+		// A shell typo doesn't know how to hand a command to
+		if shell != term.default_shell() {
+			return shell_running(term.default_shell(), command)
+		}
+		return shell
+	} else {
+		// Run by /bin/sh, which then becomes the shell
+		return fmt.tprintf("%s; exec %s", command, shell)
+	}
 }
 
 
@@ -114,9 +159,21 @@ terminal_title :: proc(t: ^Terminal) -> string {
 }
 
 
-// The program a shell command line runs, for titles: its first word (or quoted
-// path) without directory or extension
+// The program a shell command line runs, for titles
 shell_display_name :: proc(command: string) -> string {
+	program := shell_program(command)
+	switch strings.to_lower(program, context.temp_allocator) {
+	case "pwsh", "powershell": return "PowerShell"
+	case "":                   return "Terminal"
+	}
+	return program
+}
+
+
+// The program of a command line: its first word (or quoted path) without
+// directory or extension
+@(private = "file")
+shell_program :: proc(command: string) -> string {
 	cmd := strings.trim_space(command)
 
 	// The first word, or the quoted path
@@ -134,11 +191,6 @@ shell_display_name :: proc(command: string) -> string {
 	}
 	if dot := strings.last_index_byte(program, '.'); dot > 0 {
 		program = program[:dot]
-	}
-
-	switch strings.to_lower(program, context.temp_allocator) {
-	case "pwsh", "powershell": return "PowerShell"
-	case "":                   return "Terminal"
 	}
 	return program
 }
@@ -418,6 +470,13 @@ draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 		for bg in row.bgs {
 			x := term_cell_x(ox, adv, bg.col)
 			gfx.fill_rect(x, ry, term_cell_x(ox, adv, bg.col + bg.count) - x, ry2 - ry, bg.color)
+		}
+		for m in t.marks {
+			if m.row != y do continue
+
+			x := term_cell_x(ox, adv, m.first)
+			mark_w := term_cell_x(ox, adv, m.last + 1) - x
+			gfx.fill_rect(x, ry, mark_w, ry2 - ry, gfx.theme.find_match)
 		}
 		if row.sel[0] >= 0 {
 			x := term_cell_x(ox, adv, row.sel[0])

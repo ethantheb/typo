@@ -6,6 +6,7 @@ import "core:slice"
 import "core:strings"
 
 import "buffer"
+import "langs"
 import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
@@ -28,6 +29,7 @@ Editor :: struct {
 	md_view:  mdview.View,   // the rendered view of a Markdown file
 	new_file: bool,          // path doesn't exist yet; the first save creates it
 	status:   File_Status,
+	lsp:      langs.Doc,       // the document on its language servers
 
 	// View state, in logical pixels. The scroll position is in tv; it eases
 	// toward its target (see editor_animate)
@@ -81,7 +83,8 @@ editor_attach :: proc(e: ^Editor) {
 }
 
 
-// Passes the buffer's edits to the highlighter and the Markdown structure
+// Passes the buffer's edits to the highlighter, the Markdown structure and the
+// language servers
 @(private = "file")
 editor_on_edit :: proc(v: ^textedit.View, changes: []buffer.Change) {
 	e := editor_of(v)
@@ -91,6 +94,8 @@ editor_on_edit :: proc(v: ^textedit.View, changes: []buffer.Change) {
 		markdown.doc_edit(e.md, changes)
 		mdview.edit(&e.md_view, changes)
 	}
+
+	langs.doc_changed(&e.lsp, changes)
 }
 
 
@@ -134,6 +139,7 @@ editor_open :: proc(e: ^Editor, path: string) {
 	e.status = .Text
 	e.opened_at = sdl.GetTicksNS()
 	append(&e.sels, Selection{0, 0, -1})
+	lsp_doc_open(e)
 }
 
 
@@ -164,12 +170,15 @@ md_toggle_view :: proc(e: ^Editor) {
 }
 
 
-// After the file was renamed to e.path: highlighting follows the new name, and
-// the editor gains or drops its Markdown structure and rendered view
+// After the file was renamed to e.path: highlighting and language servers
+// follow the new name, and the editor gains or drops its Markdown structure and
+// rendered view
 editor_path_changed :: proc(e: ^Editor) {
 	if e.status != .Text do return
 
 	syntax.highlighter_open(&e.hl, &e.buf, e.path)
+	langs.doc_close(&e.lsp)
+	lsp_doc_open(e)
 
 	markdown_now := is_markdown_path(e.path)
 	if markdown_now == (e.md != nil) do return
@@ -200,6 +209,7 @@ is_markdown_path :: proc(path: string) -> bool {
 
 
 editor_close :: proc(e: ^Editor) {
+	langs.doc_close(&e.lsp)
 	if e.status == .Text {
 		syntax.highlighter_close(&e.hl)
 		buffer.buffer_destroy(&e.buf)
@@ -262,6 +272,7 @@ editor_save :: proc(e: ^Editor) -> bool {
 
 	buffer.mark_saved(&e.buf)
 	e.new_file = false
+	langs.doc_saved(&e.lsp)
 	return true
 }
 
@@ -305,7 +316,8 @@ editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 			return true
 		case .Paste:
 			textedit.show_caret(e, true)
-		case .Select_All, .Undo, .Redo, .Add_Cursor_Above, .Add_Cursor_Below:
+		case .Select_All, .Undo, .Redo, .Add_Cursor_Above, .Add_Cursor_Below,
+		     .Move_Line_Up, .Move_Line_Down:
 			textedit.show_caret(e, false)
 		}
 	}
@@ -319,9 +331,23 @@ editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 	case .Paste:            editor_paste(e)
 	case .Add_Cursor_Above: textedit.add_cursor_vertical(e, -1)
 	case .Add_Cursor_Below: textedit.add_cursor_vertical(e, +1)
+	case .Move_Line_Up:     textedit.move_lines(e, -1)
+	case .Move_Line_Down:   textedit.move_lines(e, +1)
 	case .Toggle_Markdown_View:
 		if e.md == nil do return false
 		md_toggle_view(e)
+	case .Go_To_Definition: return lsp_go_to_definition(e, e.sels[e.primary].head)
+	case .Find_References:  return lsp_find_references(e, e.sels[e.primary].head)
+	case .Go_To_File_Symbol:
+		lsp_find_file_symbols(e)
+	case .Trigger_Completion:
+		return lsp_trigger_completion(e)
+	case .Show_Signature_Help:
+		return lsp_show_signature(e)
+	case .Rename_Symbol:    return lsp_rename_start(e)
+	case .Show_Hover:       lsp_hover_at_caret(e)
+	case .Next_Problem:     return lsp_step_problem(e, +1)
+	case .Previous_Problem: return lsp_step_problem(e, -1)
 	case:                   return false
 	}
 	return true
@@ -333,6 +359,7 @@ editor_text_input :: proc(e: ^Editor, text: string) {
 
 	textedit.show_caret(e, true)
 	e.kind.text_input(e, text)
+	lsp_typed(e, text)
 }
 
 

@@ -29,6 +29,17 @@ Icon :: enum u8 {
 	Folder_Plus,
 	File_Plus,
 	Folder_Open,
+	Arrow_Up,
+	Arrow_Down,
+	Case_Sensitive,
+	Whole_Word,
+	Regex,
+	Scissors,
+	Copy,
+	Clipboard,
+	Select_All,
+	Go_To,
+	Search,
 }
 
 // Codepoints in assets/fonts/lucide.ttf (see lucide-static's font/codepoints.json)
@@ -59,6 +70,17 @@ ICON_GLYPHS := [Icon]string {
 	.Folder_Plus     = "", // folder-plus
 	.File_Plus       = "", // file-plus
 	.Folder_Open     = "", // folder-open
+	.Arrow_Up        = "\ue04a", // arrow-up
+	.Arrow_Down      = "\ue042", // arrow-down
+	.Case_Sensitive  = "\ue3d9", // case-sensitive
+	.Whole_Word      = "\ue3df", // whole-word
+	.Regex           = "\ue1fc", // regex
+	.Scissors        = "\ue14e", // scissors
+	.Copy            = "\ue09e", // copy
+	.Clipboard       = "\ue3e8", // clipboard-paste
+	.Select_All      = "\ue1cb", // box-select
+	.Go_To           = "\ue0a2", // corner-down-right
+	.Search          = "\ue151", // search
 }
 
 // The color lives here rather than in backgroundColor, which Clay would draw

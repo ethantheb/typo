@@ -9,6 +9,7 @@ import "core:strings"
 import clay "../vendor/clay-odin"
 import "gfx"
 import sdl "../vendor/sdl3"
+import "langs"
 import "mdview"
 
 App :: struct {
@@ -50,10 +51,12 @@ App :: struct {
 	unsaved:         Unsaved_Flow,
 	menu:            Context_Menu,
 	rename:          Inline_Rename,
+	find:            Find,
 	in_popup:        bool, // building the dialog's or context menu's UI (see ui_interactive)
 	right_pressed:   bool, // the right button went down this frame
 	quit:            bool, // set once quitting was confirmed
 	finder:          Finder,
+	lsp:             Lsp_State,
 	settings:        Settings,
 	fonts:           gfx.System_Fonts,
 	settings_window: Settings_Window,
@@ -62,6 +65,8 @@ App :: struct {
 	tooltip:         Tooltip_State,
 	pending:         Action,
 	open_heading:    string, // owned; where the caret goes in the file `pending` opens
+	open_target:     Maybe(Open_Target), // or this: a place in it
+	jumps:           Jumps,              // Go back and Go forward
 	perf:            ^Perf,  // set by --perf
 }
 
@@ -138,6 +143,9 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	update_window_metrics()
 	if !gfx.text_init(&gfx.text_system) do return .FAILURE
 	apply_settings()
+
+	// Language servers, which the perf suite starts only in its own phase
+	if g.perf == nil do lsp_init()
 
 	// Clay
 	min_memory := uint(clay.MinMemorySize())
@@ -259,10 +267,17 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	apply_pending_action()
 	dialog_frame()
 	context_menu_frame()
+	settings_servers_frame()
+	lsp_frame()
+	lsp_edits_frame()
+	lsp_rename_frame()
 	rename_frame()
 	update_focus()
 	finder_frame()
+	find_frame()
 	panes_frame()
+	lsp_completion_frame()
+	lsp_hover_frame()
 	g.wake_frames = max(g.wake_frames - 1, 0)
 	g.sleeping = g.wake_frames == 0 && !needs_continuous_frames()
 
@@ -303,7 +318,11 @@ needs_continuous_frames :: proc() -> bool {
 	switch {
 	case g.pending != nil,
 	     finder_busy(),
+	     find_busy(),
 	     panes_busy(),
+	     langs.busy(),
+	     lsp_hover_busy(),
+	     lsp_completion_busy(),
 	     smooth_scrolling(),
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
@@ -412,12 +431,25 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 	if dialog_handle_event(event) do return
 	if rename_handle_event(event) do return
+	if lsp_rename_handle_event(event) do return
 	if g.menu.open {
 		if escape do menu_close()
 		return
 	}
+	if g.lsp.popup.open && escape {
+		lsp_popup_close()
+		return
+	}
+
+	// A key (not a modifier alone) closes the hover popup; Esc only does that
+	if g.lsp.hover.open && event.type == .KEY_DOWN && !is_modifier(event.key.key) {
+		lsp_hover_close()
+		if escape do return
+	}
 	if settings_window_handle_event(event) do return
 	if finder_handle_event(event) do return
+	if find_handle_event(event) do return
+	if lsp_completion_handle_key(event) do return
 
 	// The focused pane
 	t := focused_terminal()
@@ -431,7 +463,8 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 
 	// Shortcuts
-	if event.key.key == sdl.K_F12 {
+	ctrl := event.key.mod & sdl.KMOD_CTRL != {}
+	if event.key.key == sdl.K_F12 && ctrl {
 		clay.SetDebugModeEnabled(!clay.IsDebugModeEnabled())
 		return
 	}
@@ -443,16 +476,30 @@ handle_key_event :: proc(event: ^sdl.Event) {
 }
 
 
+@(private = "file")
+is_modifier :: proc(key: sdl.Keycode) -> bool {
+	switch key {
+	case sdl.K_LCTRL, sdl.K_RCTRL, sdl.K_LSHIFT, sdl.K_RSHIFT, sdl.K_LALT, sdl.K_RALT,
+	     sdl.K_LGUI, sdl.K_RGUI:
+		return true
+	}
+	return false
+}
+
+
 app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	context = g.ctx
 
 	session_save()
 
 	finder_destroy()
+	find_destroy()
 	menu_close()
 	rename_destroy()
 	dialog_destroy()
 	panes_destroy()
+	lsp_destroy()
+	jumps_destroy()
 	settings_window_destroy()
 	settings_destroy(&g.settings)
 	gfx.fonts_destroy(&g.fonts)
@@ -527,10 +574,11 @@ set_window_icon :: proc() {
 // the start of the next frame, because this frame's render commands still point
 // at the strings they would free
 
-Toggle_Node :: distinct int
-Open_File   :: distinct string // owned, full path
-Open_Folder :: distinct string // owned
-Run_Command :: distinct Command
+Toggle_Node  :: distinct int
+Open_File    :: distinct string // owned, full path
+Open_Beside  :: distinct string // owned, full path; in a new pane beside the one in use
+Open_Folder  :: distinct string // owned
+Run_Command  :: distinct Command
 
 Pane_Op :: struct {
 	pane: ^Pane,
@@ -544,6 +592,7 @@ Pane_Op :: struct {
 Action :: union {
 	Toggle_Node,
 	Open_File,
+	Open_Beside,
 	Open_Folder,
 	Run_Command,
 	Pane_Op,
@@ -577,9 +626,17 @@ apply_pending_action :: proc() {
 		if is_file && e.md != nil && g.open_heading != "" {
 			mdview.jump_to_heading(&e.md_view, g.open_heading)
 		}
+		if target, has_target := g.open_target.?; has_target && is_file {
+			apply_open_target(e, target)
+		}
 		delete(string(a))
 		delete(g.open_heading)
 		g.open_heading = ""
+		g.open_target = nil
+
+	case Open_Beside:
+		panes_open_file_beside(string(a))
+		delete(string(a))
 
 	case Open_Folder:
 		files := make([dynamic]^Pane, context.temp_allocator)
@@ -608,6 +665,7 @@ open_folder :: proc(path: string) {
 	path := os.get_absolute_path(path, context.temp_allocator) or_else path
 	if len(path) > 3 do path = strings.trim_right(path, "/\\") // keep "C:\"
 
+	langs.stop_all()
 	workspace_open(&g.workspace, path)
 	title := fmt.ctprintf("%s - typo", folder_name(path))
 	_ = sdl.SetWindowTitle(g.window, title)

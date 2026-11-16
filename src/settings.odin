@@ -6,11 +6,13 @@ import "core:math"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 import "toml"
 import sdl "../vendor/sdl3"
 import "gfx"
+import "langs"
 
 // User settings, stored as TOML in the per-user config directory
 // (%APPDATA%\typo\settings.toml on Windows, or TYPO_SETTINGS if set). The file
@@ -23,6 +25,7 @@ import "gfx"
 
 Settings :: struct {
 	restore_session:      bool,
+	collapsed_sections:   string, // settings window sections shown collapsed: keys, ", "-separated
 	theme:                string,
 	font_family:          string,
 	font_size:            int,
@@ -40,21 +43,30 @@ Settings :: struct {
 	markdown_font_size:   int,
 	markdown_line_height: f64, // times the font size
 	markdown_max_width:   int, // logical pixels; 0 = the pane's width
+	lsp_enabled:          bool,
+	lsp_hover_delay:      int, // ms; 0 = no hover on the pointer
 	bindings:             Bindings,
+	servers:              [dynamic]langs.Server_Override, // [lsp.<name>] tables
 
-	path:                 string,    // settings.toml
-	mtime:                time.Time, // of the file as last read or written by us
-	error:                string,    // problem with the file as last loaded, or ""
+	path:                 string, // settings.toml
+	error:                string, // problem with the file as last loaded, or ""
 
-	// The watcher runs on SDL's timer thread; these are guarded by watch_mutex
+	// The watcher runs on SDL's timer thread and the saver on its own; these
+	// are guarded by watch_mutex
 	watcher:              sdl.TimerID,
 	watch_mutex:          sync.Mutex,
-	disk_mtime:           time.Time, // as last seen by the watcher
+	disk_mtime:           time.Time, // as last read, written or seen by the watcher
 	disk_changed:         bool,
+	saver:                ^thread.Thread, // started by the first settings_save_later
+	save_cond:            sync.Cond,
+	save_text:            string, // owned; waiting to be written
+	saving:               bool,   // a write is waiting or under way: the watcher looks away
+	closing:              bool,
 }
 
 Setting :: enum {
 	Restore_Session,
+	Collapsed_Sections,
 	Theme,
 	Smooth_Scroll,
 	Text_Contrast,
@@ -72,6 +84,8 @@ Setting :: enum {
 	Markdown_Font_Size,
 	Markdown_Line_Height,
 	Markdown_Max_Width,
+	Lsp_Enabled,
+	Lsp_Hover_Delay,
 }
 
 // Sections of settings.toml and the settings window, in order
@@ -82,17 +96,19 @@ Section :: enum {
 	Markdown,
 	Keybindings,
 	Terminal,
+	Language_Servers,
 	Advanced,
 }
 
 SECTION_KEYS := [Section]string {
-	.General     = "general",
-	.Appearance  = "appearance",
-	.Font        = "font",
-	.Markdown    = "markdown",
-	.Keybindings = "keybindings",
-	.Terminal    = "terminal",
-	.Advanced    = "advanced",
+	.General          = "general",
+	.Appearance       = "appearance",
+	.Font             = "font",
+	.Markdown         = "markdown",
+	.Keybindings      = "keybindings",
+	.Terminal         = "terminal",
+	.Language_Servers = "lsp",
+	.Advanced         = "advanced",
 }
 
 Setting_Info :: struct {
@@ -130,6 +146,12 @@ SETTINGS := [Setting]Setting_Info {
 		              "files and terminals where they were.",
 		keywords    = "startup reopen workspace panes",
 		default     = true,
+	},
+	.Collapsed_Sections = {
+		section     = .General,
+		key         = "collapsed_sections",
+		description = "Sections the settings window shows collapsed, e.g. \"keybindings, lsp\".",
+		default     = "",
 	},
 	.Smooth_Scroll = {
 		section     = .Appearance,
@@ -294,6 +316,28 @@ SETTINGS := [Setting]Setting_Info {
 		max         = 4000,
 		step        = 20,
 	},
+	.Lsp_Enabled = {
+		section     = .Language_Servers,
+		key         = "enabled",
+		name        = "Language servers",
+		description = "Start the installed language servers for open files: hover, go to " +
+		              "definition, symbols and diagnostics. Each server can be turned on or " +
+		              "off, pointed at a program (path) or changed in an [lsp.<name>] table.",
+		keywords    = "lsp language server intellisense diagnostics completion",
+		default     = true,
+	},
+	.Lsp_Hover_Delay = {
+		section     = .Language_Servers,
+		key         = "hover_delay",
+		name        = "Hover delay",
+		description = "How long the pointer rests on code before what the language server " +
+		              "knows about it shows, in milliseconds. 0 shows it only on Show hover.",
+		keywords    = "lsp hover tooltip documentation popup",
+		default     = int(400),
+		min         = 0,
+		max         = 3000,
+		step        = 50,
+	},
 }
 
 SETTINGS_POLL_MS :: 500
@@ -309,6 +353,7 @@ Setting_Value :: union {
 setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	switch x {
 	case .Restore_Session:      return &s.restore_session
+	case .Collapsed_Sections:   return &s.collapsed_sections
 	case .Theme:                return &s.theme
 	case .Font_Family:          return &s.font_family
 	case .Font_Size:            return &s.font_size
@@ -326,6 +371,8 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Markdown_Font_Size:   return &s.markdown_font_size
 	case .Markdown_Line_Height: return &s.markdown_line_height
 	case .Markdown_Max_Width:   return &s.markdown_max_width
+	case .Lsp_Enabled:          return &s.lsp_enabled
+	case .Lsp_Hover_Delay:      return &s.lsp_hover_delay
 	}
 	return nil
 }
@@ -359,6 +406,7 @@ setting_reset :: proc(s: ^Settings, x: Setting) {
 settings_reset_all :: proc(s: ^Settings) {
 	for x in Setting do setting_reset(s, x)
 	for cmd in Command do s.bindings[cmd] = default_bindings(cmd)
+	langs.server_overrides_clear(&s.servers)
 }
 
 
@@ -415,11 +463,11 @@ settings_init :: proc(s: ^Settings) {
 
 	// Watch it for changes made by hand
 	sync.guard(&s.watch_mutex)
-	s.disk_mtime = s.mtime
 	s.watcher = sdl.AddTimer(SETTINGS_POLL_MS, watch_callback, s)
 }
 
 
+// Stops the watcher, and writes what is waiting to be saved
 settings_destroy :: proc(s: ^Settings) {
 	if s.watcher != 0 {
 		sync.guard(&s.watch_mutex)
@@ -427,10 +475,22 @@ settings_destroy :: proc(s: ^Settings) {
 		s.watcher = 0
 	}
 
+	// The saver writes what is waiting, then exits
+	if s.saver != nil {
+		if sync.guard(&s.watch_mutex) {
+			s.closing = true
+			sync.cond_signal(&s.save_cond)
+		}
+		thread.destroy(s.saver)
+	}
+	delete(s.save_text)
+
 	for x in Setting {
 		v, is_string := setting_value(s, x).(^string)
 		if is_string do delete(v^)
 	}
+	for &o in s.servers do langs.server_override_destroy(&o)
+	delete(s.servers)
 	delete(s.path)
 	delete(s.error)
 	s^ = {}
@@ -442,7 +502,10 @@ settings_destroy :: proc(s: ^Settings) {
 // settings window
 settings_load :: proc(s: ^Settings) {
 	data, read_err := os.read_entire_file(s.path, context.temp_allocator)
-	s.mtime, _ = os.last_write_time_by_name(s.path)
+	mtime, _ := os.last_write_time_by_name(s.path)
+	if sync.guard(&s.watch_mutex) {
+		s.disk_mtime = mtime
+	}
 	if read_err != nil {
 		set_string(&s.error, fmt.tprintf("could not read %s", s.path))
 		return
@@ -495,6 +558,9 @@ settings_load :: proc(s: ^Settings) {
 			}
 		}
 	}
+
+	// The language servers' tables
+	langs.load_server_overrides(&s.servers, doc, &problems)
 
 	set_string(&s.error, strings.join(problems[:], "; ", context.temp_allocator))
 }
@@ -583,11 +649,88 @@ contains :: proc(list: []string, s: string) -> bool {
 }
 
 
-// Writes all settings, replacing the file atomically. The file then holds
-// valid settings, so a problem reported by the last load no longer applies
+// Writes all settings, replacing the file atomically, before returning. The
+// file then holds valid settings, so a problem reported by the last load no
+// longer applies
 settings_save :: proc(s: ^Settings) {
 	if s.path == "" do return
 
+	mtime, ok := write_settings_file(s.path, settings_text(s))
+	if !ok do return
+
+	if sync.guard(&s.watch_mutex) {
+		s.disk_mtime = mtime
+	}
+	set_string(&s.error, "")
+}
+
+
+// Like settings_save, but the file is written on the saver thread. A save that
+// is still waiting is replaced
+settings_save_later :: proc(s: ^Settings) {
+	if s.path == "" do return
+
+	text := strings.clone(settings_text(s))
+	if sync.guard(&s.watch_mutex) {
+		delete(s.save_text)
+		s.save_text = text
+		s.saving = true
+		sync.cond_signal(&s.save_cond)
+	}
+	if s.saver == nil {
+		s.saver = thread.create_and_start_with_poly_data(s, saver_proc, context)
+	}
+	set_string(&s.error, "")
+}
+
+
+// The saver thread: writes each text handed over, until closing with nothing
+// left to write
+@(private = "file")
+saver_proc :: proc(s: ^Settings) {
+	for {
+		text: string
+		if sync.guard(&s.watch_mutex) {
+			for s.save_text == "" && !s.closing {
+				sync.cond_wait(&s.save_cond, &s.watch_mutex)
+			}
+			if s.save_text == "" do return
+			text, s.save_text = s.save_text, ""
+		}
+
+		mtime, ok := write_settings_file(s.path, text)
+		delete(text)
+
+		// Our own write isn't a change for the watcher to report
+		if sync.guard(&s.watch_mutex) {
+			if ok do s.disk_mtime = mtime
+			s.saving = s.save_text != ""
+		}
+		free_all(context.temp_allocator)
+	}
+}
+
+
+// Writes a temp file, then moves it into place. Returns the file's new time
+@(private = "file")
+write_settings_file :: proc(path, text: string) -> (mtime: time.Time, ok: bool) {
+	_ = os.make_directory_all(os.dir(path))
+
+	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
+	write_err := os.write_entire_file(tmp, text)
+	if write_err != nil || os.rename(tmp, path) != nil {
+		sdl.Log("could not write %s", strings.clone_to_cstring(path, context.temp_allocator))
+		return {}, false
+	}
+
+	mtime, _ = os.last_write_time_by_name(path)
+	return mtime, true
+}
+
+
+// settings.toml's text for the current settings (temp)
+@(private = "file")
+settings_text :: proc(s: ^Settings) -> string {
 	sb := strings.builder_make(context.temp_allocator)
 	for key, section in SECTION_KEYS {
 		// Each section's values line up in one column
@@ -633,19 +776,10 @@ settings_save :: proc(s: ^Settings) {
 		if section != min(Section) do strings.write_byte(&sb, '\n')
 		fmt.sbprintf(&sb, "[%s]\n", key)
 		for line in lines do fmt.sbprintf(&sb, "%-*s = %s\n", width, line.key, line.value)
-	}
 
-	// Write a temp file, then move it into place
-	_ = os.make_directory_all(os.dir(s.path))
-	tmp := strings.concatenate({s.path, ".tmp"}, context.temp_allocator)
-	write_err := os.write_entire_file(tmp, strings.to_string(sb))
-	if write_err != nil || os.rename(tmp, s.path) != nil {
-		sdl.Log("could not write %s", strings.clone_to_cstring(s.path, context.temp_allocator))
-		return
+		if section == .Language_Servers do langs.write_server_overrides(&sb, s.servers[:])
 	}
-
-	s.mtime, _ = os.last_write_time_by_name(s.path)
-	set_string(&s.error, "")
+	return strings.to_string(sb)
 }
 
 
@@ -659,6 +793,7 @@ watch_callback :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) ->
 	s := (^Settings)(userdata)
 	sync.guard(&s.watch_mutex)
 	if s.watcher == 0 do return 0 // being destroyed
+	if s.saving do return interval
 
 	mtime, err := os.last_write_time_by_name(s.path)
 	if err == nil && mtime != s.disk_mtime {
@@ -670,26 +805,25 @@ watch_callback :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) ->
 }
 
 
-// Reloads the file if the watcher saw it change, unless that was our own save
+// Reloads the file if the watcher saw it changed by someone else (our own
+// saves set disk_mtime, so the watcher doesn't report them)
 settings_poll :: proc(s: ^Settings) {
 	changed: bool
 	if sync.guard(&s.watch_mutex) {
-		changed = s.disk_changed
+		changed = s.disk_changed && !s.saving
 		s.disk_changed = false
 	}
 	if !changed do return
 
-	mtime, err := os.last_write_time_by_name(s.path)
-	if err == nil && mtime != s.mtime {
-		settings_load(s)
-		apply_settings()
-	}
+	settings_load(s)
+	apply_settings()
 }
 
 
-// Saves the settings and pushes them into the running editor
+// Saves the settings (on the saver thread) and pushes them into the running
+// editor
 settings_changed :: proc() {
-	settings_save(&g.settings)
+	settings_save_later(&g.settings)
 	apply_settings()
 }
 
@@ -711,6 +845,7 @@ apply_settings :: proc() {
 
 	apply_editor_font()
 	apply_markdown_font()
+	langs.settings_changed()
 }
 
 

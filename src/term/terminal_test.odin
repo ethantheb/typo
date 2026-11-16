@@ -32,6 +32,9 @@ test_abi_matches_manifest :: proc(t: ^testing.T) {
 	check_size(t, types, "GhosttyPoint", size_of(Point))
 	check_size(t, types, "GhosttyGridRef", size_of(Grid_Ref))
 	check_size(t, types, "GhosttySelection", size_of(Selection))
+	check_size(t, types, "GhosttySelectionBuffer", size_of(Selection_Buffer))
+	check_size(t, types, "GhosttyPointCoordinate", size_of(Point_Coordinate))
+	check_size(t, types, "GhosttyString", size_of(Ghostty_String))
 	check_size(
 		t,
 		types,
