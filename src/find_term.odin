@@ -96,7 +96,7 @@ find_term_frame :: proc(f: ^Find, t: ^Terminal) {
 	total, _, _ := find_term_counts(f)
 	if ft.jump && total > 0 {
 		ft.jump = false
-		find_term_select(f, t, .Select_Next)
+		find_term_select(f, t, older = true)
 	}
 
 	find_term_marks(f, t)
@@ -111,18 +111,19 @@ find_term_busy :: proc(f: ^Find) -> bool {
 // The next match (dir = +1, toward older output) or the previous one
 find_term_step :: proc(f: ^Find, t: ^Terminal, dir: int) {
 	if f.term.search == nil do return
-	find_term_select(f, t, dir > 0 ? .Select_Next : .Select_Prev)
+	find_term_select(f, t, older = dir > 0)
 }
 
 
-// Selects a match (libghostty scrolls to it) and makes it the terminal's
-// selection, which is drawn as one
+// Selects the next match toward older output, or toward newer (libghostty
+// scrolls to it), and makes it the terminal's selection, which is drawn as one
 @(private = "file")
-find_term_select :: proc(f: ^Find, t: ^Terminal, option: term.Search_Option) {
+find_term_select :: proc(f: ^Find, t: ^Terminal, older: bool) {
 	ft := &f.term
-	if term.search_set(ft.search, option, nil) != .Success do return
+	moved := older ? term.search_select_next(ft.search) : term.search_select_prev(ft.search)
+	if moved != .Success do return
 
-	match := term.init_sized(term.Selection)
+	match: term.Selection
 	if term.search_get(ft.search, .Selected_Match, &match) == .Success {
 		term.terminal_set(ft.vt, .Selection, &match)
 	}
@@ -162,8 +163,7 @@ find_term_marks :: proc(f: ^Find, t: ^Terminal) {
 	}
 
 	matches := make([]term.Selection, buf.len, context.temp_allocator)
-	for &m in matches do m = term.init_sized(term.Selection)
-	buf = {raw_data(matches), uint(len(matches)), 0}
+	buf ={raw_data(matches), uint(len(matches)), 0}
 	if term.search_get(ft.search, .Viewport_Matches, &buf) != .Success do return
 
 	rows := int(t.session.rows)

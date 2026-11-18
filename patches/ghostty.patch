@@ -1,17 +1,17 @@
 diff --git a/src/terminal/PageList.zig b/src/terminal/PageList.zig
-index d915bcf6d..70569d1ff 100644
+index 3474ae290..3d7041dc9 100644
 --- a/src/terminal/PageList.zig
 +++ b/src/terminal/PageList.zig
-@@ -1477,7 +1477,7 @@ fn resizeCols(
+@@ -1550,7 +1550,7 @@ fn resizeCols(
  
      // Reflow all our rows.
      {
 -        var reflow_cursor: ReflowCursor = .init(first_rewritten_node);
 +        var reflow_cursor: ReflowCursor = .init(first_rewritten_node, !opts.pull_scrollback);
-         while (it.next()) |row| {
-             try reflow_cursor.reflowRow(
-                 self,
-@@ -1617,6 +1617,12 @@ const ReflowCursor = struct {
+ 
+         // Check each row against `blank.start` before reflowing it,
+         // because reflowing that row moves the pin into the new pages.
+@@ -1709,6 +1709,12 @@ const ReflowCursor = struct {
          cap: Capacity,
      },
  
@@ -24,7 +24,7 @@ index d915bcf6d..70569d1ff 100644
      const StyleCache = struct {
          src_page: ?*const Page,
          src_id: stylepkg.Id,
-@@ -1629,7 +1635,7 @@ const ReflowCursor = struct {
+@@ -1721,7 +1727,7 @@ const ReflowCursor = struct {
          };
      };
  
@@ -33,7 +33,7 @@ index d915bcf6d..70569d1ff 100644
          const page = node.page();
          const rows = page.rows.ptr(page.memory);
          return .{
-@@ -1647,6 +1653,7 @@ const ReflowCursor = struct {
+@@ -1739,6 +1745,7 @@ const ReflowCursor = struct {
  
              .style_cache = .invalid,
              .cap_memo = null,
@@ -41,7 +41,7 @@ index d915bcf6d..70569d1ff 100644
          };
      }
  
-@@ -1667,7 +1674,8 @@ const ReflowCursor = struct {
+@@ -1759,7 +1766,8 @@ const ReflowCursor = struct {
          var cols_len = src_page.size.cols;
          if (!src_row.wrap) {
              while (cols_len > 0) {
@@ -51,7 +51,7 @@ index d915bcf6d..70569d1ff 100644
                  cols_len -= 1;
              }
  
-@@ -2620,7 +2628,7 @@ const ReflowCursor = struct {
+@@ -2804,7 +2812,7 @@ const ReflowCursor = struct {
          // and we need to fix it up.
          errdefer comptime unreachable;
  
@@ -60,7 +60,7 @@ index d915bcf6d..70569d1ff 100644
          self.cursorAbsolute(old_x, old_y);
          self.total_rows = old_total_rows;
      }
-@@ -2718,7 +2726,7 @@ const ReflowCursor = struct {
+@@ -2902,7 +2910,7 @@ const ReflowCursor = struct {
          node.page().size.rows = 1;
          list.pages.insertAfter(self.node, node);
  
@@ -70,10 +70,10 @@ index d915bcf6d..70569d1ff 100644
      }
  
 diff --git a/src/terminal/page.zig b/src/terminal/page.zig
-index ad2b1a7e5..78a3eb491 100644
+index 2a66d5b1e..3bee95a1b 100644
 --- a/src/terminal/page.zig
 +++ b/src/terminal/page.zig
-@@ -2368,6 +2368,19 @@ pub const Cell = packed struct(u64) {
+@@ -2621,6 +2621,19 @@ pub const Cell = packed struct(u64) {
          };
      }
  

@@ -349,21 +349,22 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		cells := wide == .Wide ? 2 : 1
 
 		// Its style and colors
-		style := term.init_sized(term.Style)
+		style: term.Style
 		has_style: bool
 		term.render_state_row_cells_get(s.cells, .Has_Styling, &has_style)
 		if has_style do term.render_state_row_cells_get(s.cells, .Style, &style)
+		attrs := style.flags
 
 		fg_rgb, bg_rgb: term.Color_Rgb
 		has_fg := term.render_state_row_cells_get(s.cells, .Fg_Color, &fg_rgb) == .Success
 		has_bg := term.render_state_row_cells_get(s.cells, .Bg_Color, &bg_rgb) == .Success
 		fg := has_fg ? to_color(fg_rgb) : default_fg
 		bg := has_bg ? to_color(bg_rgb) : default_bg
-		if style.inverse {
+		if attrs.inverse {
 			fg, bg = bg, fg
 			has_bg = true
 		}
-		if style.faint do fg.a = 140
+		if attrs.faint do fg.a = 140
 
 		// The background extends the last run of its color, or starts one
 		if has_bg {
@@ -380,7 +381,7 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 
 		n: u32
 		term.render_state_row_cells_get(s.cells, .Graphemes_Len, &n)
-		if n == 0 || style.invisible {
+		if n == 0 || attrs.invisible {
 			append(&row.cells, 0)
 
 			// A blank continues the open run as a space (spaces draw nothing,
@@ -400,11 +401,12 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		cps_buf: [8]u32
 		cps := cps_buf[:]
 		if n > len(cps_buf) do cps = make([]u32, n, context.temp_allocator)
-		term.render_state_row_cells_get(s.cells, .Graphemes_Buf, raw_data(cps))
+		graphemes := term.Codepoint_Buffer{raw_data(cps), uint(len(cps)), 0}
+		term.render_state_row_cells_get(s.cells, .Graphemes_Buf, &graphemes)
 		append(&row.cells, rune(cps[0]))
 
 		// The open run takes it if it looks the same, else a new run starts
-		bold, underline, strike := style.bold, style.underline != 0, style.strikethrough
+		bold, underline, strike := attrs.bold, attrs.underline != 0, attrs.strikethrough
 		solo := cells == 2 ||
 		        g.settings.letter_spacing != 0 ||
 		        !gfx.font_has_own_glyph(&gfx.text_system, .Editor, rune(cps[0]))

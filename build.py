@@ -12,10 +12,12 @@ Steps:
   1. Compile the tree-sitter runtime + grammars (C) with clang into a static
      library, only when a C source is newer than the library. Always optimized,
      so parsing speed doesn't depend on the build mode.
-  2. Build libghostty-vt (terminal emulation) from a pinned ghostty commit with
-     patches/ghostty.patch applied (reflow trims trailing spaces when scrollback
-     isn't pulled, as ConPTY does), with a pinned Zig, both downloaded into
-     build/ on first use. Rebuilt only when GHOSTTY_COMMIT or the patch changes.
+  2. Build libghostty-vt (terminal emulation) from a pinned release with
+     patches/ghostty.patch applied (reflow trims trailing spaces when
+     scrollback isn't pulled, as ConPTY does), with a pinned Zig, both
+     downloaded into build/ on first use. With GHOSTTY_PATCH = False, use the
+     release as it is: on Windows x64, its prebuilt static library, downloaded.
+     Redone only when the release, the patch or GHOSTTY_PATCH changes.
   3. Build SDL3 and SDL3_ttf (with FreeType, HarfBuzz and plutosvg) with CMake
      from pinned releases, downloaded into build/ on first use, SDL3_ttf with
      patches/sdl_ttf.patch applied (glyphs at quarter-pixel positions, and a
@@ -107,16 +109,28 @@ TS_INPUT_DIRS = [
     "vendor/tree-sitter-toml/src",
 ]
 
-# libghostty-vt, built with a pinned Zig
-ZIG_VERSION    = "0.16.0"
-GHOSTTY_REPO   = "https://github.com/ghostty-org/ghostty.git"
-GHOSTTY_COMMIT = "6301810a48aaa3426887a4316668f18833a40138"
-GHOSTTY_SRC    = OUT / "deps" / "ghostty"
-GHOSTTY_OUT    = OBJ / "ghostty-vt"
-GHOSTTY_PATCH  = ROOT / "patches" / "ghostty.patch"
-GHOSTTY_LIB    = GHOSTTY_OUT / "lib" / (
+# libghostty-vt, a pinned release. With GHOSTTY_PATCH it is built from source
+# with a pinned Zig and GHOSTTY_PATCH_FILE applied; without, it is the release
+# as it is: its prebuilt static library on Windows x64, else built from source.
+# src/term/ghostty_vt.odin links GHOSTTY_LIB either way
+GHOSTTY_PATCH      = True
+GHOSTTY_VERSION    = "1.0.1"
+GHOSTTY_REF        = f"refs/tags/vt-{GHOSTTY_VERSION}"
+ZIG_VERSION        = "0.17.1"
+GHOSTTY_REPO       = "https://github.com/ghostty-org/ghostty.git"
+GHOSTTY_SRC        = OUT / "deps" / "ghostty"
+GHOSTTY_OUT        = OBJ / "ghostty-vt"
+GHOSTTY_PATCH_FILE = ROOT / "patches" / "ghostty.patch"
+GHOSTTY_LIB        = GHOSTTY_OUT / "lib" / (
     "ghostty-vt-static.lib" if IS_WINDOWS else "libghostty-vt.a"
 )
+
+GHOSTTY_PREBUILT_NAME   = f"ghostty-vt-{GHOSTTY_VERSION}-x86_64-windows-gnu"
+GHOSTTY_PREBUILT_URL    = (
+    f"https://release.files.ghostty.org/libghostty-vt/{GHOSTTY_VERSION}/"
+    f"{GHOSTTY_PREBUILT_NAME}.zip"
+)
+GHOSTTY_PREBUILT_SHA256 = "8e2eb9e1822e85d786b456c8beb86f49d09c318c91f0c2913f91e7ffa12cda29"
 
 # SDL3 and SDL3_ttf, built with CMake
 SDL_VERSION        = "3.4.2"
@@ -270,24 +284,79 @@ def zig_exe():
     return str(exe)
 
 
+def ghostty_prebuilt():
+    """Whether libghostty-vt is the release's prebuilt library (unpatched, on
+    the one platform it is published for)."""
+    x64 = platform.machine().lower() in ("amd64", "x86_64")
+    return not GHOSTTY_PATCH and IS_WINDOWS and x64
+
+
+def ghostty_flags():
+    """Odin flags for the libghostty-vt in use: whether it is patched (some
+    terminal tests depend on it), and for the prebuilt library, which is built
+    with MinGW, LLVM's linker (MSVC's link.exe rejects it)."""
+    patched = "true" if GHOSTTY_PATCH else "false"
+    flags = [f"-define:GHOSTTY_PATCHED={patched}"]
+    if ghostty_prebuilt():
+        flags.append("-linker:lld")
+    return flags
+
+
 def build_ghostty():
+    """Builds or fetches libghostty-vt, unless what's there is already it."""
+    if GHOSTTY_PATCH and not GHOSTTY_PATCH_FILE.exists():
+        sys.exit(f"GHOSTTY_PATCH is on, but {GHOSTTY_PATCH_FILE} is missing")
+
+    if ghostty_prebuilt():
+        wanted = f"prebuilt {GHOSTTY_PREBUILT_SHA256}"
+    else:
+        patch = patch_hash(GHOSTTY_PATCH_FILE) if GHOSTTY_PATCH else "unpatched"
+        wanted = f"{GHOSTTY_REF} {patch}"
+
     stamp = GHOSTTY_OUT / "commit.txt"
-    version = f"{GHOSTTY_COMMIT} {patch_hash(GHOSTTY_PATCH)}"
-    if GHOSTTY_LIB.exists() and stamp.exists() and stamp.read_text().strip() == version:
+    if GHOSTTY_LIB.exists() and stamp.exists() and stamp.read_text().strip() == wanted:
         return
 
+    shutil.rmtree(GHOSTTY_OUT, ignore_errors=True)
+    if ghostty_prebuilt():
+        fetch_ghostty_prebuilt()
+    else:
+        build_ghostty_source()
+    stamp.write_text(wanted)
+
+
+def build_ghostty_source():
     print("Building libghostty-vt...", flush=True)
-    git_checkout(GHOSTTY_SRC, GHOSTTY_REPO, GHOSTTY_COMMIT)
-    check(["git", "-C", GHOSTTY_SRC, "apply", GHOSTTY_PATCH])
+    git_checkout(GHOSTTY_SRC, GHOSTTY_REPO, GHOSTTY_REF)
+    if GHOSTTY_PATCH:
+        check(["git", "-C", GHOSTTY_SRC, "apply", GHOSTTY_PATCH_FILE])
 
     # Zig builds from the ghostty checkout, not ROOT
     zig = zig_exe()
-    cmd = [zig, "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "--prefix", GHOSTTY_OUT]
+    cmd = [
+        zig, "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast",
+        f"-Dlib-version-string={GHOSTTY_VERSION}", "--prefix", GHOSTTY_OUT,
+    ]
     print("+", " ".join(str(c) for c in cmd), flush=True)
     if subprocess.run(cmd, cwd=GHOSTTY_SRC).returncode != 0:
         sys.exit(1)
 
-    stamp.write_text(version)
+
+def fetch_ghostty_prebuilt():
+    """Downloads the release's Windows zip and keeps its static library."""
+    # The release server refuses urllib's default user agent
+    print(f"Downloading libghostty-vt {GHOSTTY_VERSION}...", flush=True)
+    request = urllib.request.Request(GHOSTTY_PREBUILT_URL, headers={"User-Agent": "typo-build"})
+    with urllib.request.urlopen(request) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != GHOSTTY_PREBUILT_SHA256:
+        sys.exit(f"libghostty-vt download checksum mismatch: {GHOSTTY_PREBUILT_URL}")
+
+    # The zip holds one folder named after it, with lib/ and include/ inside
+    GHOSTTY_LIB.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        member = f"{GHOSTTY_PREBUILT_NAME}/lib/{GHOSTTY_LIB.name}"
+        GHOSTTY_LIB.write_bytes(z.read(member))
 
 
 def cmake_build(src, build_dir, options):
@@ -386,7 +455,7 @@ def build_odin(release, exe=EXE, console=False):
     if IS_WINDOWS:
         flags.append("-resource:assets/icon/typo.rc")  # the executable's icon
 
-    cmd = ["odin", "build", "src", f"-out:{exe}", *flags]
+    cmd = ["odin", "build", "src", f"-out:{exe}", *flags, *ghostty_flags()]
 
     # A link that fails on a locked executable is retried
     for attempt in range(1, 5):
@@ -515,7 +584,10 @@ def run_unit_tests():
     for package in TEST_PACKAGES:
         name = Path(package).name if package != "src" else "typo"
         out = OUT / f"{name}_test{'.exe' if IS_WINDOWS else ''}"
-        cmd = ["odin", "test", package, f"-out:{out}", "-define:ODIN_TEST_FANCY=false"]
+        cmd = [
+            "odin", "test", package, f"-out:{out}", "-define:ODIN_TEST_FANCY=false",
+            *ghostty_flags(),
+        ]
         ok &= run(cmd).returncode == 0
     return ok
 

@@ -277,11 +277,11 @@ session_write :: proc(s: ^Session, data: []u8) {
 // character without modifiers, or 0
 session_send_key :: proc(s: ^Session, key: Key, mods: Mods, repeat: bool, unshifted: rune) {
 	ev := s.key_ev
-	key_encoder_setopt_from_terminal(s.key_enc, s.vt)
+	key_encoder_set_from_terminal(s.key_enc, s.vt)
 	key_event_set_action(ev, repeat ? .Repeat : .Press)
 	key_event_set_key(ev, key)
 	key_event_set_mods(ev, mods)
-	key_event_set_utf8(ev, nil, 0)
+	key_event_set_utf8(ev, {})
 	key_event_set_unshifted_codepoint(ev, u32(unshifted))
 
 	buf: [64]u8
@@ -307,9 +307,9 @@ session_send_mouse :: proc(
 	size.screen_width, size.screen_height = u32(s.cols) * s.cell_w, u32(s.rows) * s.cell_h
 	size.cell_width, size.cell_height = s.cell_w, s.cell_h
 	pressed := any_pressed
-	mouse_encoder_setopt_from_terminal(s.mouse_enc, s.vt)
-	mouse_encoder_setopt(s.mouse_enc, .Size, &size)
-	mouse_encoder_setopt(s.mouse_enc, .Any_Button_Pressed, &pressed)
+	mouse_encoder_set_from_terminal(s.mouse_enc, s.vt)
+	mouse_encoder_set(s.mouse_enc, .Size, &size)
+	mouse_encoder_set(s.mouse_enc, .Any_Button_Pressed, &pressed)
 
 	// The event
 	ev := s.mouse_ev
@@ -423,7 +423,6 @@ session_mode :: proc(s: ^Session, mode: Mode) -> bool {
 // A cell in the visible viewport, clamped to the grid
 @(private = "file")
 viewport_ref :: proc(s: ^Session, col, row: int) -> (ref: Grid_Ref, ok: bool) {
-	ref = init_sized(Grid_Ref)
 	p := Point{tag = .Viewport}
 	p.value.coordinate = {
 		u16(clamp(col, 0, int(s.cols) - 1)),
@@ -467,14 +466,13 @@ session_select_event :: proc(
 		selection_gesture_event_set(ev, .Repeat_Distance, &distance)
 	}
 
-	sel := init_sized(Selection)
-	switch selection_gesture_event(s.gesture, s.vt, ev, &sel) {
+	sel: Selection
+	#partial switch selection_gesture_event(s.gesture, s.vt, ev, &sel) {
 	case .Success:
 		terminal_set(s.vt, .Selection, &sel)
 	case .No_Value:
 		// A plain press starts a new gesture: drop the old selection
 		if type == .Press do terminal_set(s.vt, .Selection, nil)
-	case .Out_Of_Memory, .Invalid_Value, .Out_Of_Space, .Io_Error, .Limit_Exceeded, .Rejected:
 	}
 }
 
@@ -485,7 +483,7 @@ session_clear_selection :: proc(s: ^Session) {
 
 
 session_has_selection :: proc(s: ^Session) -> bool {
-	sel := init_sized(Selection)
+	sel: Selection
 	return terminal_get(s.vt, .Selection, &sel) == .Success
 }
 
@@ -493,18 +491,23 @@ session_has_selection :: proc(s: ^Session) -> bool {
 // The selected text as plain UTF-8 (soft-wrapped lines joined, trailing
 // spaces trimmed), or "" without a selection
 session_selection_text :: proc(s: ^Session, allocator := context.temp_allocator) -> string {
-	sel := init_sized(Selection)
+	sel: Selection
 	if terminal_get(s.vt, .Selection, &sel) != .Success do return ""
 
-	opts := init_sized(Selection_Format_Options)
-	opts.emit = .Plain
-	opts.unwrap = true
-	opts.trim = true
-	opts.selection = &sel
+	// Plain text, wrapped lines joined and trailing spaces trimmed, as Ghostty copies
+	f: Formatter
+	if formatter_terminal_new(nil, &f, s.vt) != .Success do return ""
+	defer formatter_free(f)
+
+	emit := Formatter_Format.Plain
+	unwrap := true
+	formatter_set(f, .Emit, &emit)
+	formatter_set(f, .Unwrap, &unwrap)
+	formatter_set(f, .Selection, &sel)
 
 	ptr: [^]u8
 	n: uint
-	result := terminal_selection_format_alloc(s.vt, nil, opts, &ptr, &n)
+	result := formatter_format_alloc(f, nil, &ptr, &n)
 	if result != .Success || ptr == nil {
 		return ""
 	}

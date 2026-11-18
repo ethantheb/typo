@@ -1,13 +1,17 @@
 package term
 
-// Bindings to libghostty-vt (include/ghostty/vt.h at the commit pinned in
-// build.py) for what typo uses. The C API is not yet stable: check these
-// against the headers when GHOSTTY_COMMIT changes (test_abi_matches_manifest
+// Bindings to libghostty-vt (include/ghostty/vt.h of the release pinned in
+// build.py) for what typo uses. The C ABI is stable from 1.0; check these
+// against the headers when GHOSTTY_VERSION changes (test_abi_matches_manifest
 // catches size and key-value mismatches)
 
 import "core:c"
 
-// The static library build.py builds
+// Whether build.py applied patches/ghostty.patch (reflow trims trailing spaces
+// when scrollback isn't pulled)
+GHOSTTY_PATCHED :: #config(GHOSTTY_PATCHED, true)
+
+// The static library build.py builds or downloads
 when ODIN_OS == .Windows {
 	foreign import vt "../../build/obj/ghostty-vt/lib/ghostty-vt-static.lib"
 } else {
@@ -24,6 +28,7 @@ Result :: enum c.int {
 	Io_Error       = -5,
 	Limit_Exceeded = -6,
 	Rejected       = -7,
+	Unsupported    = -8,
 }
 
 Terminal      :: distinct rawptr
@@ -42,7 +47,7 @@ Color_Rgb :: struct {
 
 // --- Styles ------------------------------------------------------------------------
 
-Style_Color_Tag :: enum c.int {
+Style_Color_Tag :: enum u8 {
 	None    = 0,
 	Palette = 1,
 	Rgb     = 2,
@@ -53,24 +58,29 @@ Style_Color :: struct {
 	value: struct #raw_union {
 		palette: u8,
 		rgb:     Color_Rgb,
-		_:       u64,
 	},
 }
 
+// GhosttyStyleFlags: the attributes, and the underline style in bits 8-10
+// (0 = none; otherwise single, double, curly, dotted, dashed)
+Style_Flags :: bit_field u16 {
+	bold:          bool | 1,
+	italic:        bool | 1,
+	faint:         bool | 1,
+	blink:         bool | 1,
+	inverse:       bool | 1,
+	invisible:     bool | 1,
+	strikethrough: bool | 1,
+	overline:      bool | 1,
+	underline:     u8   | 3,
+}
+
 Style :: struct {
-	size:            c.size_t,
 	fg_color:        Style_Color,
 	bg_color:        Style_Color,
 	underline_color: Style_Color,
-	bold:            bool,
-	italic:          bool,
-	faint:           bool,
-	blink:           bool,
-	inverse:         bool,
-	invisible:       bool,
-	strikethrough:   bool,
-	overline:        bool,
-	underline:       c.int, // 0 = none; otherwise single, double, curly, dotted, dashed
+	flags:           Style_Flags,
+	_:               u16,
 }
 
 
@@ -95,21 +105,21 @@ Cell_Data :: enum c.int {
 // --- Terminal ----------------------------------------------------------------------
 
 Terminal_Option :: enum c.int {
-	Userdata               = 0,
-	Write_Pty              = 1,
-	Bell                   = 2,
-	Title_Changed          = 5,
-	Size                   = 6,
-	Color_Foreground       = 11,
-	Color_Background       = 12,
-	Color_Cursor           = 13,
-	Color_Palette          = 14,
-	Selection              = 21,
-	Default_Cursor_Blink   = 23,
-	Mode_Default           = 33,
-	Mode                   = 34,
-	Scrollback_Max_Bytes   = 27,
-	Resize_Pull_Scrollback = 40,
+	Userdata               = 1,
+	Write_Pty              = 2,
+	Bell                   = 3,
+	Title_Changed          = 6,
+	Size                   = 7,
+	Color_Foreground       = 12,
+	Color_Background       = 13,
+	Color_Cursor           = 14,
+	Color_Palette          = 15,
+	Selection              = 22,
+	Default_Cursor_Blink   = 24,
+	Scrollback_Max_Bytes   = 28,
+	Mode_Default           = 34,
+	Mode                   = 35,
+	Resize_Pull_Scrollback = 41,
 }
 
 Terminal_Data :: enum c.int {
@@ -189,7 +199,7 @@ Row_Cells_Data :: enum c.int {
 	Raw           = 1,
 	Style         = 2,
 	Graphemes_Len = 3,
-	Graphemes_Buf = 4,
+	Graphemes_Buf = 4, // Codepoint_Buffer
 	Bg_Color      = 5,
 	Fg_Color      = 6,
 	Selected      = 7,
@@ -215,6 +225,14 @@ Render_Colors :: struct {
 	cursor:           Color_Rgb,
 	cursor_has_value: bool,
 	palette:          [256]Color_Rgb,
+}
+
+// A cell's codepoints: up to `cap` are written to `ptr`, `len` is how many
+// the cell has (Out_Of_Space when more than `cap`)
+Codepoint_Buffer :: struct {
+	ptr: [^]u32,
+	cap: c.size_t,
+	len: c.size_t,
 }
 
 Row_Selection :: struct {
@@ -246,14 +264,12 @@ Point :: struct {
 
 // A cell reference; only valid until the terminal is next modified
 Grid_Ref :: struct {
-	size: c.size_t,
 	node: rawptr,
 	x:    u16,
 	y:    u16,
 }
 
 Selection :: struct {
-	size:      c.size_t,
 	start:     Grid_Ref,
 	end:       Grid_Ref,
 	rectangle: bool,
@@ -265,12 +281,15 @@ Formatter_Format :: enum c.int {
 	Html  = 2,
 }
 
-Selection_Format_Options :: struct {
-	size:      c.size_t,
-	emit:      Formatter_Format,
-	unwrap:    bool,
-	trim:      bool,
-	selection: ^Selection,
+// Formatter (formatter.h): terminal content as text, e.g. a selection
+Formatter :: distinct rawptr
+
+Formatter_Option :: enum c.int {
+	Emit      = 1, // Formatter_Format
+	Unwrap    = 2, // bool
+	Trim      = 3, // bool
+	Selection = 4, // Selection
+	Extras    = 5,
 }
 
 Selection_Gesture :: distinct rawptr
@@ -286,21 +305,19 @@ Search_Status :: enum c.int {
 }
 
 Search_Data :: enum c.int {
-	Status           = 0,
-	Needle           = 1,
-	Total_Matches    = 2,
-	Selected_Index   = 3, // 0 is the newest match
-	Selected_Match   = 4,
-	Matches          = 5,
-	Viewport_Matches = 6,
-	Select_Scroll    = 7,
+	Status           = 1,
+	Needle           = 2,
+	Total_Matches    = 3,
+	Selected_Index   = 4, // 0 is the newest match
+	Selected_Match   = 5,
+	Matches          = 6,
+	Viewport_Matches = 7,
+	Select_Scroll    = 8,
 }
 
 Search_Option :: enum c.int {
-	Needle        = 0,
-	Select_Next   = 1, // toward older content
-	Select_Prev   = 2, // toward newer content
-	Select_Scroll = 3,
+	Needle        = 1,
+	Select_Scroll = 4,
 }
 
 Ghostty_String :: struct {
@@ -327,12 +344,12 @@ Gesture_Event_Type :: enum c.int {
 }
 
 Gesture_Event_Option :: enum c.int {
-	Ref                = 0,
-	Position           = 1,
-	Repeat_Distance    = 2,
-	Time_Ns            = 3,
-	Repeat_Interval_Ns = 4,
-	Geometry           = 8,
+	Ref                = 1,
+	Position           = 2,
+	Repeat_Distance    = 3,
+	Time_Ns            = 4,
+	Repeat_Interval_Ns = 5,
+	Geometry           = 9,
 }
 
 Surface_Position :: struct {
@@ -420,11 +437,11 @@ Mouse_Encoder_Size :: struct {
 }
 
 Mouse_Encoder_Option :: enum c.int {
-	Event              = 0,
-	Format             = 1,
-	Size               = 2,
-	Any_Button_Pressed = 3,
-	Track_Last_Cell    = 4,
+	Event              = 1,
+	Format             = 2,
+	Size               = 3,
+	Any_Button_Pressed = 4,
+	Track_Last_Cell    = 5,
 }
 
 
@@ -442,7 +459,7 @@ foreign vt {
 	terminal_set :: proc(terminal: Terminal, option: Terminal_Option, value: rawptr) -> Result ---
 	terminal_get :: proc(terminal: Terminal, data: Terminal_Data, out: rawptr) -> Result ---
 	terminal_vt_write :: proc(terminal: Terminal, data: [^]u8, len: c.size_t) ---
-	terminal_scroll_viewport :: proc(terminal: Terminal, behavior: Scroll_Viewport) ---
+	terminal_scroll_viewport :: proc(terminal: Terminal, behavior: Scroll_Viewport) -> Result ---
 
 	render_state_new :: proc(allocator: rawptr, state: ^Render_State) -> Result ---
 	render_state_free :: proc(state: Render_State) ---
@@ -466,14 +483,14 @@ foreign vt {
 
 	key_event_new :: proc(allocator: rawptr, event: ^Key_Event) -> Result ---
 	key_event_free :: proc(event: Key_Event) ---
-	key_event_set_action :: proc(event: Key_Event, action: Key_Action) ---
-	key_event_set_key :: proc(event: Key_Event, key: Key) ---
-	key_event_set_mods :: proc(event: Key_Event, mods: Mods) ---
-	key_event_set_utf8 :: proc(event: Key_Event, utf8: [^]u8, len: c.size_t) ---
-	key_event_set_unshifted_codepoint :: proc(event: Key_Event, codepoint: u32) ---
+	key_event_set_action :: proc(event: Key_Event, action: Key_Action) -> Result ---
+	key_event_set_key :: proc(event: Key_Event, key: Key) -> Result ---
+	key_event_set_mods :: proc(event: Key_Event, mods: Mods) -> Result ---
+	key_event_set_utf8 :: proc(event: Key_Event, utf8: Ghostty_String) -> Result ---
+	key_event_set_unshifted_codepoint :: proc(event: Key_Event, codepoint: u32) -> Result ---
 	key_encoder_new :: proc(allocator: rawptr, encoder: ^Key_Encoder) -> Result ---
 	key_encoder_free :: proc(encoder: Key_Encoder) ---
-	key_encoder_setopt_from_terminal :: proc(encoder: Key_Encoder, terminal: Terminal) ---
+	key_encoder_set_from_terminal :: proc(encoder: Key_Encoder, terminal: Terminal) -> Result ---
 	key_encoder_encode :: proc(
 		encoder: Key_Encoder,
 		event: Key_Event,
@@ -484,19 +501,19 @@ foreign vt {
 
 	mouse_event_new :: proc(allocator: rawptr, event: ^Mouse_Event) -> Result ---
 	mouse_event_free :: proc(event: Mouse_Event) ---
-	mouse_event_set_action :: proc(event: Mouse_Event, action: Mouse_Action) ---
-	mouse_event_set_button :: proc(event: Mouse_Event, button: Mouse_Button) ---
-	mouse_event_clear_button :: proc(event: Mouse_Event) ---
-	mouse_event_set_mods :: proc(event: Mouse_Event, mods: Mods) ---
-	mouse_event_set_position :: proc(event: Mouse_Event, position: Mouse_Position) ---
+	mouse_event_set_action :: proc(event: Mouse_Event, action: Mouse_Action) -> Result ---
+	mouse_event_set_button :: proc(event: Mouse_Event, button: Mouse_Button) -> Result ---
+	mouse_event_clear_button :: proc(event: Mouse_Event) -> Result ---
+	mouse_event_set_mods :: proc(event: Mouse_Event, mods: Mods) -> Result ---
+	mouse_event_set_position :: proc(event: Mouse_Event, position: Mouse_Position) -> Result ---
 	mouse_encoder_new :: proc(allocator: rawptr, encoder: ^Mouse_Encoder) -> Result ---
 	mouse_encoder_free :: proc(encoder: Mouse_Encoder) ---
-	mouse_encoder_setopt :: proc(
+	mouse_encoder_set :: proc(
 		encoder: Mouse_Encoder,
 		option: Mouse_Encoder_Option,
 		value: rawptr,
-	) ---
-	mouse_encoder_setopt_from_terminal :: proc(encoder: Mouse_Encoder, terminal: Terminal) ---
+	) -> Result ---
+	mouse_encoder_set_from_terminal :: proc(encoder: Mouse_Encoder, terminal: Terminal) -> Result ---
 	mouse_encoder_encode :: proc(
 		encoder: Mouse_Encoder,
 		event: Mouse_Event,
@@ -509,13 +526,19 @@ foreign vt {
 	color_palette_default :: proc(out: [^]Color_Rgb) ---
 
 	terminal_grid_ref :: proc(terminal: Terminal, point: Point, out_ref: ^Grid_Ref) -> Result ---
-	terminal_selection_format_alloc :: proc(
-		terminal: Terminal,
+	formatter_terminal_new :: proc(
 		allocator: rawptr,
-		options: Selection_Format_Options,
+		out_formatter: ^Formatter,
+		terminal: Terminal,
+	) -> Result ---
+	formatter_set :: proc(formatter: Formatter, option: Formatter_Option, value: rawptr) -> Result ---
+	formatter_format_alloc :: proc(
+		formatter: Formatter,
+		allocator: rawptr,
 		out_ptr: ^[^]u8,
 		out_len: ^c.size_t,
 	) -> Result ---
+	formatter_free :: proc(formatter: Formatter) ---
 	selection_gesture_new :: proc(allocator: rawptr, out_gesture: ^Selection_Gesture) -> Result ---
 	selection_gesture_free :: proc(gesture: Selection_Gesture, terminal: Terminal) ---
 	selection_gesture_event :: proc(
@@ -540,6 +563,8 @@ foreign vt {
 	search_free :: proc(search: Search) ---
 	search_tick :: proc(search: Search, out_status: ^Search_Status) -> Result ---
 	search_feed :: proc(search: Search) -> Result ---
+	search_select_next :: proc(search: Search) -> Result --- // toward older content
+	search_select_prev :: proc(search: Search) -> Result --- // toward newer content
 	search_set :: proc(search: Search, option: Search_Option, value: rawptr) -> Result ---
 	search_get :: proc(search: Search, data: Search_Data, value: rawptr) -> Result ---
 	terminal_point_from_grid_ref :: proc(
@@ -570,7 +595,8 @@ foreign vt {
 }
 
 
-// Sized structs must carry their own size, like GHOSTTY_INIT_SIZED in C
+// Sized structs (those with a `size` field) must carry their own size, like
+// GHOSTTY_INIT_SIZED in C
 init_sized :: proc($T: typeid) -> (v: T) {
 	v.size = size_of(T)
 	return

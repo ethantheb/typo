@@ -77,7 +77,15 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
     subpixel rendering (upstream never stored it); `TTF_SetFontCoverageTable`, which
     `gfx/text.odin` uses for per-font gamma and contrast.
   - `patches/ghostty.patch`: when scrollback isn't pulled on resize (set on Windows),
-    reflow also trims trailing spaces, as ConPTY does (see Terminal below).
+    reflow also trims trailing spaces, as ConPTY does (see Terminal below). Applied
+    while `GHOSTTY_PATCH` is on.
+- libghostty-vt is a pinned release (`GHOSTTY_VERSION`, Zig `ZIG_VERSION`), built from
+  source with the patch. `GHOSTTY_PATCH = False` uses the release as it is: on Windows
+  x64 its prebuilt static library, downloaded (linked with `-linker:lld`, as MSVC's
+  link.exe rejects its MinGW objects), elsewhere built from source. `build.py` passes
+  `-define:GHOSTTY_PATCHED` so tests that need the patch skip without it.
+  `test_abi_matches_manifest` checks the bindings' struct sizes and every bound enum
+  against the library's manifest: run it after changing the version.
 - Markdown spec suite (`src/markdown/spec_test.odin`): CommonMark and GFM examples
   rendered to HTML. `testdata/spec_failures.txt` lists known failures with reasons; any
   other failure, or a listed example passing, fails the test. `-define:SPEC_WRITE=true`

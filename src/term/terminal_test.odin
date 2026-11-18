@@ -2,7 +2,7 @@ package term
 
 import "base:runtime"
 import "core:encoding/json"
-import "core:fmt"
+import "core:reflect"
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -35,27 +35,66 @@ test_abi_matches_manifest :: proc(t: ^testing.T) {
 	check_size(t, types, "GhosttySelectionBuffer", size_of(Selection_Buffer))
 	check_size(t, types, "GhosttyPointCoordinate", size_of(Point_Coordinate))
 	check_size(t, types, "GhosttyString", size_of(Ghostty_String))
-	check_size(
-		t,
-		types,
-		"GhosttyTerminalSelectionFormatOptions",
-		size_of(Selection_Format_Options),
-	)
 	check_size(t, types, "GhosttySurfacePosition", size_of(Surface_Position))
 	check_size(t, types, "GhosttySelectionGestureGeometry", size_of(Gesture_Geometry))
+	check_size(t, types, "GhosttyCodepointBuffer", size_of(Codepoint_Buffer))
 
-	// Every named Key must have the value the library gives it
-	keys := types["GhosttyKey"].(json.Object)["values"].(json.Object)
-	for k in Key {
-		name := strings.to_upper(fmt.tprint(k), context.temp_allocator)
-		v, ok := keys[name].(json.Integer)
+	// Every value of the enums we bind must be the one the library gives it
+	check_enum(t, types, "GhosttyResult", Result)
+	check_enum(t, types, "GhosttyStyleColorTag", Style_Color_Tag)
+	check_enum(t, types, "GhosttyCellWide", Cell_Wide)
+	check_enum(t, types, "GhosttyCellData", Cell_Data)
+	check_enum(t, types, "GhosttyTerminalOption", Terminal_Option)
+	check_enum(t, types, "GhosttyTerminalData", Terminal_Data)
+	check_enum(t, types, "GhosttyTerminalScrollViewportTag", Scroll_Viewport_Tag)
+	check_enum(t, types, "GhosttyRenderStateDirty", Render_Dirty)
+	check_enum(t, types, "GhosttyCursorStyle", Cursor_Visual_Style)
+	check_enum(t, types, "GhosttyRenderStateData", Render_Data)
+	check_enum(t, types, "GhosttyRenderStateRowData", Row_Data)
+	check_enum(t, types, "GhosttyRenderStateRowCellsData", Row_Cells_Data)
+	check_enum(t, types, "GhosttyPointTag", Point_Tag)
+	check_enum(t, types, "GhosttyFormatterFormat", Formatter_Format)
+	check_enum(t, types, "GhosttyFormatterOption", Formatter_Option)
+	check_enum(t, types, "GhosttySearchStatus", Search_Status)
+	check_enum(t, types, "GhosttySearchData", Search_Data)
+	check_enum(t, types, "GhosttySearchOption", Search_Option)
+	check_enum(t, types, "GhosttySelectionGestureEventType", Gesture_Event_Type)
+	check_enum(t, types, "GhosttySelectionGestureEventOption", Gesture_Event_Option)
+	check_enum(t, types, "GhosttyKeyAction", Key_Action)
+	check_enum(t, types, "GhosttyKey", Key)
+	check_enum(t, types, "GhosttyMouseAction", Mouse_Action)
+	check_enum(t, types, "GhosttyMouseButton", Mouse_Button)
+	check_enum(t, types, "GhosttyMouseEncoderOption", Mouse_Encoder_Option)
+}
+
+
+// Each named value of E must be in the manifest's enum `name` with the same
+// value (Odin's Ab_Cd is the manifest's AB_CD)
+@(private = "file")
+check_enum :: proc(
+	t: ^testing.T,
+	types: json.Object,
+	name: string,
+	$E: typeid,
+	loc := #caller_location,
+) {
+	desc, found := types[name].(json.Object)
+	testing.expectf(t, found, "%s missing from manifest", name, loc = loc)
+	if !found do return
+
+	values := desc["values"].(json.Object)
+	for field in reflect.enum_fields_zipped(E) {
+		key := strings.to_upper(field.name, context.temp_allocator)
+		v, ok := values[key].(json.Integer)
 		testing.expectf(
 			t,
-			ok && int(v) == int(k),
-			"GhosttyKey %s: manifest %v, ours %d",
+			ok && int(v) == int(field.value),
+			"%s %s: manifest %v, ours %d",
 			name,
-			keys[name],
-			int(k),
+			key,
+			values[key],
+			int(field.value),
+			loc = loc,
 		)
 	}
 }
@@ -127,10 +166,10 @@ test_render_cells :: proc(t: ^testing.T) {
 			}
 
 			cp: [8]u32
-			render_state_row_cells_get(cells, .Graphemes_Buf, &cp)
+			graphemes := Codepoint_Buffer{&cp[0], len(cp), 0}
+			render_state_row_cells_get(cells, .Graphemes_Buf, &graphemes)
 			strings.write_rune(&texts[y], rune(cp[0]))
 			if y == 0 && x == 0 {
-				first_style = init_sized(Style)
 				render_state_row_cells_get(cells, .Style, &first_style)
 			}
 			x += 1
@@ -220,7 +259,8 @@ screen_text :: proc(s: ^Session) -> []string {
 			n: u32
 			render_state_row_cells_get(s.cells, .Graphemes_Len, &n)
 			cp: [8]u32
-			if n > 0 do render_state_row_cells_get(s.cells, .Graphemes_Buf, &cp)
+			graphemes := Codepoint_Buffer{&cp[0], len(cp), 0}
+			if n > 0 do render_state_row_cells_get(s.cells, .Graphemes_Buf, &graphemes)
 			strings.write_rune(&b, n > 0 ? rune(cp[0]) : ' ')
 		}
 		append(&lines, strings.trim_right_space(strings.to_string(b)))
@@ -345,7 +385,7 @@ test_grow_keeps_cursor_row :: proc(t: ^testing.T) {
 // spaces must not become extra rows here
 @(test)
 test_narrow_trims_trailing_spaces :: proc(t: ^testing.T) {
-	when ODIN_OS != .Windows do return
+	when ODIN_OS != .Windows || !GHOSTTY_PATCHED do return
 
 	s: Session
 	session_init(&s, 20, 4, noop, nil)
@@ -363,4 +403,25 @@ test_narrow_trims_trailing_spaces :: proc(t: ^testing.T) {
 	testing.expect_value(t, lines[0], "abcde")
 	testing.expect_value(t, lines[1], "fg")
 	testing.expect_value(t, lines[2], "x")
+}
+
+
+// ConPTY keeps the cursor's row up to the cursor when it rewraps (a prompt
+// ending in a space): the cursor lands where ConPTY puts it
+@(test)
+test_narrow_keeps_cursor_after_spaces :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+
+	s: Session
+	session_init(&s, 20, 4, noop, nil)
+	defer session_destroy(&s)
+	text := "READY\r\nabcdefg     "
+	terminal_vt_write(s.vt, raw_data(text), len(text))
+	session_resize(&s, 5, 4, 10, 20)
+
+	render_state_update(s.render, s.vt)
+	c := init_sized(Render_Cursor)
+	render_state_get(s.render, .Cursor, &c)
+	testing.expect_value(t, c.viewport_y, 3)
+	testing.expect_value(t, c.viewport_x, 2)
 }
