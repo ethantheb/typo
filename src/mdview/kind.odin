@@ -22,6 +22,7 @@ KIND := textedit.Kind {
 	max_scroll   = kind_max_scroll,
 	scroll_step  = kind_scroll_step,
 	reveal       = kind_reveal,
+	anchor       = kind_anchor,
 	same_row     = kind_same_row,
 	move         = kind_move,
 	page_height  = kind_page_height,
@@ -105,13 +106,19 @@ kind_max_scroll :: proc(v: ^textedit.View) -> f64 {
 
 @(private = "file")
 kind_scroll_step :: proc(v: ^textedit.View) -> f64 {
-	return f64(body_line_height())
+	return f64(body_line_height(md(v)))
 }
 
 
 @(private = "file")
 kind_reveal :: proc(v: ^textedit.View) {
 	reveal_caret(md(v))
+}
+
+
+@(private = "file")
+kind_anchor :: proc(v: ^textedit.View) -> textedit.Anchor {
+	return anchor_line(md(v))
 }
 
 
@@ -312,7 +319,7 @@ kind_pointer :: proc(v: ^textedit.View, p: [2]f32, over_text: bool) -> textedit.
 	e := md(v)
 
 	_, _, _, _, on_bar := code_bar_at(e, p)
-	if on_bar || e.mdv.code_drag.active {
+	if on_bar || e.mdv.code_drag.grab != nil {
 		return .Arrow
 	}
 

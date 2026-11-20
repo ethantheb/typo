@@ -2,6 +2,7 @@ package term
 
 import "base:runtime"
 import "core:encoding/json"
+import "core:os"
 import "core:reflect"
 import "core:strings"
 import "core:testing"
@@ -299,6 +300,41 @@ test_session_runs_command :: proc(t: ^testing.T) {
 		found ||= strings.contains(line, "hello-from-pty")
 	}
 	testing.expect(t, found, "command output not on screen")
+}
+
+
+// Variables given to session_spawn reach the shell (replacing one of the same
+// name), and typo's own environment stays as it was
+@(test)
+test_session_environment :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+
+	os.set_env("TYPO_TEST_REPLACED", "old")
+	defer os.unset_env("TYPO_TEST_REPLACED")
+
+	s: Session
+	testing.expect(t, session_init(&s, 80, 10, noop, nil))
+	defer session_destroy(&s)
+	env := []string{"TYPO_TEST_VAR=from-typo", "typo_test_replaced=new"}
+	command := "cmd.exe /c echo [%TYPO_TEST_VAR%] [%TYPO_TEST_REPLACED%] [%COLORTERM%]"
+	testing.expect(t, session_spawn(&s, command, "", env = env))
+
+	exited := false
+	deadline := time.tick_now()
+	for !exited && time.tick_since(deadline) < 10 * time.Second {
+		_, exited = session_pump(&s, 4 * time.Millisecond)
+		time.sleep(5 * time.Millisecond)
+	}
+	testing.expect(t, exited, "process exit was not reported")
+
+	found := false
+	for line in screen_text(&s) {
+		found ||= strings.contains(line, "[from-typo] [new] [truecolor]")
+	}
+	testing.expect(t, found, "the variables are not in the shell's environment")
+
+	own := os.get_env("TYPO_TEST_VAR", context.temp_allocator)
+	testing.expect(t, own == "", "typo's own environment changed")
 }
 
 

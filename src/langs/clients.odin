@@ -10,6 +10,7 @@ package langs
 
 import "core:fmt"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:time"
 
@@ -43,6 +44,19 @@ Client :: struct {
 	restart_at:      Maybe(time.Tick),   // a restart waiting for its delay
 	message:         string,             // owned; the last window/showMessage
 	server_key:      string,             // owned; its server's settings as it started
+}
+
+// A command that installs a server, offered because its program is found
+Install :: struct {
+	command: string,
+	builds:  bool, // compiles the server from source
+}
+
+// How a server can be installed (server_installs)
+Installs :: struct {
+	offered: []Install, // lightest first (temp)
+	needs:   string,    // none offered: what any command needs, e.g. "uv, npm or pip" (temp)
+	known:   bool,      // every command's program has been looked for
 }
 
 // A lookup's answer
@@ -213,7 +227,14 @@ server :: proc(name: string) -> ^Server {
 // command's first word found on PATH; "" if it isn't installed. Not `known`
 // until the lookup thread has answered (`frame` then attaches the open files)
 server_path :: proc(s: ^Server) -> (path: string, known: bool) {
-	name := program_name(s)
+	return program_path(program_name(s))
+}
+
+
+// A program's path: `name` itself if it is a path, else found on PATH; "" if
+// there is none. Not `known` until the lookup thread has answered
+@(private)
+program_path :: proc(name: string) -> (path: string, known: bool) {
 	if name == "" do return "", true
 
 	if answer, found := state.programs[name]; found {
@@ -223,6 +244,51 @@ server_path :: proc(s: ^Server) -> (path: string, known: bool) {
 	state.programs[strings.clone(name)] = {checking = true}
 	lsp.lookup_program(lookups(), name, name)
 	return "", false
+}
+
+
+// The install commands of a server whose programs are found, lightest first.
+// One set up with a path to its program has none
+server_installs :: proc(s: ^Server) -> Installs {
+	timed()
+	if s.path != "" do return {known = true}
+
+	offered := make([dynamic]Install, context.temp_allocator)
+	names := make([dynamic]string, context.temp_allocator)
+	known := true
+
+	for command in lsp.order_installs(s.install) {
+		installer := lsp.installer_for(command)
+		if !slice.contains(names[:], installer.name) {
+			append(&names, installer.name)
+		}
+
+		path, answered := program_path(lsp.command_program(command))
+		if !answered {
+			known = false
+		} else if path != "" {
+			append(&offered, Install{command, installer.builds})
+		}
+	}
+
+	needs := ""
+	if known && len(offered) == 0 {
+		needs = or_list(names[:])
+	}
+	return {offered[:], needs, known}
+}
+
+
+// "a", "a or b", "a, b or c" (temp)
+@(private = "file")
+or_list :: proc(items: []string) -> string {
+	if len(items) <= 1 {
+		return len(items) == 1 ? items[0] : ""
+	}
+
+	last := len(items) - 1
+	start := strings.join(items[:last], ", ", context.temp_allocator)
+	return fmt.tprintf("%s or %s", start, items[last])
 }
 
 
@@ -313,7 +379,7 @@ take_answers :: proc() {
 }
 
 
-@(private = "file")
+@(private)
 forget_answers :: proc(answers: ^map[string]Answer) {
 	for key, answer in answers {
 		delete(key)

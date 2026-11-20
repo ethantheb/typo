@@ -14,6 +14,8 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+import "../buffer"
+
 
 State :: enum {
 	Starting, // the process starting, or initialize sent
@@ -240,10 +242,9 @@ Command :: union {
 
 @(private)
 Open_Command :: struct {
-	uri:      string, // owned
-	language: string, // owned
-	version:  u64,
-	text:     []u8,   // owned
+	uri:      string,          // owned
+	language: string,          // owned
+	text:     buffer.Snapshot, // owned
 }
 
 @(private)
@@ -393,13 +394,12 @@ request_stop :: proc(c: ^Client, stop: Stop_Request) {
 
 // --- Documents ---------------------------------------------------------------------
 
-// Opens a document on the server (once it is running). Takes `text`, which
-// must come from the allocator the client was started with
-client_open :: proc(c: ^Client, uri, language: string, version: u64, text: []u8) {
+// Opens a document on the server (once it is running) at the snapshot's
+// version. Takes the snapshot, which the client's thread reads and releases
+client_open :: proc(c: ^Client, uri, language: string, text: buffer.Snapshot) {
 	push(c, Open_Command {
 		uri      = strings.clone(uri, c.allocator),
 		language = strings.clone(language, c.allocator),
-		version  = version,
 		text     = text,
 	})
 }
@@ -688,7 +688,7 @@ command_destroy :: proc(cmd: ^Command) {
 	case Open_Command:
 		delete(x.uri)
 		delete(x.language)
-		delete(x.text)
+		buffer.snapshot_release(&x.text)
 	case Change_Command:
 		delete(x.uri)
 		for edit in x.edits do delete(edit.text)

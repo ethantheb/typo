@@ -10,6 +10,7 @@ import clay "../vendor/clay-odin"
 import "term"
 import ttf "../vendor/sdl3/ttf"
 import "gfx"
+import "textedit"
 
 // One terminal: a term.Session (libghostty-vt plus a shell on a pty) and the
 // view of it.
@@ -40,6 +41,7 @@ Terminal :: struct {
 	cursor:      term.Render_Cursor,
 	colors:      term.Render_Colors,
 	view:        gfx.Rect, // cell grid area from the last layout
+	zoom:        int,      // the text's size: steps from 100% in textedit.ZOOM_LEVELS
 	cell_w:      f32,
 	cell_h:      f32,
 	marks:       [dynamic]Term_Mark, // search matches in view, set by find
@@ -109,7 +111,14 @@ terminal_start_shell :: proc(t: ^Terminal) {
 		t.command = ""
 	}
 
-	if !term.session_spawn(&t.session, line, g.workspace.root, g.settings.bundled_conpty) {
+	spawned := term.session_spawn(
+		&t.session,
+		line,
+		g.workspace.root,
+		g.settings.bundled_conpty,
+		ipc_shell_env(),
+	)
+	if !spawned {
 		notice := "Could not start the shell. Press Enter to try again."
 		term.session_print_notice(&t.session, notice)
 	}
@@ -237,8 +246,9 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 	if exited do term.session_print_notice(s, "Process exited. Press Enter to restart.")
 	if !visible do return
 
-	t.cell_w = editor_char_width()
-	t.cell_h = f32(editor_line_height())
+	zoom := textedit.zoom_factor(t.zoom)
+	t.cell_w = editor_char_width(zoom)
+	t.cell_h = f32(editor_line_height(zoom))
 
 	if r, ok := element_rect(element); ok {
 		t.view = {
@@ -318,8 +328,9 @@ row_destroy :: proc(row: ^Term_Row) {
 // Reads one row from the render state into its cache: background runs, and
 // text runs that each share a color and font. Blank cells extend the current
 // run as spaces; a wide (2-cell) character, or one drawn by a fallback font,
-// gets a run of its own so its advance can't shift the cells after it. With
-// letter spacing every character does
+// gets a run of its own so its advance can't shift the cells after it, and so
+// does one drawn as shapes (gfx.is_box_glyph). With letter spacing every
+// character does
 @(private = "file")
 build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 	s := &t.session
@@ -409,6 +420,7 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 		bold, underline, strike := attrs.bold, attrs.underline != 0, attrs.strikethrough
 		solo := cells == 2 ||
 		        g.settings.letter_spacing != 0 ||
+		        gfx.is_box_glyph(rune(cps[0])) ||
 		        !gfx.font_has_own_glyph(&gfx.text_system, .Editor, rune(cps[0]))
 		if open {
 			r := &row.runs[len(row.runs) - 1]
@@ -451,9 +463,10 @@ build_row :: proc(t: ^Terminal, row: ^Term_Row) {
 draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	if t.cell_w <= 0 do return
 
-	font := gfx.text_get_font(&gfx.text_system, .Editor, editor_font_size())
+	size := editor_font_size(textedit.zoom_factor(t.zoom))
+	font := gfx.text_get_font(&gfx.text_system, .Editor, size)
 	if font == nil do return
-	bold_font := gfx.text_get_font(&gfx.text_system, .Editor_Bold, editor_font_size())
+	bold_font := gfx.text_get_font(&gfx.text_system, .Editor_Bold, size)
 	if bold_font == nil do bold_font = font
 
 	gfx.push_clip_box(b)
@@ -463,6 +476,8 @@ draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 	adv, lh := t.cell_w * scale, t.cell_h * scale
 	text_dy := math.round((lh - f32(ttf.GetFontHeight(font))) / 2)
 	line_w := max(math.round(scale), 1)
+	box_line := gfx.box_line_width(.Editor, font, adv)
+	boxes: gfx.Box_Batch
 
 	for &row, y in t.rows {
 		ry := math.round(oy + f32(y) * lh)
@@ -486,20 +501,31 @@ draw_terminal :: proc(t: ^Terminal, b: clay.BoundingBox, scale: f32) {
 			gfx.fill_rect(x, ry, sel_w, ry2 - ry, gfx.theme.selection)
 		}
 
-		// Text, with its lines
+		// Text, and the characters drawn as shapes filling their cells
 		for run in row.runs {
 			x := term_cell_x(ox, adv, run.col)
-			run_font := run.bold ? bold_font : font
 			text := string(row.text[run.text[0]:run.text[1]])
-			gfx.draw_text(gfx.text_get(&gfx.text_system, run_font, text), x, ry + text_dy, run.fg)
+			if r, is_box := gfx.box_glyph_in(text); is_box {
+				w := term_cell_x(ox, adv, run.end_col) - x
+				gfx.box_batch_add(&boxes, r, x, ry, w, ry2 - ry, box_line, run.fg)
+				continue
+			}
 
+			run_font := run.bold ? bold_font : font
+			gfx.draw_text(gfx.text_get(&gfx.text_system, run_font, text), x, ry + text_dy, run.fg)
+		}
+		gfx.box_batch_draw(&boxes)
+
+		// Their lines
+		for run in row.runs {
+			x := term_cell_x(ox, adv, run.col)
 			w := term_cell_x(ox, adv, run.end_col) - x
 			if run.underline do gfx.fill_rect(x, ry2 - 2 * line_w, w, line_w, run.fg)
 			if run.strike do gfx.fill_rect(x, math.round((ry + ry2) / 2), w, line_w, run.fg)
 		}
 	}
 
-	draw_cursor(t, font, ox, oy, adv, lh, text_dy, line_w)
+	draw_cursor(t, font, ox, oy, adv, lh, text_dy, line_w, box_line)
 }
 
 
@@ -510,8 +536,13 @@ term_cell_x :: proc(ox, adv: f32, col: int) -> f32 {
 }
 
 
+// The cursor; `box_line` is the line width of characters drawn as shapes
 @(private = "file")
-draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, line_w: f32) {
+draw_cursor :: proc(
+	t: ^Terminal,
+	font: ^ttf.Font,
+	ox, oy, adv, lh, text_dy, line_w, box_line: f32,
+) {
 	c := t.cursor
 	if !c.visible || !c.viewport_has_value || int(c.viewport_y) >= len(t.rows) {
 		return
@@ -540,7 +571,9 @@ draw_cursor :: proc(t: ^Terminal, font: ^ttf.Font, ox, oy, adv, lh, text_dy, lin
 	switch style {
 	case .Block:
 		gfx.fill_rect(x, y, w, h, color)
-		if glyph != 0 {
+		if gfx.is_box_glyph(glyph) {
+			gfx.draw_box_glyph(glyph, x, y, w, h, box_line, to_color(t.colors.background))
+		} else if glyph != 0 {
 			buf, n := utf8.encode_rune(glyph)
 			text := gfx.text_get(&gfx.text_system, font, string(buf[:n]))
 			gfx.draw_text(text, x, y + text_dy, to_color(t.colors.background))

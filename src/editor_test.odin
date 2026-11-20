@@ -111,6 +111,83 @@ test_movement :: proc(t: ^testing.T) {
 }
 
 
+// The text view scrolls sideways as far as the widest line it has shown, with
+// room for the caret: lines come into view or under the caret, follow the
+// lines edited above them, and an edit to the widest line has it measured again
+@(test)
+test_sideways_scrolling :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	long := strings.repeat("x", 200, context.temp_allocator)
+	short := strings.repeat("s\n", 10, context.temp_allocator)
+	e := make_editor(strings.concatenate({short, long, "\nend"}, context.temp_allocator))
+	defer destroy_editor(&e)
+	editor_attach(&e)
+
+	g.settings.line_height = 1.4
+	e.char_w = editor_char_width(textedit.zoom(&e))
+	e.view = {0, 0, 400, f32(text_line_height(&e) * 2)}
+
+	// The long line (10) is out of view
+	next_frame(&e)
+	testing.expect_value(t, sideways(&e), 0)
+
+	// The caret goes to its end
+	end := buffer.line_end(&e.buf, 10)
+	textedit.set_single_selection(&e, {end, end, -1})
+	e.kind.reveal(&e)
+	text_w := e.view.w - e.gutter_w - TEXT_MARGIN - 2 * e.char_w
+	testing.expect_value(t, sideways(&e), 200 * e.char_w - text_w)
+	testing.expect(t, e.target_x > 0)
+
+	// Typing on it widens it
+	editor_text_input(&e, "y")
+	next_frame(&e)
+	testing.expect_value(t, sideways(&e), 201 * e.char_w - text_w)
+
+	// Deleting its text narrows it
+	start := buffer.line_start(&e.buf, 10)
+	textedit.set_single_selection(&e, {start, end + 1, -1})
+	editor_handle_key(&e, {key = sdl.K_BACKSPACE})
+	next_frame(&e)
+	testing.expect_value(t, sideways(&e), 0)
+
+	// Back, then lines added above it
+	textedit.undo(&e)
+	next_frame(&e)
+	testing.expect_value(t, e.widest.line, 10)
+	testing.expect_value(t, e.widest.cols, 201)
+	textedit.set_single_selection(&e, {0, 0, -1})
+	editor_handle_key(&e, {key = sdl.K_RETURN})
+	editor_handle_key(&e, {key = sdl.K_RETURN})
+	textedit.take_changes(&e)
+	testing.expect_value(t, e.widest.line, 12)
+	testing.expect_value(t, e.widest.cols, 201)
+
+	// A tab and wide characters count as columns, not bytes
+	end = buffer.line_end(&e.buf, 12)
+	textedit.set_single_selection(&e, {end, end, -1})
+	editor_text_input(&e, "\té")
+	next_frame(&e)
+	testing.expect_value(t, e.widest.cols, 205) // the tab to 204
+}
+
+
+// What an editor's frame does with the edits and the lines in view before it
+// scrolls
+@(private = "file")
+next_frame :: proc(e: ^Editor) {
+	textedit.take_changes(e)
+	e.kind.frame_begin(e)
+}
+
+
+@(private = "file")
+sideways :: proc(e: ^Editor) -> f32 {
+	max_x, _ := editor_sideways(e)
+	return max_x
+}
+
+
 @(test)
 test_shell_display_name :: proc(t: ^testing.T) {
 	git_bash := `"C:\Program Files\Git\bin\bash.exe" --login`
@@ -183,6 +260,7 @@ shell = "  bash  "
 [keybindings]
 save = ["Ctrl+Shift+S", "F2"]
 undo = "Nonsense+Q"
+go_back = ["Alt+Left", "ctrl+mouse4"]
 `)
 
 	// Load
@@ -198,6 +276,7 @@ undo = "Nonsense+Q"
 	testing.expect_value(t, s.letter_spacing, 1.0)
 	testing.expect_value(t, s.terminal_shell, "bash")
 	testing.expect_value(t, bindings_label(s.bindings[.Save], " "), "Ctrl+Shift+S F2")
+	testing.expect_value(t, bindings_label(s.bindings[.Go_Back], " "), "Alt+Left Ctrl+Mouse4")
 	testing.expect(t, strings.contains(s.error, "font.size"))
 	testing.expect(t, strings.contains(s.error, "Nonsense+Q"))
 
@@ -220,6 +299,30 @@ undo = "Nonsense+Q"
 }
 
 
+// Chords name a key or a mouse side button; the side buttons go back and forward
+@(test)
+test_mouse_button_chords :: proc(t: ^testing.T) {
+	back, back_ok := parse_chord("Mouse4")
+	testing.expect(t, back_ok)
+	testing.expect_value(t, back, Chord{button = sdl.BUTTON_X1})
+	testing.expect_value(t, format_chord(back), "Mouse4")
+
+	forward, forward_ok := parse_chord("Shift+mouse5")
+	testing.expect(t, forward_ok)
+	testing.expect_value(t, forward, Chord{button = sdl.BUTTON_X2, shift = true})
+	testing.expect_value(t, format_chord(forward), "Shift+Mouse5")
+
+	// The buttons that click aren't chords
+	_, left_ok := parse_chord("Mouse1")
+	testing.expect(t, !left_ok)
+	_, left_is_chord := chord_from_button(sdl.BUTTON_LEFT)
+	testing.expect(t, !left_is_chord)
+
+	testing.expect_value(t, bindings_label(default_bindings(.Go_Back), " "), "Alt+Left Mouse4")
+	testing.expect_value(t, bindings_label(default_bindings(.Go_Forward), " "), "Alt+Right Mouse5")
+}
+
+
 @(test)
 test_number_settings :: proc(t: ^testing.T) {
 	s: Settings
@@ -238,6 +341,40 @@ test_number_settings :: proc(t: ^testing.T) {
 	testing.expect_value(t, format_decimal(0), "0.0")
 	testing.expect_value(t, format_decimal(-0.25), "-0.25")
 	testing.expect_value(t, format_decimal(2), "2.0")
+}
+
+
+// Keys whose names end in '+' (zoom in), with modifiers, and back from their
+// names as saved
+@(test)
+test_chords_with_plus :: proc(t: ^testing.T) {
+	Case :: struct {
+		text:  string,
+		chord: Chord,
+	}
+
+	// SDL names '+' by the layout's key for it ('=' where it is Shift+=)
+	plus := sdl.GetKeyFromName("+")
+	cases := [?]Case {
+		{"Ctrl++", {key = plus, ctrl = true}},
+		{"Ctrl+Keypad +", {key = sdl.K_KP_PLUS, ctrl = true}},
+		{"Ctrl+Shift+=", {key = '=', ctrl = true, shift = true}},
+		{"Keypad -", {key = sdl.K_KP_MINUS}},
+		{"+", {key = plus}},
+	}
+	for c in cases {
+		chord, ok := parse_chord(c.text)
+		testing.expect(t, ok, c.text)
+		testing.expect_value(t, chord, c.chord)
+
+		again, again_ok := parse_chord(format_chord(chord))
+		testing.expect(t, again_ok && again == chord, c.text)
+	}
+
+	for text in ([?]string{"Ctrl+", "", "Ctrl+Nonsense+A"}) {
+		_, ok := parse_chord(text)
+		testing.expect(t, !ok, text)
+	}
 }
 
 

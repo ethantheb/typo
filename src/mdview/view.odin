@@ -67,9 +67,8 @@ State :: struct {
 	// The mouse is selecting a rectangle of table cells (cell_drag)
 	cell_drag:     bool,
 	code_drag:     struct {
-		active: bool,
-		last:   int, // the block's last line, which holds its scroll bar
-		grab:   f32, // pointer x minus the thumb's left when the drag began
+		last: int,         // the block's last line, which holds its scroll bar
+		grab: Maybe(f32),  // pointer x minus the thumb's left while dragging
 	},
 
 	// Caches for the document, cleared when it or the fonts change, then memo:
@@ -156,7 +155,7 @@ set_mode :: proc(e: ^View, mode: Mode) {
 	mv := &e.mdv
 	top: int
 	if mode == .Rendered {
-		top = int(e.scroll_y) / env.config().text_line_height
+		top = int(e.scroll_y) / env.text_line_height(e)
 	} else {
 		top, _ = hm_find(&mv.heights, e.scroll_y)
 	}
@@ -175,7 +174,7 @@ set_mode :: proc(e: ^View, mode: Mode) {
 		check_heights(e)
 		textedit.scroll_to(e, top == 0 ? 0 : hm_y(&mv.heights, top))
 	} else {
-		textedit.scroll_to(e, f64(top * env.config().text_line_height))
+		textedit.scroll_to(e, f64(top * env.text_line_height(e)))
 	}
 	e.reveal = true
 }
@@ -218,7 +217,7 @@ begin_caches :: proc(e: ^View) {
 		e.md.refdef_gen,
 		gfx.text_system.generation,
 		u64(transmute(u32)gfx.scale),
-		u64(env.config().font_size),
+		u64(font_size(e)),
 		transmute(u64)env.config().line_height,
 	}
 	h := hash.fnv64a(mem.slice_to_bytes(doc[:]))
@@ -308,13 +307,15 @@ hold_reveal :: proc(e: ^View) {
 
 // --- Frame -----------------------------------------------------------------------------
 
-// Places the text column in the view
+// Places the text column in the view; its widest is scaled with the text
 @(private)
 column :: proc(e: ^View) {
 	mv := &e.mdv
 	avail := max(e.view.w - 2 * COLUMN_PAD, 120)
 	w := avail
-	if env.config().max_width > 0 do w = min(f32(env.config().max_width), avail)
+
+	max_width := f32(env.config().max_width) * textedit.zoom(e)
+	if max_width > 0 do w = min(math.round(max_width), avail)
 
 	mv.col_w = math.round(w)
 	mv.col_x = math.round((e.view.w - w) / 2)
@@ -328,57 +329,80 @@ check_heights :: proc(e: ^View) {
 	m := &mv.measured
 	n := buffer.line_count(&e.buf)
 
-	config := env.config()
+	size := int(font_size(e))
+	line_height := env.config().line_height
 	unchanged := m.col_w == mv.col_w &&
 	             m.generation == gfx.text_system.generation &&
-	             m.size == config.font_size &&
-	             m.line_height == config.line_height &&
+	             m.size == size &&
+	             m.line_height == line_height &&
 	             mv.heights.lines == n
 	if unchanged do return
 
-	m^ = {mv.col_w, gfx.text_system.generation, config.font_size, config.line_height}
+	m^ = {mv.col_w, gfx.text_system.generation, size, line_height}
 	hm_destroy(&mv.heights)
-	mv.heights.pad = math.round(f64(body_line_height()))
+	mv.heights.pad = math.round(f64(body_line_height(e)))
 
+	sizes := estimate_sizes(e)
 	est := make([]f32, n, context.temp_allocator)
-	for &h, i in est do h = estimate(e, i)
+	for &h, i in est do h = estimate(e, &sizes, i)
 	hm_splice(&mv.heights, 0, 0, est)
 }
 
 
+// The heights a line's estimate picks from, the same for every line
+@(private = "file")
+Estimate_Sizes :: struct {
+	body:     f32,    // a row of body text
+	code:     f32,    // a row of code
+	fence:    f32,    // a code block's first or last line
+	headings: [6]f32, // a heading line, by level, its space above and below included
+	per_row:  f32,    // characters on a wrapped row of text
+}
+
+
+@(private = "file")
+estimate_sizes :: proc(e: ^View) -> (s: Estimate_Sizes) {
+	size := f32(font_size(e))
+	s.body = math.round(size * line_factor())
+	s.code = math.round(f32(code_size(font_size(e))) * CODE_LINE_FACTOR)
+	s.fence = fence_row_height(e)
+	s.per_row = max(e.mdv.col_w / (size * 0.48), 1)
+
+	for &h, i in s.headings {
+		level := u8(i + 1)
+		top, bottom := heading_pads(e, level)
+		row := math.round(f32(heading_size(e, level)) * f32(HEADING_LINE_FACTOR))
+		h = top + row + bottom
+	}
+	return
+}
+
+
 // A line's height before it is laid out, from its kind and length
-@(private)
-estimate :: proc(e: ^View, i: int) -> f32 {
-	size := f32(font_size())
-	body := math.round(size * line_factor())
-	if i >= len(e.md.lines) do return body
+@(private = "file")
+estimate :: proc(e: ^View, s: ^Estimate_Sizes, i: int) -> f32 {
+	if i >= len(e.md.lines) do return s.body
 
 	l := e.md.lines[i]
-	code := math.round(f32(code_size(font_size())) * CODE_LINE_FACTOR)
-
 	#partial switch l.kind {
 	case .Blank:
-		return body
+		return s.body
 	case .Atx_Heading:
-		top, bottom := heading_pads(l.aux)
-		hs := f32(heading_size(l.aux))
-		row := math.round(hs * f32(HEADING_LINE_FACTOR))
-		return top + row + bottom
+		return s.headings[clamp(int(l.aux), 1, 6) - 1]
 	case .Fence_Open, .Fence_Close, .Math_Fence, .Front_Matter_Fence:
-		return fence_row_height()
+		return s.fence
 	case .Setext_Underline:
 		return SETEXT_ROW
 	case .Fence_Body, .Indented_Code, .Html, .Math_Body, .Front_Matter_Body:
-		return code
+		return s.code
 	case .Table_Delim:
 		return 1
 	case .Table_Row:
-		return body + 2 * CELL_VPAD
+		return s.body + 2 * CELL_VPAD
 	}
 
 	// Text: wrapped rows of an average character width
-	per_row := max(e.mdv.col_w / (size * 0.48), 1)
-	return body * max(math.ceil(f32(l.len) / per_row), 1)
+	return s.body * max(math.ceil(f32(l.len) / s.per_row), 1)
 }
 
 
@@ -398,7 +422,7 @@ edit :: proc(e: ^View, changes: []buffer.Change) {
 		shift_line_keys(&e.mdv.wide_tables, c.start.row, c.old_end.row, delta)
 
 		est := make([]f32, inserted, context.temp_allocator)
-		for &h in est do h = math.round(body_line_height())
+		for &h in est do h = math.round(body_line_height(e))
 		hm_splice(&e.mdv.heights, c.start.row + 1, removed, est)
 	}
 }
@@ -446,15 +470,29 @@ frame_begin :: proc(e: ^View) {
 
 
 // Lays out the visible lines, putting their real heights in the height map,
-// and keeps the top line where it was on screen
+// and keeps the top line where it was on screen (the view's anchor instead,
+// when one is set)
 @(private)
 layout_visible :: proc(e: ^View) {
 	mv := &e.mdv
 	hm := &mv.heights
 	if hm.lines == 0 do return
 
+	// The anchor, placed with the estimated heights first so the lines laid
+	// out are the ones that will be in view
+	a, anchored := e.anchor.?
+	if anchored {
+		e.anchor = nil
+		a.line = clamp(a.line, 0, hm.lines - 1)
+		textedit.scroll_to(e, max(hm_y(hm, a.line) - a.y, 0))
+	}
+
+	// The line kept in place, and how far the view's top is below its top
 	top, top_y := hm_find(hm, e.scroll_y)
-	offset := e.scroll_y - top_y
+	kept, offset := top, e.scroll_y - top_y
+	if anchored {
+		kept, offset = a.line, e.scroll_y - hm_y(hm, a.line)
+	}
 
 	// Lay out from the line above the top to the bottom of the view
 	line := max(top - 1, 0)
@@ -467,12 +505,33 @@ layout_visible :: proc(e: ^View) {
 		line += 1
 	}
 
-	// Keep the top line in place
-	delta := hm_y(hm, top) + offset - e.scroll_y
-	if delta != 0 {
+	// Keep that line in place
+	delta := hm_y(hm, kept) + offset - e.scroll_y
+	if anchored {
+		textedit.scroll_to(e, max(e.scroll_y + delta, 0))
+	} else if delta != 0 {
 		e.scroll_y += delta
 		e.target_y += delta
 	}
+}
+
+
+// The caret's line if it shows and is in view, else the top line
+@(private)
+anchor_line :: proc(e: ^View) -> textedit.Anchor {
+	hm := &e.mdv.heights
+	if hm.lines == 0 do return {}
+
+	if !e.mdv.caretless {
+		line := buffer.offset_to_line(&e.buf, e.sels[e.primary].head)
+		y := hm_y(hm, line) - e.scroll_y
+		if y >= 0 && y + f64(hm_get(hm, line)) <= f64(e.view.h) {
+			return {line, y}
+		}
+	}
+
+	top, top_y := hm_find(hm, e.scroll_y)
+	return {top, top_y - e.scroll_y}
 }
 
 
@@ -638,7 +697,8 @@ move_page :: proc(e: ^View, s: Selection, dir: int) -> (head, col: int) {
 
 @(private)
 page_height :: proc(e: ^View) -> f64 {
-	return max(f64(e.view.h) - f64(body_line_height()), f64(body_line_height()))
+	body := f64(body_line_height(e))
+	return max(f64(e.view.h) - body, body)
 }
 
 
@@ -780,7 +840,7 @@ reveal_caret :: proc(e: ^View) {
 	bottom := top + f64(r.h)
 	ty := e.target_y
 	h := f64(e.view.h)
-	margin := f64(body_line_height())
+	margin := f64(body_line_height(e))
 	outside := top < ty || bottom > ty + h
 	switch {
 	case outside && e.center: ty = (top + bottom) / 2 - h / 2
@@ -797,7 +857,7 @@ reveal_caret :: proc(e: ^View) {
 	at := e.sels[e.primary].head - c.start
 	if at < content do return
 
-	cw := gfx.text_char_width(&gfx.text_system, .Editor, code_size(font_size()))
+	cw := gfx.text_char_width(&gfx.text_system, .Editor, code_size(font_size(e)))
 	x := f32(textedit.visual_col(c.text[content:], at - content)) * cw
 	width, box := code_widths(e, b)
 	scroll := e.mdv.code_scroll[b.first]

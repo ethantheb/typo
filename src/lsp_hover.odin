@@ -495,10 +495,11 @@ is_list_item :: proc(s: string) -> bool {
 }
 
 
-// Lines of code in the editor font, colored by the language's lexer
+// Lines of code in the editor font, colored by the language's lexer. The popup
+// is interface: it keeps its size when the pane zooms
 @(private = "file")
 code_block :: proc(lines: []string, lang: syntax.Language) {
-	size := max(editor_font_size(), 11) - 1
+	size := max(editor_font_size(1), 11) - 1
 	rules := syntax.rules_for(lang)
 	state: syntax.Lex_State
 

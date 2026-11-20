@@ -26,7 +26,7 @@ Find_Option :: enum {
 Find :: struct {
 	open:     bool,
 	pane:     ^Pane, // the pane searched
-	typing:   bool,  // keys go to the field, not the pane
+	typing:   bool,  // the field has the keys (see find_has_keys)
 	edit:     Line_Edit,
 	options:  bit_set[Find_Option],
 
@@ -64,21 +64,6 @@ FIND_COMMANDS :: bit_set[Command]{
 	.Find_Regex,
 }
 
-// Editing commands that would act on the pane behind the field
-@(private = "file")
-EDIT_COMMANDS :: bit_set[Command]{
-	.Undo,
-	.Redo,
-	.Select_All,
-	.Copy,
-	.Cut,
-	.Paste,
-	.Add_Cursor_Above,
-	.Add_Cursor_Below,
-	.Move_Line_Up,
-	.Move_Line_Down,
-}
-
 
 // --- Opening and closing -----------------------------------------------------------
 
@@ -110,8 +95,7 @@ find_open :: proc() -> bool {
 	}
 
 	// The whole query is selected, so typing replaces it
-	query := line_edit_string(&f.edit)
-	line_edit_set(&f.edit, query, 0, len(query))
+	line_edit_select_all(&f.edit)
 
 	find_restart(f, jump = true)
 	return true
@@ -138,33 +122,43 @@ find_destroy :: proc() {
 
 	delete(g.find.query)
 	delete(g.find.matches)
-	delete(g.find.edit.text)
+	line_edit_destroy(&g.find.edit)
 }
 
 
-// Whether the pointer is over the bar, which keeps the pane under it from
-// taking the mouse
-find_bar_hovered :: proc(p: ^Pane) -> bool {
-	return g.find.open && g.find.pane == p && pointer_in(clay.ID("FindBar"))
+// Whether the pointer is over the bar, which keeps what is under it from
+// taking the mouse (see ui_interactive)
+find_bar_covers_pointer :: proc() -> bool {
+	return g.find.open && pointer_in(clay.ID("FindBar"))
+}
+
+
+// Whether keys go to the field: it was last given them, and its pane is the
+// focused one
+find_has_keys :: proc() -> bool {
+	f := &g.find
+	return f.open && f.typing && f.pane == g.panes.focused
 }
 
 
 // --- Per frame ---------------------------------------------------------------------
 
-// Before the panes' frames: focus moves between the field and the pane with the
-// mouse, and the search takes its next step
+// Before the panes' frames: the field's keyboard focus follows the focused pane,
+// and the search takes its next step
 find_frame :: proc() {
 	f := &g.find
 	if !f.open do return
 
-	// A press on the field types in it; one elsewhere in the pane goes to the pane
-	if g.mouse_pressed && ui_interactive() {
-		if pointer_in(clay.ID("FindField")) {
-			f.typing = true
-		} else if pointer_in(pane_id(f.pane)) && !pointer_in(clay.ID("FindBar")) {
-			f.typing = false
-		}
+	// A press in the pane outside the bar gives the keys to the pane (a press
+	// on the field gives them back: find_field)
+	pressed := g.mouse_pressed || g.right_pressed
+	if pressed && ui_interactive() && pointer_in(pane_id(f.pane)) {
+		f.typing = false
 	}
+
+	// Focusing another pane takes the keys from the field for good; the bar
+	// stays on its pane until the field is clicked or Find runs elsewhere
+	if f.pane != g.panes.focused do f.typing = false
 
 	switch c in f.pane.content {
 	case ^Editor:   find_editor_frame(f, c)
@@ -512,7 +506,9 @@ find_run_command :: proc(cmd: Command) -> bool {
 		return find_open()
 
 	case .Find_Next, .Find_Previous:
-		if !f.open && !find_open() {
+		// In the focused pane: the bar opens there, or moves there from another
+		elsewhere := f.open && f.pane != g.panes.focused
+		if (!f.open || elsewhere) && !find_open() {
 			return false
 		}
 		return find_step(cmd == .Find_Next ? +1 : -1)
@@ -531,13 +527,14 @@ find_run_command :: proc(cmd: Command) -> bool {
 }
 
 
-// Keys while typing in the field; it takes them all. In the editor searched,
-// Escape closes the bar too (a terminal's Escape goes to its program)
+// Keys while the field has them; it takes them all, letting through shortcuts
+// that don't act on the pane behind it. In the editor searched, Escape closes
+// the bar too (a terminal's Escape goes to its program)
 find_handle_event :: proc(event: ^sdl.Event) -> bool {
 	f := &g.find
 	if !f.open do return false
 
-	if !f.typing {
+	if !find_has_keys() {
 		escape := event.type == .KEY_DOWN && event.key.key == sdl.K_ESCAPE
 		in_editor := f.pane == g.panes.focused && is_editor(f.pane)
 		if escape && in_editor {
@@ -568,8 +565,7 @@ find_handle_event :: proc(event: ^sdl.Event) -> bool {
 	cmd, is_command := command_for_key(key)
 	if is_command && cmd in FIND_COMMANDS {
 		if cmd == .Find {
-			query := line_edit_string(&f.edit)
-			line_edit_set(&f.edit, query, 0, len(query))
+			line_edit_select_all(&f.edit)
 		} else {
 			find_run_command(cmd)
 		}
@@ -579,7 +575,7 @@ find_handle_event :: proc(event: ^sdl.Event) -> bool {
 	handled, _ := line_edit_event(&f.edit, event)
 	if handled do return true
 
-	if is_command && cmd not_in EDIT_COMMANDS {
+	if is_command && field_lets_through(cmd) {
 		run_command(cmd)
 	}
 	return true
@@ -594,6 +590,9 @@ find_bar_ui :: proc(p: ^Pane) {
 	if !f.open || f.pane != p {
 		return
 	}
+
+	g.in_find_bar = true
+	defer g.in_find_bar = false
 
 	if clay.UI(clay.ID("FindBar"))({
 		layout = {
@@ -647,36 +646,26 @@ find_bar_ui :: proc(p: ^Pane) {
 }
 
 
-// The query field: an editable line while typing, else the query
+// The query field, with the caret while it has the keys. A press on it gives
+// it the keys and focuses its pane
 @(private = "file")
 find_field :: proc() {
 	f := &g.find
-
-	edge := gfx.theme.border
-	if f.typing do edge = gfx.theme.accent
-	if f.invalid do edge = gfx.theme.error
-
-	if clay.UI(clay.ID("FindField"))({
-		layout = {
-			sizing = {clay.SizingFixed(FIND_FIELD_WIDTH), clay.SizingFixed(24)},
-			padding = {left = 6, right = 6},
-			childAlignment = {y = .Center},
-		},
-		backgroundColor = gfx.theme.bg,
-		cornerRadius = clay.CornerRadiusAll(5),
-		border = {color = edge, width = clay.BorderOutside(1)},
-		clip = {horizontal = true},
-	}) {
-		query := line_edit_string(&f.edit)
-		switch {
-		case f.typing:
-			line_edit_ui(&f.edit, FONT_SIZE_SMALL, gfx.theme.text_bright)
-		case query == "":
-			label("Find", gfx.theme.text_faint, FONT_SIZE_SMALL)
-		case:
-			label(query, gfx.theme.text, FONT_SIZE_SMALL)
-		}
+	id := clay.ID("FindField")
+	if clicked(id) {
+		pane_focus(f.pane)
+		f.typing = true
 	}
+
+	look := Field_Look{
+		width   = FIND_FIELD_WIDTH,
+		height  = 24,
+		size    = FONT_SIZE_SMALL,
+		padding = 6,
+	}
+	if f.invalid do look.edge = gfx.theme.error
+
+	text_field(id, &f.edit, "Find", find_has_keys(), look)
 }
 
 

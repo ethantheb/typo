@@ -136,8 +136,9 @@ collect :: proc(b: ^Buffer, t: u32, out: ^[dynamic]Piece) {
 
 
 // If the last piece of t is the most recent text in the add store, grows it by
-// `piece` (which must directly follow it) and returns true. This makes
-// sequential typing extend one node instead of creating one per keystroke
+// `piece` (which must directly follow it in the same block) and returns true.
+// This makes sequential typing extend one node instead of creating one per
+// keystroke
 @(private)
 try_extend_last :: proc(b: ^Buffer, t: u32, piece: Piece) -> bool {
 	if t == NIL do return false
@@ -148,6 +149,11 @@ try_extend_last :: proc(b: ^Buffer, t: u32, piece: Piece) -> bool {
 	} else {
 		p := &n.piece
 		if p.source != .Added || p.start + p.length != piece.start {
+			return false
+		}
+
+		// A piece never spans two blocks
+		if piece.start == block_end(&b.stores[.Added], p.start) {
 			return false
 		}
 		p.length += piece.length

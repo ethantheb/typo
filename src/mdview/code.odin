@@ -31,7 +31,7 @@ code_block_at :: proc(e: ^View, i: int) -> (block: ^Code_Block, ok: bool) {
 code_widths :: proc(e: ^View, b: ^Code_Block) -> (width, box: f32) {
 	// Measure the first 2000 lines once
 	if !b.measured {
-		cw := gfx.text_char_width(&gfx.text_system, .Editor, code_size(font_size()))
+		cw := gfx.text_char_width(&gfx.text_system, .Editor, code_size(font_size(e)))
 		cols := 0
 		for line in b.first ..= min(b.last, b.first + 2000) {
 			text, _ := line_text(e, line)
@@ -72,9 +72,9 @@ code_bar :: proc(e: ^View, line: int) -> (track, thumb: gfx.Rect, first: int, ok
 	track = {track_x, track_y, box, 3}
 
 	// The thumb, sized by how much of the code shows
-	tw := max(box * box / width, 24)
-	thumb_x := track.x + (box - tw) * mv.code_scroll[b.first] / (width - box)
-	thumb = {thumb_x, track.y, tw, track.h}
+	scroll := f64(mv.code_scroll[b.first])
+	max_scroll := f64(width - box)
+	thumb = gfx.scrollbar_thumb(track, .Horizontal, scroll, max_scroll, f64(box), 24) or_return
 
 	return track, thumb, b.first, true
 }
@@ -110,38 +110,32 @@ code_bar_at :: proc(
 @(private)
 code_bar_mouse :: proc(e: ^View) -> bool {
 	d := &e.mdv.code_drag
+	input := env.input()
+	pointer := gfx.Pointer_State{input.mouse_pos, input.mouse_pressed, input.mouse_down}
 
-	// A press on a scroll bar starts the drag
-	if !d.active {
-		if !env.input().mouse_pressed do return false
+	// Only a press on a scroll bar starts a drag, of its block's bar
+	if d.grab == nil {
+		if !pointer.pressed do return false
 
-		mouse := env.input().mouse_pos
-		_, thumb, _, last, ok := code_bar_at(e, mouse)
-		if !ok do return false
-
-		// Clicking the track centres the thumb there
-		grab := gfx.rect_contains(thumb, mouse) ? mouse.x - thumb.x : thumb.w / 2
-		d^ = {true, last, grab}
-	}
-
-	if !env.input().mouse_down {
-		d.active = false
-		return true
+		_, _, _, last, on_bar := code_bar_at(e, pointer.pos)
+		if !on_bar do return false
+		d.last = last
 	}
 
 	track, thumb, first, ok := code_bar(e, d.last)
 	if !ok {
-		d.active = false
-		return true
+		d.grab = nil
+		return false
 	}
 
 	// Scroll to where the thumb is dragged
 	b, _ := code_block_at(e, first)
 	width, box := code_widths(e, b)
-	thumb_x := env.input().mouse_pos.x - d.grab - track.x
-	frac := clamp(thumb_x / max(track.w - thumb.w, 1), 0, 1)
-	set_code_scroll(e, first, frac * (width - box))
-	return true
+	grab_area := code_bar_grab_area(track)
+	max_x := f64(width - box)
+	x, active := gfx.scrollbar_drag(&d.grab, track, thumb, grab_area, .Horizontal, max_x, pointer)
+	if active do set_code_scroll(e, first, f32(x))
+	return active
 }
 
 

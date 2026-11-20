@@ -22,7 +22,7 @@ Server_Override :: struct {
 	languages:    []string,
 	extensions:   []string, // of a language typo doesn't know (the first of `languages`)
 	root_markers: []string,
-	install:      Maybe(string),
+	install:      Maybe([]string), // replaces the built-in commands; set and empty: none
 	settings:     string, // JSON; "" keeps the built-in
 	init_options: string, // JSON; "" keeps the built-in
 }
@@ -54,7 +54,7 @@ server_override_destroy :: proc(o: ^Server_Override) {
 	delete_strings(o.extensions)
 	delete_strings(o.root_markers)
 	if install, ok := o.install.?; ok {
-		delete(install)
+		delete_strings(install)
 	}
 	delete(o.settings)
 	delete(o.init_options)
@@ -131,7 +131,7 @@ override_field_text :: proc(o: ^Server_Override, field: Server_Field) -> string 
 	case .Languages:    return list_text(o.languages)
 	case .Extensions:   return list_text(o.extensions)
 	case .Root_Markers: return list_text(o.root_markers)
-	case .Install:      return o.install.? or_else ""
+	case .Install:      return install_text(o.install.? or_else nil)
 	}
 	return ""
 }
@@ -146,7 +146,7 @@ spec_field_text :: proc(spec: lsp.Server_Spec, field: Server_Field) -> string {
 	case .Languages:    return list_text(spec.languages)
 	case .Extensions:   return ""
 	case .Root_Markers: return list_text(spec.root_markers)
-	case .Install:      return spec.install
+	case .Install:      return install_text(spec.install)
 	}
 	return ""
 }
@@ -175,10 +175,12 @@ set_override_field_text :: proc(o: ^Server_Override, field: Server_Field, text: 
 		o.root_markers = split_list(text)
 	case .Install:
 		if install, ok := o.install.?; ok {
-			delete(install)
+			delete_strings(install)
 		}
 		o.install = nil
-		if text != "" do o.install = strings.clone(text)
+
+		commands := split_list(text, sep = ";")
+		if commands != nil do o.install = commands
 	}
 }
 
@@ -222,6 +224,13 @@ list_text :: proc(list: []string) -> string {
 }
 
 
+// Install commands, separated by semicolons
+@(private = "file")
+install_text :: proc(commands: []string) -> string {
+	return strings.join(commands, "; ", context.temp_allocator)
+}
+
+
 // A command line's words (see command_text), owned; nil for none
 split_command :: proc(text: string) -> []string {
 	words := make([dynamic]string)
@@ -253,11 +262,11 @@ split_command :: proc(text: string) -> []string {
 }
 
 
-// Items separated by commas, trimmed, the empty ones left out; owned, nil for
-// none. `strip` is taken off the front of each item
-split_list :: proc(text: string, lower := false, strip := "") -> []string {
+// Items separated by commas (or `sep`), trimmed, the empty ones left out; owned,
+// nil for none. `strip` is taken off the front of each item
+split_list :: proc(text: string, lower := false, strip := "", sep := ",") -> []string {
 	list := make([dynamic]string)
-	for part in strings.split(text, ",", context.temp_allocator) {
+	for part in strings.split(text, sep, context.temp_allocator) {
 		item := strings.trim_space(part)
 		if strip != "" do item = strings.trim_left(item, strip)
 		if item == "" do continue
@@ -328,8 +337,8 @@ set_override_field :: proc(o: ^Server_Override, key: string, value: toml.Value) 
 	case "root_markers":
 		o.root_markers = toml_strings(value) or_return
 	case "install":
-		str := value.(string) or_return
-		o.install = strings.clone(str)
+		// One command line, or a list of them
+		o.install = toml_strings(value) or_return
 	case "settings":
 		o.settings = toml_to_json(value)
 	case "init_options":
@@ -426,7 +435,9 @@ write_server_overrides :: proc(sb: ^strings.Builder, list: []Server_Override) {
 			append(&lines, Line{"root_markers", toml_list(o.root_markers)})
 		}
 		if install, ok := o.install.?; ok {
-			append(&lines, Line{"install", toml.quote(install)})
+			// One command stays a string, as older settings files have it
+			value := len(install) == 1 ? toml.quote(install[0]) : toml_list(install)
+			append(&lines, Line{"install", value})
 		}
 		if o.settings != "" do append(&lines, Line{"settings", json_to_toml(o.settings)})
 		if o.init_options != "" {
@@ -560,7 +571,9 @@ apply_override :: proc(server: ^Server, o: ^Server_Override) {
 	spec := &server.spec
 	if o.path != "" do server.path = o.path
 	spec.enabled = o.enabled.? or_else spec.enabled
-	spec.install = o.install.? or_else spec.install
+	if install, ok := o.install.?; ok {
+		spec.install = install
+	}
 	if o.command != nil do spec.command = o.command
 	if o.languages != nil do spec.languages = o.languages
 	if o.root_markers != nil do spec.root_markers = o.root_markers

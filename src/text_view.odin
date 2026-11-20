@@ -30,8 +30,10 @@ TEXT_KIND := textedit.Kind {
 	char_rect   = text_char_rect,
 	over_text   = text_over_text,
 	max_scroll  = text_max_scroll,
+	sideways    = text_sideways,
 	scroll_step = text_scroll_step,
 	reveal      = text_reveal,
+	anchor      = text_anchor,
 	same_row    = text_same_row,
 	move        = text_move,
 	page_height = text_page_height,
@@ -49,12 +51,106 @@ Visible_Line :: struct {
 	start: int,    // document offset
 }
 
+// The widest line the text view has shown, which sets how far it scrolls
+// sideways. Only lines that come into view are measured, so a huge file costs
+// no more than a small one; the width grows as wider lines show
+Widest_Line :: struct {
+	line, cols:  int,
+	// The lines in view when last measured, and the document's version then
+	version:     u64,
+	first, last: int,
+}
 
+
+// The row height of a text view, at its zoom
+text_line_height :: proc(v: ^textedit.View) -> int {
+	return editor_line_height(textedit.zoom(v))
+}
+
+
+// The gutter's width, the anchor line put back in place after a zoom, and the
+// widest line measured over the lines then in view
 @(private = "file")
 text_frame_begin :: proc(v: ^textedit.View) {
 	e := editor_of(v)
 	digits := len(fmt.tprintf("%d", buffer.line_count(&e.buf)))
 	e.gutter_w = f32(max(digits, 3)) * e.char_w + 28
+
+	if a, ok := v.anchor.?; ok {
+		v.anchor = nil
+		y := f64(a.line * text_line_height(v)) - a.y
+		textedit.scroll_to(v, clamp(y, 0, text_max_scroll(v)))
+	}
+
+	measure_view(e)
+}
+
+
+// The caret's line if it is in view, else the top line
+@(private = "file")
+text_anchor :: proc(v: ^textedit.View) -> textedit.Anchor {
+	lh := f64(text_line_height(v))
+	caret := buffer.offset_to_line(&v.buf, v.sels[v.primary].head)
+	caret_y := f64(caret) * lh - v.scroll_y
+	if caret_y >= 0 && caret_y + lh <= f64(v.view.h) {
+		return {caret, caret_y}
+	}
+
+	top := int(v.scroll_y / lh)
+	return {top, f64(top) * lh - v.scroll_y}
+}
+
+
+// Widens the widest line to the lines in view, unless they were measured at
+// this version of the document already
+measure_view :: proc(e: ^Editor) {
+	w := &e.widest
+	lh := text_line_height(e)
+	count := buffer.line_count(&e.buf)
+	first := min(int(e.scroll_y) / lh, count - 1)
+	last := min(first + int(e.view.h) / lh + 2, count)
+
+	same_lines := w.first == first && w.last == last
+	if same_lines && w.version == e.buf.version {
+		return
+	}
+	w.version, w.first, w.last = e.buf.version, first, last
+
+	lo := buffer.line_start(&e.buf, first)
+	hi := last < count ? buffer.line_start(&e.buf, last) : buffer.length(&e.buf)
+	for l, i in visible_lines(e, first, last, lo, hi) {
+		widen(e, first + i, l.text)
+	}
+}
+
+
+// Makes `line` (its text, capped like line_text) the widest if it is wider
+@(private = "file")
+widen :: proc(e: ^Editor, line: int, text: string) {
+	// A byte takes at most a tab's columns
+	if len(text) * textedit.TAB_WIDTH <= e.widest.cols do return
+
+	cols := textedit.visual_col(text, len(text))
+	if cols > e.widest.cols {
+		e.widest.line = line
+		e.widest.cols = cols
+	}
+}
+
+
+// Keeps the widest line through a frame's edits: it moves with the lines
+// around it, and an edit to it forgets it, as it may have narrowed. The lines
+// in view are measured again before the view next scrolls (text_frame_begin)
+widest_line_edited :: proc(e: ^Editor, changes: []buffer.Change) {
+	w := &e.widest
+	for c in changes {
+		if w.line > c.old_end.row {
+			w.line += c.new_end.row - c.old_end.row
+		} else if w.line >= c.start.row {
+			w.line = c.start.row
+			w.cols = 0
+		}
+	}
 }
 
 
@@ -64,7 +160,7 @@ text_frame_end :: proc(v: ^textedit.View) {
 	e := editor_of(v)
 	if e.md == nil do return
 
-	last := int(e.scroll_y + f64(e.view.h)) / editor_line_height() + 1
+	last := int(e.scroll_y + f64(e.view.h)) / text_line_height(e) + 1
 	markdown.doc_update(e.md, &e.buf, last + markdown.LOOKAHEAD_LINES, markdown.PARSE_BUDGET)
 }
 
@@ -76,7 +172,7 @@ text_offset_at :: proc(v: ^textedit.View, p: [2]f32) -> int {
 	y := f64(p.y - e.view.y) + e.scroll_y
 	if y < 0 do return 0
 
-	line := int(y) / editor_line_height()
+	line := int(y) / text_line_height(e)
 	line = clamp(line, 0, buffer.line_count(&e.buf) - 1)
 	text, start := textedit.line_text(e, line)
 
@@ -93,7 +189,7 @@ text_char_at :: proc(v: ^textedit.View, p: [2]f32) -> (offset: int, ok: bool) {
 
 	y := f64(p.y - e.view.y) + e.scroll_y
 	if y < 0 do return
-	line := int(y) / editor_line_height()
+	line := int(y) / text_line_height(e)
 	if line >= buffer.line_count(&e.buf) do return
 
 	x := p.x - e.view.x - e.gutter_w - TEXT_MARGIN + e.scroll_x
@@ -117,7 +213,7 @@ text_char_at :: proc(v: ^textedit.View, p: [2]f32) -> (offset: int, ok: bool) {
 @(private = "file")
 text_char_rect :: proc(v: ^textedit.View, offset: int) -> (r: gfx.Rect, ok: bool) {
 	e := editor_of(v)
-	lh := editor_line_height()
+	lh := text_line_height(e)
 
 	line := buffer.offset_to_line(&e.buf, offset)
 	y := e.view.y + f32(f64(line * lh) - e.scroll_y)
@@ -184,13 +280,30 @@ text_over_text :: proc(v: ^textedit.View, p: [2]f32) -> bool {
 // The last line can scroll to the top
 @(private = "file")
 text_max_scroll :: proc(v: ^textedit.View) -> f64 {
-	return max(f64((buffer.line_count(&v.buf) - 1) * editor_line_height()), 0)
+	return max(f64((buffer.line_count(&v.buf) - 1) * text_line_height(v)), 0)
+}
+
+
+// As far as the widest line shown, with room for the caret after its end
+@(private = "file")
+text_sideways :: proc(v: ^textedit.View) -> (max_scroll: f32, area: gfx.Rect) {
+	e := editor_of(v)
+	area = {e.view.x + e.gutter_w, e.view.y, e.view.w - e.gutter_w, e.view.h}
+	content := f32(e.widest.cols) * e.char_w
+	return max(content - text_width(e), 0), area
+}
+
+
+// The width the text shows in, less two columns kept clear for the caret
+@(private = "file")
+text_width :: proc(e: ^Editor) -> f32 {
+	return e.view.w - e.gutter_w - TEXT_MARGIN - e.char_w * 2
 }
 
 
 @(private = "file")
 text_scroll_step :: proc(v: ^textedit.View) -> f64 {
-	return f64(editor_line_height())
+	return f64(text_line_height(v))
 }
 
 
@@ -201,7 +314,7 @@ text_reveal :: proc(v: ^textedit.View) {
 	line := buffer.offset_to_line(&e.buf, head)
 
 	// Vertically: the caret's line
-	lh := f64(editor_line_height())
+	lh := f64(text_line_height(e))
 	top := f64(line) * lh
 	ty, tx := e.target_y, e.target_x
 	h := f64(e.view.h)
@@ -212,10 +325,12 @@ text_reveal :: proc(v: ^textedit.View) {
 	case top + lh > ty + h:   ty = top + lh - h
 	}
 
-	// Sideways: the caret's column
+	// Sideways: the caret's column, its line now measured for how far the
+	// view scrolls
 	text, start := textedit.line_text(e, line)
+	widen(e, line, text)
 	x := f32(textedit.visual_col(text, head - start)) * e.char_w
-	text_w := e.view.w - e.gutter_w - TEXT_MARGIN - e.char_w * 2
+	text_w := text_width(e)
 	if x < tx do tx = max(x - e.char_w * 4, 0)
 	if x > tx + text_w do tx = x - text_w
 
@@ -233,13 +348,13 @@ text_same_row :: proc(v: ^textedit.View, a, b: int) -> bool {
 // Lines a page moves
 @(private = "file")
 page_lines :: proc(v: ^textedit.View) -> int {
-	return max(int(v.view.h) / editor_line_height() - 1, 1)
+	return max(int(v.view.h) / text_line_height(v) - 1, 1)
 }
 
 
 @(private = "file")
 text_page_height :: proc(v: ^textedit.View) -> f64 {
-	return f64(page_lines(v) * editor_line_height())
+	return f64(page_lines(v) * text_line_height(v))
 }
 
 
@@ -350,7 +465,8 @@ text_drag_x :: proc(v: ^textedit.View, p: [2]f32) {
 @(private = "file")
 draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: bool) {
 	e := editor_of(v)
-	font := gfx.text_get_font(&gfx.text_system, .Editor, editor_font_size())
+	zoom := textedit.zoom(v)
+	font := gfx.text_get_font(&gfx.text_system, .Editor, editor_font_size(zoom))
 	if font == nil do return
 
 	gfx.push_clip_box({b.x, b.y, b.w, b.h})
@@ -358,7 +474,7 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 
 	// Metrics
 	adv := e.char_w * scale
-	line_height := editor_line_height()
+	line_height := editor_line_height(zoom)
 	lh := f32(line_height) * scale
 	gutter := math.round(e.gutter_w * scale)
 	text_x := b.x + gutter + TEXT_MARGIN * scale - e.scroll_x * scale
@@ -388,9 +504,13 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 	}
 
 	// By style: regular, bold, italic, bold italic (drawn bold)
-	bold := gfx.text_get_font(&gfx.text_system, .Editor_Bold, editor_font_size())
-	italic := gfx.text_get_font(&gfx.text_system, .Editor_Italic, editor_font_size())
+	bold := gfx.text_get_font(&gfx.text_system, .Editor_Bold, editor_font_size(zoom))
+	italic := gfx.text_get_font(&gfx.text_system, .Editor_Italic, editor_font_size(zoom))
 	fonts := [4]^ttf.Font{font, bold, italic, bold}
+
+	// Box drawing and blocks, drawn as shapes filling their cells
+	box_line := gfx.box_line_width(.Editor, font, adv)
+	boxes: gfx.Box_Batch
 
 	primary := e.sels[e.primary]
 	primary_line := buffer.offset_to_line(&e.buf, primary.head)
@@ -405,17 +525,17 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 	}
 
 	lines := visible_lines(e, first, last, hl_start, hl_end)
+
+	// Behind the text: the caret line and marks (search matches)
 	for l, i in lines {
 		line := first + i
 		y := math.round(y0 + f32(i) * lh)
 		end := l.start + len(l.text)
-		si := textedit.first_selection_at(e, l.start) // selections are sorted
 
 		if line == primary_line && primary.anchor == primary.head {
 			gfx.fill_rect(b.x + gutter, y, b.w - gutter, lh, gfx.theme.current_line)
 		}
 
-		// Marks (search matches)
 		for j := textedit.first_mark_at(e, l.start); j < len(e.marks); j += 1 {
 			lo, hi := e.marks[j][0], e.marks[j][1]
 			if lo > end do break
@@ -424,40 +544,47 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 			x2 := col_x(l.text, min(hi, end) - l.start, text_x, adv)
 			gfx.fill_rect(x1, y, x2 - x1, lh, gfx.theme.find_match)
 		}
+	}
 
-		// Selections. One continuing past the line end also covers one extra
-		// cell, to show the line break is selected
-		for j := si; j < len(e.sels); j += 1 {
-			lo, hi := textedit.sel_lo(e.sels[j]), textedit.sel_hi(e.sels[j])
-			if lo > end do break
-			if hi < l.start || lo == hi {
-				continue
-			}
+	draw_selections(e, lines, first, {text_x, y0, adv, lh}, scale)
 
-			x1 := col_x(l.text, max(lo, l.start) - l.start, text_x, adv)
-			x2 := col_x(l.text, min(hi, end) - l.start, text_x, adv)
-			if hi > end do x2 += math.round(adv * 0.6)
-			gfx.fill_rect(x1, y, x2 - x1, lh, gfx.theme.selection)
-		}
+	// The text and what goes over it
+	for l, i in lines {
+		y := math.round(y0 + f32(i) * lh)
+		end := l.start + len(l.text)
+		si := textedit.first_selection_at(e, l.start) // selections are sorted
 
-		// The text, run by run
+		// The text, run by run, and the characters drawn as shapes filling their cells
 		lo := clamp(l.start - hl_start, 0, len(hl))
 		hi := clamp(end - hl_start, lo, len(hl))
 		line_styles := styles != nil ? styles[lo:hi] : nil
-		for run in editor_runs(l.text, hl[lo:hi], line_styles, first_col, col_count) {
+		runs := editor_runs(l.text, hl[lo:hi], line_styles, first_col, col_count)
+		for run in runs {
 			x := math.round(text_x + f32(run.col) * adv)
+			color := gfx.theme.syntax[run.hl]
+			if r, is_box := gfx.box_glyph_in(run.text); is_box {
+				x2 := math.round(text_x + f32(run.col + 1) * adv)
+				y2 := math.round(y0 + f32(i + 1) * lh)
+				gfx.box_batch_add(&boxes, r, x, y, x2 - x, y2 - y, box_line, color)
+				continue
+			}
+
 			face := (.Bold in run.style ? 1 : 0) + (.Italic in run.style ? 2 : 0)
 			run_font := fonts[face]
 			if run_font == nil do run_font = font
-
-			color := gfx.theme.syntax[run.hl]
 			gfx.draw_text(gfx.text_get(&gfx.text_system, run_font, run.text), x, y + text_dy, color)
+		}
+		gfx.box_batch_draw(&boxes)
 
-			if .Strike in run.style {
-				strike_y := math.round(y + lh / 2)
-				strike_w := f32(utf8.rune_count(run.text)) * adv
-				gfx.fill_rect(x, strike_y, strike_w, max(math.round(scale), 1), color)
-			}
+		// Struck through text
+		for run in runs {
+			if .Strike not_in run.style do continue
+
+			x := math.round(text_x + f32(run.col) * adv)
+			strike_y := math.round(y + lh / 2)
+			strike_w := f32(utf8.rune_count(run.text)) * adv
+			color := gfx.theme.syntax[run.hl]
+			gfx.fill_rect(x, strike_y, strike_w, max(math.round(scale), 1), color)
 		}
 
 		// Problems, underlined with a wave (an empty one under the character after it)
@@ -508,7 +635,7 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 	}
 
 	// Line numbers use a smaller font, baseline-aligned with the text
-	num_font := gfx.text_get_font(&gfx.text_system, .Editor, gutter_font_size())
+	num_font := gfx.text_get_font(&gfx.text_system, .Editor, gutter_font_size(zoom))
 	if num_font == nil do return
 
 	num_dy := text_dy + f32(ttf.GetFontAscent(font) - ttf.GetFontAscent(num_font))
@@ -523,6 +650,80 @@ draw_text_view :: proc(v: ^textedit.View, b: gfx.Rect, scale: f32, caret_on: boo
 		color := line == primary_line ? gfx.theme.text_dim : gfx.theme.text_faint
 		gfx.draw_text(t, num_right - f32(w), y + num_dy, color)
 	}
+}
+
+
+// Where the lines in view are drawn, in pixels: the text's left (scrolled),
+// the first line's top, a column's width and a row's height
+@(private = "file")
+Text_Grid :: struct {
+	text_x, y0, adv, lh: f32,
+}
+
+
+// Each selection over the lines in view as one shape (gfx.fill_selection).
+// One continuing past a line's end also covers part of a cell after it, to
+// show the line break is selected
+@(private = "file")
+draw_selections :: proc(
+	e: ^Editor,
+	lines: []Visible_Line,
+	first: int,
+	grid: Text_Grid,
+	scale: f32,
+) {
+	if len(lines) == 0 do return
+
+	view_lo := lines[0].start
+	bottom := lines[len(lines) - 1]
+	view_hi := bottom.start + len(bottom.text)
+	pad, radius := gfx.selection_look(f32(editor_font_size(textedit.zoom(e))) * scale)
+	rows := make([dynamic]gfx.Rect, context.temp_allocator)
+
+	for j := textedit.first_selection_at(e, view_lo); j < len(e.sels); j += 1 {
+		lo, hi := textedit.sel_lo(e.sels[j]), textedit.sel_hi(e.sels[j])
+		if lo > view_hi do break
+		if lo == hi do continue
+
+		// The line above the view too, which decides the shape's top corners
+		clear(&rows)
+		if lo < view_lo && first > 0 {
+			text, start := textedit.line_text(e, first - 1)
+			add_selection_row(&rows, {text, start}, lo, hi, grid, -1)
+		}
+
+		for l, i in lines {
+			if l.start > hi do break
+			add_selection_row(&rows, l, lo, hi, grid, i)
+		}
+		gfx.fill_selection(rows[:], pad, radius, gfx.theme.selection)
+	}
+}
+
+
+// Adds the part of line l (row i of the grid) that a selection [lo, hi]
+// covers, if any
+@(private = "file")
+add_selection_row :: proc(
+	rows: ^[dynamic]gfx.Rect,
+	l: Visible_Line,
+	lo, hi: int,
+	grid: Text_Grid,
+	i: int,
+) {
+	end := l.start + len(l.text)
+	if hi < l.start || lo > end {
+		return
+	}
+
+	x1 := col_x(l.text, max(lo, l.start) - l.start, grid.text_x, grid.adv)
+	x2 := col_x(l.text, min(hi, end) - l.start, grid.text_x, grid.adv)
+	if hi > end do x2 += math.round(grid.adv * 0.6)
+	if x2 <= x1 do return
+
+	top := math.round(grid.y0 + f32(i) * grid.lh)
+	bottom := math.round(grid.y0 + f32(i + 1) * grid.lh)
+	append(rows, gfx.Rect{x1, top, x2 - x1, bottom - top})
 }
 
 

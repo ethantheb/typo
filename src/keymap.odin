@@ -48,6 +48,9 @@ Command :: enum {
 	Show_Hover,
 	Next_Problem,
 	Previous_Problem,
+	Zoom_In,
+	Zoom_Out,
+	Reset_Zoom,
 }
 
 Command_Info :: struct {
@@ -91,11 +94,20 @@ COMMANDS := [Command]Command_Info {
 	.Go_To_Symbol         = {"go_to_symbol", "Go to symbol in project", {"Ctrl+T"}},
 	.Trigger_Completion   = {"trigger_completion", "Trigger completion", {"Ctrl+Space"}},
 	.Show_Signature_Help  = {"show_signature_help", "Show signature help", {"Ctrl+Shift+Space"}},
-	.Go_Back              = {"go_back", "Go back", {"Alt+Left"}},
-	.Go_Forward           = {"go_forward", "Go forward", {"Alt+Right"}},
+	.Go_Back              = {"go_back", "Go back", {"Alt+Left", "Mouse4"}},
+	.Go_Forward           = {"go_forward", "Go forward", {"Alt+Right", "Mouse5"}},
 	.Show_Hover           = {"show_hover", "Show hover", {"Ctrl+K"}},
 	.Next_Problem         = {"next_problem", "Next problem", {"F8"}},
 	.Previous_Problem     = {"previous_problem", "Previous problem", {"Shift+F8"}},
+
+	// Plus is Shift+= on some layouts and a key of its own on others
+	.Zoom_In              = {
+		"zoom_in",
+		"Zoom in",
+		{"Ctrl+=", "Ctrl+Shift+=", "Ctrl++", "Ctrl+Keypad +"},
+	},
+	.Zoom_Out             = {"zoom_out", "Zoom out", {"Ctrl+-", "Ctrl+Keypad -"}},
+	.Reset_Zoom           = {"reset_zoom", "Reset zoom", {"Ctrl+0", "Ctrl+Keypad 0"}},
 }
 
 // App commands that still work while the terminal has focus; every other chord
@@ -109,18 +121,33 @@ TERMINAL_COMMANDS :: bit_set[Command]{
 	.Maximize_Pane,
 	.Focus_Next_Pane,
 	.Open_Settings,
+	.Zoom_In,
+	.Zoom_Out,
+	.Reset_Zoom,
 }
 
+// A key or a mouse button, with modifiers. Mouse buttons are the side buttons,
+// named "Mouse4" (back, SDL's X1) and "Mouse5" (forward, X2)
 Chord :: struct {
-	key:   sdl.Keycode,
-	ctrl:  bool,
-	shift: bool,
-	alt:   bool,
+	key:    sdl.Keycode,
+	button: u8, // sdl.BUTTON_X1 or sdl.BUTTON_X2 instead of a key
+	ctrl:   bool,
+	shift:  bool,
+	alt:    bool,
 }
 
 MAX_CHORDS :: 4
 
-// Unused slots have key == 0
+// The mouse buttons a chord may name, by name
+MOUSE_BUTTONS := [?]struct {
+	name:   string,
+	button: u8,
+}{
+	{"Mouse4", sdl.BUTTON_X1},
+	{"Mouse5", sdl.BUTTON_X2},
+}
+
+// Unused slots are zero (chord_bound is false)
 Bindings :: [Command][MAX_CHORDS]Chord
 
 
@@ -160,6 +187,9 @@ run_command :: proc(cmd: Command) -> bool {
 	case .Find, .Find_Next, .Find_Previous, .Find_Match_Case, .Find_Whole_Word, .Find_Regex:
 		return find_run_command(cmd)
 
+	case .Zoom_In, .Zoom_Out, .Reset_Zoom:
+		return zoom_run_command(cmd)
+
 	case:
 		e := focused_editor()
 		return e != nil && editor_run_command(e, cmd)
@@ -170,16 +200,26 @@ run_command :: proc(cmd: Command) -> bool {
 
 // The command bound to a key press, if any
 command_for_key :: proc(key: sdl.KeyboardEvent) -> (cmd: Command, ok: bool) {
-	pressed := chord_from_event(key)
+	return command_for_chord(chord_from_event(key))
+}
 
+
+// The command bound to a chord (a key or a mouse button), if any
+command_for_chord :: proc(pressed: Chord) -> (cmd: Command, ok: bool) {
 	for chords, c in g.settings.bindings {
 		for chord in chords {
-			if chord.key != 0 && chord == pressed {
+			if chord_bound(chord) && chord == pressed {
 				return c, true
 			}
 		}
 	}
 	return {}, false
+}
+
+
+// Whether a binding slot holds a chord
+chord_bound :: proc(c: Chord) -> bool {
+	return c.key != 0 || c.button != 0
 }
 
 
@@ -194,28 +234,32 @@ normalize_key :: proc(k: sdl.Keycode) -> sdl.Keycode {
 
 
 parse_chord :: proc(s: string) -> (c: Chord, ok: bool) {
-	parts := strings.split(s, "+", context.temp_allocator)
-
-	// "Ctrl++" means Ctrl and the '+' key
-	if strings.has_suffix(s, "++") {
-		parts = parts[:len(parts) - 1]
-		parts[len(parts) - 1] = "+"
-	}
-	if len(parts) == 0 do return {}, false
+	// The key follows the last '+' between parts. A key's name may end in '+'
+	// itself: "Ctrl++" is Ctrl and the '+' key, "Ctrl+Keypad +" the numpad's
+	search := strings.has_suffix(s, "+") ? s[:len(s) - 1] : s
+	sep := strings.last_index_byte(search, '+')
+	name := strings.trim_space(s[sep + 1:])
+	if name == "" do return {}, false
 
 	// The modifiers
-	for part in parts[:len(parts) - 1] {
-		switch strings.to_lower(strings.trim_space(part), context.temp_allocator) {
-		case "ctrl", "control", "cmd": c.ctrl = true
-		case "shift":                 c.shift = true
-		case "alt", "option":         c.alt = true
-		case:                         return {}, false
+	if sep >= 0 {
+		for part in strings.split(s[:sep], "+", context.temp_allocator) {
+			switch strings.to_lower(strings.trim_space(part), context.temp_allocator) {
+			case "ctrl", "control", "cmd": c.ctrl = true
+			case "shift":                 c.shift = true
+			case "alt", "option":         c.alt = true
+			case:                         return {}, false
+			}
 		}
 	}
 
-	// The key
-	name := strings.trim_space(parts[len(parts) - 1])
-	if name == "" do return {}, false
+	// The key or mouse button
+	for m in MOUSE_BUTTONS {
+		if strings.equal_fold(name, m.name) {
+			c.button = m.button
+			return c, true
+		}
+	}
 
 	cname := strings.clone_to_cstring(name, context.temp_allocator)
 	c.key = normalize_key(sdl.GetKeyFromName(cname))
@@ -228,17 +272,52 @@ format_chord :: proc(c: Chord, allocator := context.temp_allocator) -> string {
 	if c.ctrl do strings.write_string(&sb, "Ctrl+")
 	if c.shift do strings.write_string(&sb, "Shift+")
 	if c.alt do strings.write_string(&sb, "Alt+")
-	strings.write_string(&sb, string(sdl.GetKeyName(c.key)))
+
+	if c.button != 0 {
+		strings.write_string(&sb, mouse_button_name(c.button))
+	} else {
+		strings.write_string(&sb, string(sdl.GetKeyName(c.key)))
+	}
 	return strings.to_string(sb)
 }
 
 
+@(private = "file")
+mouse_button_name :: proc(button: u8) -> string {
+	for m in MOUSE_BUTTONS {
+		if m.button == button do return m.name
+	}
+	return "?"
+}
+
+
 chord_from_event :: proc(key: sdl.KeyboardEvent) -> Chord {
+	c := chord_with_mods(key.mod)
+	c.key = base_key(key)
+	return c
+}
+
+
+// The chord of a mouse button press, if a chord may name that button, with the
+// modifiers held
+chord_from_button :: proc(button: u8) -> (c: Chord, ok: bool) {
+	for m in MOUSE_BUTTONS {
+		if m.button == button {
+			c = chord_with_mods(sdl.GetModState())
+			c.button = button
+			return c, true
+		}
+	}
+	return {}, false
+}
+
+
+@(private = "file")
+chord_with_mods :: proc(mod: sdl.Keymod) -> Chord {
 	return {
-		key   = base_key(key),
-		ctrl  = key.mod & sdl.KMOD_CTRL != {},
-		shift = key.mod & sdl.KMOD_SHIFT != {},
-		alt   = key.mod & sdl.KMOD_ALT != {},
+		ctrl  = mod & sdl.KMOD_CTRL != {},
+		shift = mod & sdl.KMOD_SHIFT != {},
+		alt   = mod & sdl.KMOD_ALT != {},
 	}
 }
 
@@ -272,7 +351,7 @@ default_bindings :: proc(cmd: Command) -> (chords: [MAX_CHORDS]Chord) {
 bindings_label :: proc(chords: [MAX_CHORDS]Chord, sep: string) -> string {
 	parts := make([dynamic]string, context.temp_allocator)
 	for c in chords {
-		if c.key != 0 do append(&parts, format_chord(c))
+		if chord_bound(c) do append(&parts, format_chord(c))
 	}
 	return strings.join(parts[:], sep, context.temp_allocator)
 }
@@ -281,7 +360,7 @@ bindings_label :: proc(chords: [MAX_CHORDS]Chord, sep: string) -> string {
 // "Ctrl+E" (the first binding) for showing in the UI, or "" if unbound
 first_chord_label :: proc(cmd: Command) -> string {
 	for c in g.settings.bindings[cmd] {
-		if c.key != 0 do return format_chord(c)
+		if chord_bound(c) do return format_chord(c)
 	}
 	return ""
 }

@@ -10,9 +10,12 @@ import "core:testing"
 import "core:time"
 
 import "buffer"
+import "fuzzy"
 import "langs"
 import "lsp"
+import "markdown"
 import "textedit"
+import sdl "../vendor/sdl3"
 
 // Language server tests with the fake server (src/lsp/fake_server, built by
 // build.py --test): edits reach the server as the same text
@@ -22,9 +25,24 @@ import "textedit"
 FAKE_SERVER :: "build/fake_lsp.exe" when ODIN_OS == .Windows else "build/fake_lsp"
 
 
-// Sets g.lsp up with the fake server for ".fake" files
+// How the fake server answers completion requests
 @(private = "file")
-use_fake_server :: proc(t: ^testing.T, utf16: bool) {
+Fake_Completion :: enum {
+	Words,
+	Incomplete, // short, incomplete lists
+	Empty,
+	Error,
+	Late,       // after FAKE_DELAY
+}
+
+@(private = "file")
+FAKE_DELAY :: "1500" // ms
+
+
+// Sets g.lsp up with the fake server for ".fake" files, answering completion
+// requests as `completion` says
+@(private = "file")
+use_fake_server :: proc(t: ^testing.T, utf16: bool, completion := Fake_Completion.Words) {
 	if !os.exists(FAKE_SERVER) {
 		testing.fail_now(t, "build/fake_lsp missing; build.py --test builds it")
 	}
@@ -32,13 +50,23 @@ use_fake_server :: proc(t: ^testing.T, utf16: bool) {
 	// Its command names a program that isn't on PATH: `path` says where it is
 	@(static) utf8_command := []string{"fake-lsp-not-on-path"}
 	@(static) utf16_command := []string{"fake-lsp-not-on-path", "--utf16"}
+	@(static) completion_commands := [Fake_Completion][]string {
+		.Words      = {"fake-lsp-not-on-path"},
+		.Incomplete = {"fake-lsp-not-on-path", "--incomplete"},
+		.Empty      = {"fake-lsp-not-on-path", "--complete-empty"},
+		.Error      = {"fake-lsp-not-on-path", "--complete-error"},
+		.Late       = {"fake-lsp-not-on-path", "--complete-delay", FAKE_DELAY},
+	}
 	@(static) languages := []string{"fake"}
 	@(static) extensions := []string{"fake"}
+
+	command := utf16 ? utf16_command : utf8_command
+	if completion != .Words do command = completion_commands[completion]
 
 	server := langs.Server {
 		spec = {
 			name      = "fake",
-			command   = utf16 ? utf16_command : utf8_command,
+			command   = command,
 			languages = languages,
 			enabled   = true,
 		},
@@ -374,6 +402,474 @@ test_settings_saved_later :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, again.error, "")
 	testing.expect_value(t, again.theme, "one-dark")
+}
+
+
+// Typing the start of a function defined above the caret offers it, and Enter
+// inserts it. The server's lists are short and incomplete: the letters typed
+// while an answer is on its way are asked about once it comes
+@(test)
+test_lsp_completion_while_typing :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_fake_server(t, false, .Incomplete)
+	defer stop_fake_server()
+
+	// A function and other words starting with "ta", then an empty line
+	dir := os.temp_directory(context.temp_allocator) or_else "."
+	path := fmt.tprintf("%s/typo-completion-%d.fake", dir, os.get_pid())
+	text := "target_func :: proc() {}\ntab_1 tab_2 tab_3 tab_4 tab_5 tab_6\n\n"
+	_ = os.write_entire_file(path, text)
+	defer os.remove(path)
+
+	// Opened in the focused pane
+	words_init()
+	e := new(Editor)
+	pane := Pane{content = e}
+	append(&g.panes.open, &pane)
+	g.panes.focused = &pane
+	defer {
+		editor_destroy(e)
+		free(e)
+		delete(g.panes.open)
+		g.panes.open = {}
+		g.panes.focused = nil
+		fuzzy.destroy()
+		words_destroy()
+	}
+	editor_open(e, path)
+	testing.expect(t, attach_when_found(e))
+	testing.expect(t, completion_frames(e, completes))
+	at := len(text) - 1
+	textedit.set_single_selection(e, {at, at, -1})
+
+	// "t" opens the list: its first few words
+	cs := &g.lsp.completion
+	editor_text_input(e, "t")
+	listed := completion_frames(e, completion_listed)
+	testing.expect(t, listed && cs.incomplete && !shows_completion("target_func"))
+
+	// "a" asks again, and "rg" is typed before that answer comes
+	editor_text_input(e, "a")
+	completion_frame(e, poll = false)
+	testing.expect(t, cs.request != 0)
+	for letter in ([]string{"r", "g"}) {
+		editor_text_input(e, letter)
+		completion_frame(e, poll = false)
+	}
+
+	// The answers come: the function is listed, and Enter inserts it
+	found := completion_frames(e, target_listed)
+	testing.expect(t, found)
+	enter: sdl.Event
+	enter.type = .KEY_DOWN
+	enter.key.key = sdl.K_RETURN
+	testing.expect(t, lsp_completion_handle_key(&enter))
+	line, _ := textedit.line_text(e, 2)
+	testing.expect_value(t, line, "target_func")
+}
+
+
+// A frame of what completion depends on: answers, the editor's edits going
+// out, its words, then asking and filtering
+@(private = "file")
+completion_frame :: proc(e: ^Editor, poll := true) {
+	if poll do lsp_frame()
+	textedit.take_changes(e)
+	words_frame()
+	lsp_completion_frame()
+}
+
+
+// Runs completion frames until `done`; false after a few seconds
+@(private = "file")
+completion_frames :: proc(e: ^Editor, done: proc() -> bool) -> bool {
+	start := time.tick_now()
+	for time.tick_since(start) < 5 * time.Second {
+		completion_frame(e)
+		if done() do return true
+		time.sleep(2 * time.Millisecond)
+	}
+	return false
+}
+
+
+// The focused editor's server is running and completes
+@(private = "file")
+completes :: proc() -> bool {
+	return langs.client_with(&focused_editor().lsp, .Completion) != nil
+}
+
+
+// The list is open with items, no answer on its way
+@(private = "file")
+completion_listed :: proc() -> bool {
+	cs := &g.lsp.completion
+	return cs.open && cs.request == 0 && len(cs.shown) > 0
+}
+
+
+@(private = "file")
+target_listed :: proc() -> bool {
+	return g.lsp.completion.request == 0 && shows_completion("target_func")
+}
+
+
+// Whether the completion list shows a server's item
+@(private = "file")
+shows_completion :: proc(label: string) -> bool {
+	cs := &g.lsp.completion
+	for s in cs.shown {
+		if s.index < 0 do continue
+		if cs.items[s.index].label == label do return true
+	}
+	return false
+}
+
+
+// --- Word completions --------------------------------------------------------------
+
+@(private = "file")
+WORDS_TEXT ::
+	"alpha_one alpha_two beta_three utf8_name item_aaaaaaaa item_bbbbbbbb item_cccccccc " +
+	"item_dddddddd item_eeeeeeee item_z\n\n\n"
+
+
+@(private = "file")
+use_words :: proc(mode: string) {
+	g.settings.words = mode
+	g.settings.words_min_length = 3
+	g.settings.lsp_fetch_timeout = 100
+	g.settings.words_in_text_files = false
+}
+
+
+@(private = "file")
+reset_words :: proc() {
+	g.settings.words = ""
+	g.settings.words_min_length = 0
+	g.settings.lsp_fetch_timeout = 0
+}
+
+
+// Writes WORDS_TEXT to a temp file with the extension and opens it in a focused
+// pane, with the words thread running, the caret on the last line. Close with
+// close_words_file
+@(private = "file")
+open_words_file :: proc(t: ^testing.T, ext: string) -> (e: ^Editor, path: string) {
+	dir := os.temp_directory(context.temp_allocator) or_else "."
+	path = fmt.tprintf("%s/typo-words-%d.%s", dir, os.get_pid(), ext)
+	_ = os.write_entire_file(path, WORDS_TEXT)
+
+	words_init()
+	e = new(Editor)
+	pane := new(Pane)
+	pane.content = e
+	append(&g.panes.open, pane)
+	g.panes.focused = pane
+	editor_open(e, path)
+
+	at := len(WORDS_TEXT) - 1
+	textedit.set_single_selection(e, {at, at, -1})
+	testing.expect(t, completion_frames(e, words_collected))
+	return e, path
+}
+
+
+@(private = "file")
+close_words_file :: proc(e: ^Editor, path: string) {
+	lsp_completion_destroy()
+	pane := g.panes.focused
+	editor_destroy(e)
+	free(e)
+	free(pane)
+	delete(g.panes.open)
+	g.panes.open = {}
+	g.panes.focused = nil
+	fuzzy.destroy()
+	words_destroy()
+	os.remove(path)
+}
+
+
+@(private = "file")
+words_collected :: proc() -> bool {
+	return focused_editor().words.index != nil
+}
+
+
+// Types the text a character at a time, as keys do
+@(private = "file")
+type_text :: proc(e: ^Editor, text: string) {
+	for i in 0 ..< len(text) {
+		editor_text_input(e, text[i:][:1])
+		completion_frame(e)
+	}
+}
+
+
+// Runs completion frames for a while
+@(private = "file")
+settle :: proc(e: ^Editor, duration := 200 * time.Millisecond) {
+	start := time.tick_now()
+	for time.tick_since(start) < duration {
+		completion_frame(e)
+		time.sleep(2 * time.Millisecond)
+	}
+}
+
+
+// Whether the completion list shows a word
+@(private = "file")
+shows_word :: proc(word: string) -> bool {
+	for s in g.lsp.completion.shown {
+		if s.index >= 0 do continue
+		if s.word == word do return true
+	}
+	return false
+}
+
+
+@(private = "file")
+alpha_listed :: proc() -> bool {
+	return shows_word("alpha_one")
+}
+
+
+@(private = "file")
+press_key :: proc(key: sdl.Keycode) -> bool {
+	event: sdl.Event
+	event.type = .KEY_DOWN
+	event.key.key = key
+	return lsp_completion_handle_key(&event)
+}
+
+
+// With no server, typed words of three letters get the file's words (not ones
+// with digits, nor the word typed); Enter puts the chosen one at every caret as
+// one undo step
+@(test)
+test_words_without_server :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_words("fallback")
+	defer reset_words()
+	e, path := open_words_file(t, "code")
+	defer close_words_file(e, path)
+
+	// Carets on the last two lines
+	second := len(WORDS_TEXT) - 2
+	clear(&e.sels)
+	append(&e.sels, Selection{second, second, -1}, Selection{second + 1, second + 1, -1})
+	textedit.normalize(e)
+
+	// Two letters: too short
+	type_text(e, "al")
+	settle(e)
+	testing.expect(t, !shows_word("alpha_one"))
+
+	// Three
+	type_text(e, "p")
+	testing.expect(t, completion_frames(e, alpha_listed))
+	testing.expect(t, shows_word("alpha_two"))
+	testing.expect(t, !shows_word("beta_three"))
+	testing.expect(t, !shows_word("alp"))
+
+	// Enter inserts the first at both carets
+	testing.expect(t, press_key(sdl.K_RETURN))
+	first, _ := textedit.line_text(e, 1)
+	last, _ := textedit.line_text(e, 2)
+	testing.expect_value(t, first, "alpha_one")
+	testing.expect_value(t, last, "alpha_one")
+	testing.expect(t, !g.lsp.completion.open)
+
+	textedit.undo(e)
+	first, _ = textedit.line_text(e, 1)
+	testing.expect_value(t, first, "alp")
+}
+
+
+// After typing rests the words are collected again, and then nothing keeps
+// frames coming
+@(test)
+test_words_collected_again :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_words("fallback")
+	defer reset_words()
+	e, path := open_words_file(t, "code")
+	defer close_words_file(e, path)
+
+	type_text(e, "gamma_four")
+	testing.expect(t, words_busy())
+	settle(e, 2 * WORDS_DELAY)
+	testing.expect(t, completion_frames(e, proc() -> bool { return !words_busy() }))
+
+	index := e.words.index
+	testing.expect(t, index != nil && index.version == e.buf.version)
+}
+
+
+// Trigger completion offers words at any length (with digits once one is
+// typed); with words disabled nothing is offered
+@(test)
+test_words_trigger_and_disabled :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_words("fallback")
+	defer reset_words()
+	e, path := open_words_file(t, "code")
+	defer close_words_file(e, path)
+
+	// One letter: words only when asked for
+	type_text(e, "b")
+	settle(e)
+	testing.expect(t, !shows_word("beta_three"))
+	testing.expect(t, editor_run_command(e, .Trigger_Completion))
+	testing.expect(t, completion_frames(e, proc() -> bool { return shows_word("beta_three") }))
+
+	// Words with digits once a digit is typed
+	type_text(e, " u")
+	testing.expect(t, editor_run_command(e, .Trigger_Completion))
+	settle(e)
+	testing.expect(t, g.lsp.completion.open)
+	testing.expect(t, !shows_word("utf8_name"))
+	type_text(e, "tf8")
+	testing.expect(t, completion_frames(e, proc() -> bool { return shows_word("utf8_name") }))
+
+	// Disabled
+	lsp_completion_close()
+	g.settings.words = "disabled"
+	testing.expect(t, !editor_run_command(e, .Trigger_Completion))
+	type_text(e, "tf8")
+	settle(e)
+	testing.expect_value(t, len(g.lsp.completion.shown), 0)
+}
+
+
+// Markdown and plain text files have no word completions unless asked for
+@(test)
+test_words_off_in_prose :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_words("fallback")
+	defer reset_words()
+
+	doc: markdown.Doc
+	md, text, code: Editor
+	md.status, md.path, md.md = .Text, "notes.md", &doc
+	text.status, text.path = .Text, "notes.TXT"
+	code.status, code.path = .Text, "config.yaml"
+	testing.expect_value(t, words_mode(&md), Words_Mode.Disabled)
+	testing.expect_value(t, words_mode(&text), Words_Mode.Disabled)
+	testing.expect_value(t, words_mode(&code), Words_Mode.Fallback)
+
+	// Typing asks for nothing
+	lsp_typed(&md, "abc")
+	testing.expect(t, g.lsp.completion.due == nil)
+	testing.expect(t, !lsp_trigger_completion(&md))
+
+	g.settings.words_in_text_files = true
+	testing.expect_value(t, words_mode(&md), Words_Mode.Fallback)
+	testing.expect_value(t, words_mode(&text), Words_Mode.Fallback)
+}
+
+
+// With "fallback", a server's items keep the words out; an empty answer, an
+// error or no answer in time brings them
+@(test)
+test_words_fallback :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	for completion in ([]Fake_Completion{.Words, .Empty, .Error, .Late}) {
+		use_fake_server(t, false, completion)
+		defer stop_fake_server()
+		use_words("fallback")
+		defer reset_words()
+		e, path := open_words_file(t, "fake")
+		defer close_words_file(e, path)
+		testing.expect(t, attach_when_found(e))
+		testing.expect(t, completion_frames(e, completes))
+
+		type_text(e, "alp")
+		listed := completion_frames(e, proc() -> bool { return len(g.lsp.completion.shown) > 0 })
+		testing.expect(t, listed)
+
+		cs := &g.lsp.completion
+		switch completion {
+		case .Words:
+			testing.expect(t, shows_completion("alpha_one"))
+			testing.expect(t, !shows_word("alpha_one"))
+		case .Empty, .Error:
+			testing.expect(t, shows_word("alpha_one"))
+			testing.expect_value(t, cs.server, Server_Answer.Failed)
+		case .Late, .Incomplete:
+			testing.expect(t, shows_word("alpha_one"))
+			testing.expect_value(t, cs.server, Server_Answer.Waiting)
+		}
+	}
+}
+
+
+// A server's answer after the words showed replaces them, unless a word was
+// chosen with the keys: then the words stay until the next letter
+@(test)
+test_words_replaced_by_late_answer :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	for navigate in ([]bool{false, true}) {
+		use_fake_server(t, false, .Late)
+		defer stop_fake_server()
+		use_words("fallback")
+		defer reset_words()
+		e, path := open_words_file(t, "fake")
+		defer close_words_file(e, path)
+		testing.expect(t, attach_when_found(e))
+		testing.expect(t, completion_frames(e, completes))
+
+		type_text(e, "alp")
+		testing.expect(t, completion_frames(e, alpha_listed))
+		if navigate do testing.expect(t, press_key(sdl.K_DOWN))
+
+		// The answer comes
+		cs := &g.lsp.completion
+		answered := completion_frames(e, proc() -> bool {
+			return g.lsp.completion.server == .Items
+		})
+		testing.expect(t, answered)
+		completion_frame(e)
+		if navigate {
+			testing.expect(t, shows_word("alpha_one"))
+			testing.expect_value(t, cs.selected, 1)
+			type_text(e, "h")
+		}
+		testing.expect(t, shows_completion("alpha_one"))
+		testing.expect(t, !shows_word("alpha_one"))
+	}
+}
+
+
+// With "enabled", words come after the server's items (even "item_z", which
+// matches "ite" better than its long names), less those it lists
+@(test)
+test_words_enabled :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+	use_fake_server(t, false, .Incomplete)
+	defer stop_fake_server()
+	use_words("enabled")
+	defer reset_words()
+	e, path := open_words_file(t, "fake")
+	defer close_words_file(e, path)
+	testing.expect(t, attach_when_found(e))
+	testing.expect(t, completion_frames(e, completes))
+
+	// The server lists five of the six "item_" words
+	type_text(e, "ite")
+	mixed := completion_frames(e, proc() -> bool {
+		return shows_completion("item_aaaaaaaa") && shows_word("item_z")
+	})
+	testing.expect(t, mixed)
+	testing.expect(t, !shows_word("item_aaaaaaaa"))
+
+	cs := &g.lsp.completion
+	seen_word := false
+	for s in cs.shown {
+		if s.index < 0 do seen_word = true
+		if s.index >= 0 do testing.expect(t, !seen_word)
+	}
 }
 
 

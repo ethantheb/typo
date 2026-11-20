@@ -139,12 +139,29 @@ next_col :: proc(col: int, r: rune) -> int {
 
 // Visual column of byte index i in a line, with tabs expanded
 visual_col :: proc(text: string, i: int) -> int {
+	// ASCII without tabs takes a column per byte, which is checked much faster
+	// than characters are decoded (a long line's column is asked every frame)
+	before := text[:clamp(i, 0, len(text))]
+	if plain_columns(before) do return len(before)
+
 	col := 0
-	for r, j in text {
-		if j >= i do break
+	for r in before {
 		col = next_col(col, r)
 	}
 	return col
+}
+
+
+// Whether text is ASCII without tabs
+@(private = "file")
+plain_columns :: proc(text: string) -> bool {
+	bits: u8
+	tabs := 0
+	for c in transmute([]u8)text {
+		bits |= c
+		tabs += int(c == '\t')
+	}
+	return bits < 0x80 && tabs == 0
 }
 
 

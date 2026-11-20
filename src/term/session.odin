@@ -133,9 +133,15 @@ session_destroy :: proc(s: ^Session) {
 }
 
 
-// Starts `command` (a full command line) in `cwd`. On Windows, `bundled_conpty`
-// runs it through the bundled ConPTY when possible (see pty_spawn)
-session_spawn :: proc(s: ^Session, command, cwd: string, bundled_conpty := true) -> bool {
+// Starts `command` (a full command line) in `cwd`, with `env` ("NAME=value"
+// each) added to its environment. On Windows, `bundled_conpty` runs it
+// through the bundled ConPTY when possible (see pty_spawn)
+session_spawn :: proc(
+	s: ^Session,
+	command, cwd: string,
+	bundled_conpty := true,
+	env: []string = nil,
+) -> bool {
 	if s.running do return true
 
 	spawned := pty_spawn(
@@ -147,6 +153,7 @@ session_spawn :: proc(s: ^Session, command, cwd: string, bundled_conpty := true)
 		s.wake,
 		s.wake_data,
 		bundled_conpty,
+		env,
 	)
 	if !spawned do return false
 

@@ -14,6 +14,17 @@ import "../textedit"
 // colored by its language
 
 
+// A line being drawn: its layout and text, and its top in pixels
+@(private = "file")
+Visible :: struct {
+	line:  int,
+	y:     f32,
+	L:     ^Line_Layout,
+	text:  string,
+	start: int,
+}
+
+
 // Draws the lines in view. `caret_on` is whether the editor's caret is in its
 // visible phase
 @(private)
@@ -30,24 +41,20 @@ draw :: proc(e: ^View, b: clay.BoundingBox, scale: f32, caret_on: bool) {
 	first, top := hm_find(hm, e.scroll_y)
 	y := f64(b.y) + (top - e.scroll_y) * f64(scale)
 
-	Visible :: struct {
-		line: int,
-		y:    f32,
-		L:    ^Line_Layout,
-	}
 	lines := make([dynamic]Visible, context.temp_allocator)
 	for line := first; line < hm.lines && y < f64(b.y + b.height); line += 1 {
-		L := line_layout(e, line)
-		append(&lines, Visible{line, f32(y), L})
+		append(&lines, visible(e, line, f32(y)))
 		y += f64(hm_get(hm, line)) * f64(scale)
 	}
 
-	// Their text
+	// What is behind their text, the selections, then the text
+	for v in lines do draw_line_back(e, v, left, scale)
+	if !mv.caretless do draw_selections(e, lines[:], left, scale)
+
 	caret_on := !mv.caretless && caret_on
 	for v in lines {
-		text, start := line_text(e, v.line)
-		hl := code_colors(e, v.line, text)
-		draw_line(e, v.line, v.L, text, start, hl, left, v.y, scale, caret_on)
+		hl := code_colors(e, v.line, v.text)
+		draw_line_text(e, v, hl, left, scale, caret_on)
 	}
 
 	// Expand buttons of tables whose text wraps, brighter under the pointer
@@ -119,19 +126,20 @@ screen_x :: proc(left, x, scale: f32) -> f32 {
 }
 
 
+// Line i laid out, with its top at y (pixels)
 @(private = "file")
-draw_line :: proc(
-	e: ^View,
-	line: int,
-	L: ^Line_Layout,
-	text: string,
-	start: int,
-	hl: []syntax.Highlight,
-	left, y: f32,
-	scale: f32,
-	caret_on: bool,
-) {
+visible :: proc(e: ^View, i: int, y: f32) -> Visible {
+	text, start := line_text(e, i)
+	return {i, y, line_layout(e, i), text, start}
+}
+
+
+// What is drawn behind a line's text and its selections: images, a code
+// block's background and scroll bar, quote bars, rules, table borders, marks
+@(private = "file")
+draw_line_back :: proc(e: ^View, v: Visible, left, scale: f32) {
 	mv := &e.mdv
+	L, y := v.L, v.y
 	h := L.height * scale
 
 	// Images, or a box with the alt text while one loads or when it can't
@@ -157,9 +165,9 @@ draw_line :: proc(
 		}
 
 		if box.alt[1] <= box.alt[0] do continue
-		font := gfx.text_get_font(&gfx.text_system, .Md_Italic, font_size())
+		font := gfx.text_get_font(&gfx.text_system, .Md_Italic, font_size(e))
 		if font == nil do continue
-		alt := gfx.text_get(&gfx.text_system, font, text[box.alt[0]:box.alt[1]])
+		alt := gfx.text_get(&gfx.text_system, font, v.text[box.alt[0]:box.alt[1]])
 		if alt == nil do continue
 
 		tw, th: i32
@@ -189,24 +197,10 @@ draw_line :: proc(
 		gfx.fill_rect(bar_x, math.round(y), bar_w, math.ceil(h), gfx.theme.md_rule)
 	}
 
-	// A code block's scroll bar, and its code clipped to the box
-	clipped := false
-	if L.code_bg != {} {
-		x0 := screen_x(left, L.code_bg[0] + CODE_PAD, scale)
-		x1 := screen_x(left, L.code_bg[1] - CODE_PAD, scale)
-		if L.round[1] do draw_code_bar(e, line, scale)
-
-		// Code scrolled sideways stays inside its box; markers hanging left
-		// of it are drawn first
-		if L.kind == .Code {
-			for run in L.runs {
-				if hanging(L, run) do draw_run(L, run, text, hl, left, y, scale)
-			}
-			gfx.push_clip_box({x0 - 2 * scale, math.round(y), x1 - x0 + 4 * scale, math.ceil(h)})
-			clipped = true
-		}
+	// A code block's scroll bar
+	if L.code_bg != {} && L.round[1] {
+		draw_code_bar(e, v.line, scale)
 	}
-	defer if clipped do gfx.pop_clip()
 
 	// A thematic break
 	if L.kind == .Rule {
@@ -220,46 +214,38 @@ draw_line :: proc(
 	}
 
 	if len(L.edges) > 1 do draw_table_borders(L, left, y, h, scale)
+	draw_marks(e, L, v.text, v.start, left, y, scale)
+}
 
-	end := start + len(text)
-	draw_marks(e, L, text, start, left, y, scale)
 
-	// Selections
-	first_sel := mv.caretless ? len(e.sels) : textedit.first_selection_at(e, start)
-	for j := first_sel; j < len(e.sels); j += 1 {
-		lo, hi := textedit.sel_lo(e.sels[j]), textedit.sel_hi(e.sels[j])
-		if lo > end do break
-		if hi < start || lo == hi {
-			continue
+// A line's text, over its selections, and its carets
+@(private = "file")
+draw_line_text :: proc(
+	e: ^View,
+	v: Visible,
+	hl: []syntax.Highlight,
+	left, scale: f32,
+	caret_on: bool,
+) {
+	L, y, text, start := v.L, v.y, v.text, v.start
+	h := L.height * scale
+
+	// Code scrolled sideways stays inside its box; markers hanging left of it
+	// are drawn first
+	clipped := false
+	if L.code_bg != {} && L.kind == .Code {
+		x0 := screen_x(left, L.code_bg[0] + CODE_PAD, scale)
+		x1 := screen_x(left, L.code_bg[1] - CODE_PAD, scale)
+		for run in L.runs {
+			if hanging(L, run) do draw_run(L, run, text, hl, left, y, scale)
 		}
-
-		if L.kind == .Table {
-			for box in table_selection(L, text, lo - start, hi - start) {
-				x0 := screen_x(left, box.x, scale)
-				x1 := screen_x(left, box.x + box.w, scale)
-				box_y := math.round(y + box.y * scale)
-				box_h := math.ceil(box.h * scale)
-				gfx.fill_rect(x0, box_y, x1 - x0, box_h, gfx.theme.selection)
-			}
-			continue
-		}
-
-		for r, ri in L.rows {
-			x1, x2, ok := selection_span(L, text, ri, lo - start, hi - start)
-			if !ok do continue
-
-			// Selected past the line's end: its newline
-			if hi > end && ri == len(L.rows) - 1 {
-				x2 += f32(font_size()) * 0.4
-			}
-			row_x := screen_x(left, x1, scale)
-			row_y := math.round(y + r.y * scale)
-			row_h := math.ceil(r.h * scale)
-			gfx.fill_rect(row_x, row_y, (x2 - x1) * scale, row_h, gfx.theme.selection)
-		}
+		gfx.push_clip_box({x0 - 2 * scale, math.round(y), x1 - x0 + 4 * scale, math.ceil(h)})
+		clipped = true
 	}
+	defer if clipped do gfx.pop_clip()
 
 	// Text
+	end := start + len(text)
 	for _, k in L.runs {
 		run := md_run(L, k)
 
@@ -288,6 +274,120 @@ draw_line :: proc(
 				gfx.theme.caret,
 			)
 		}
+	}
+}
+
+
+// Each selection over the lines in view as one shape (gfx.fill_selection), the
+// lines just outside the view included for the shape's ends. Where it goes on
+// into the line before or after, a row reaches up to its line's top or down to
+// its bottom, so rows join across a line's padding (not across an image under
+// it). Selected table cells are boxes of their own
+@(private = "file")
+draw_selections :: proc(e: ^View, lines: []Visible, left, scale: f32) {
+	if len(lines) == 0 do return
+	hm := &e.mdv.heights
+
+	// The lines in view and one either side
+	around := make([dynamic]Visible, 0, len(lines) + 2, context.temp_allocator)
+	top, bottom := lines[0], lines[len(lines) - 1]
+	if top.line > 0 {
+		y := top.y - f32(hm_get(hm, top.line - 1)) * scale
+		append(&around, visible(e, top.line - 1, y))
+	}
+	append(&around, ..lines)
+	if bottom.line + 1 < hm.lines {
+		y := bottom.y + f32(hm_get(hm, bottom.line)) * scale
+		append(&around, visible(e, bottom.line + 1, y))
+	}
+
+	view_lo := around[0].start
+	last := around[len(around) - 1]
+	view_hi := last.start + len(last.text)
+	pad, radius := gfx.selection_look(f32(font_size(e)) * scale)
+	rows := make([dynamic]gfx.Rect, context.temp_allocator)
+
+	for j := textedit.first_selection_at(e, view_lo); j < len(e.sels); j += 1 {
+		lo, hi := textedit.sel_lo(e.sels[j]), textedit.sel_hi(e.sels[j])
+		if lo > view_hi do break
+		if lo == hi do continue
+
+		clear(&rows)
+		for v in around {
+			if v.start > hi do break
+
+			if v.L.kind == .Table {
+				draw_cell_selection(v, lo, hi, left, scale, radius)
+			} else {
+				add_selection_rows(e, &rows, v, lo, hi, left, scale)
+			}
+		}
+		gfx.fill_selection(rows[:], pad, radius, gfx.theme.selection)
+	}
+}
+
+
+// Adds the rows of line v that a selection [lo, hi] covers
+@(private = "file")
+add_selection_rows :: proc(
+	e: ^View,
+	rows: ^[dynamic]gfx.Rect,
+	v: Visible,
+	lo, hi: int,
+	left, scale: f32,
+) {
+	L, start := v.L, v.start
+	end := start + len(v.text)
+	if hi < start || lo > end {
+		return
+	}
+
+	for r, ri in L.rows {
+		x1, x2, ok := selection_span(L, v.text, ri, lo - start, hi - start)
+		if !ok do continue
+
+		// Selected past the line's end: its newline
+		last_row := ri == len(L.rows) - 1
+		if hi > end && last_row {
+			x2 += f32(font_size(e)) * 0.4
+		}
+		if x2 <= x1 do continue
+
+		// Reaching the lines before and after, across the line's padding
+		row_top := r.y
+		row_bottom := r.y + r.h
+		if ri == 0 && lo < start {
+			row_top = 0
+		}
+		if last_row && hi > end && len(L.images) == 0 {
+			row_bottom = L.height
+		}
+
+		x := screen_x(left, x1, scale)
+		y := math.round(v.y + row_top * scale)
+		w := screen_x(left, x2, scale) - x
+		h := math.round(v.y + row_bottom * scale) - y
+		append(rows, gfx.Rect{x, y, w, h})
+	}
+}
+
+
+// A selection [lo, hi] over a table row: each box it covers (a whole cell, or
+// a line of a cell's text) rounded on its own
+@(private = "file")
+draw_cell_selection :: proc(v: Visible, lo, hi: int, left, scale, radius: f32) {
+	end := v.start + len(v.text)
+	if hi < v.start || lo > end {
+		return
+	}
+
+	for box in table_selection(v.L, v.text, lo - v.start, hi - v.start) {
+		x := screen_x(left, box.x, scale)
+		y := math.round(v.y + box.y * scale)
+		w := screen_x(left, box.x + box.w, scale) - x
+		h := math.round(v.y + (box.y + box.h) * scale) - y
+		r := [1]gfx.Rect{{x, y, w, h}}
+		gfx.fill_selection(r[:], 0, radius, gfx.theme.selection)
 	}
 }
 
@@ -347,7 +447,7 @@ draw_code_bar :: proc(e: ^View, line: int, scale: f32) {
 	if !ok do return
 
 	active :=
-		e.mdv.code_drag.active ||
+		e.mdv.code_drag.grab != nil ||
 		gfx.rect_contains(code_bar_grab_area(track), env.input().mouse_pos)
 	r := clay.BoundingBox{
 		math.round(thumb.x * scale),
@@ -399,7 +499,7 @@ draw_run :: proc(
 	ry := y + r.y * scale
 	m := gfx.font_metrics(&gfx.text_system, run.font, run.size)
 	baseline := ry + (r.baseline + run.dy) * scale
-	x := screen_x(left, run.x, scale)
+	x := screen_x(left, run.x + run.dx, scale)
 
 	#partial switch run.kind {
 	case .Text:

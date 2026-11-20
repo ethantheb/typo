@@ -518,7 +518,12 @@ has_diagnostics :: proc(c: ^Client, got: []Event) -> bool {
 
 @(private = "file")
 open_text :: proc(c: ^Client, uri, text: string) {
-	client_open(c, uri, "plaintext", 1, transmute([]u8)strings.clone(text))
+	b: buffer.Buffer
+	buffer.buffer_init(&b, transmute([]u8)strings.clone(text))
+	defer buffer.buffer_destroy(&b)
+
+	b.version = 1
+	client_open(c, uri, "plaintext", buffer.snapshot(&b))
 }
 
 

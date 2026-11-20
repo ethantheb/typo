@@ -8,32 +8,49 @@ package fake_server
 // inside them; references are the word wherever it is in the open documents.
 // Completion offers every word of the open documents (but the one typed), a
 // snippet ("fake_snippet") and an item that adds a line at the top
-// ("fake_import"); resolving adds documentation. Signature help is for an
-// unclosed "name(" on the line: "name(a, b, c)". Renaming changes the word in the
-// open documents and in its root folder's files of the same kind (up to 1 MB)
-// that aren't open. "fake/apply" makes it ask the client to replace each
-// "FIXME" of a document with "FIXED" (workspace/applyEdit), and answers with
-// the client's answer. `--utf16` makes it refuse UTF-8 positions; "fake/crash"
-// makes it exit at once. `--copy-to <path>` copies the program there and exits
-// (an install command for the perf suite)
+// ("fake_import"); resolving adds documentation; `--incomplete` makes it list
+// only the first few words starting with the one typed, as an incomplete list.
+// `--complete-empty` makes completion answer an empty list, `--complete-error`
+// an error, and `--complete-delay <ms>` wait that long before answering.
+// Signature help is for an unclosed "name(" on the line: "name(a, b, c)".
+// Renaming changes the word in the open documents and in its root folder's
+// files of the same kind (up to 1 MB) that aren't open. "fake/apply" makes it
+// ask the client to replace each "FIXME" of a document with "FIXED"
+// (workspace/applyEdit), and answers with the client's answer. `--utf16` makes
+// it refuse UTF-8 positions; "fake/crash" makes it exit at once. `--copy-to
+// <path>` copies the program there and exits (an install command for the perf
+// suite)
 
 import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:slice"
+import "core:strconv"
 import "core:strings"
+import "core:time"
 
 import lsp ".."
 
 
 Server :: struct {
-	encoding: lsp.Encoding,
-	root:     string,            // owned; the folder from initialize
-	docs:     map[string]string, // by URI, owned
-	versions: map[string]int,    // by URI (keys are the docs' keys)
-	applying: json.Value,        // the id of a fake/apply waiting for the client
-	out:      [dynamic]u8,
+	encoding:   lsp.Encoding,
+	incomplete: bool,              // completion lists a few words starting with the typed one
+	completion: enum {
+		Words,
+		Empty,
+		Error,
+	},
+	delay:      time.Duration,     // before answering completion
+	root:       string,            // owned; the folder from initialize
+	docs:       map[string]string, // by URI, owned
+	versions:   map[string]int,    // by URI (keys are the docs' keys)
+	applying:   json.Value,        // the id of a fake/apply waiting for the client
+	out:        [dynamic]u8,
 }
+
+// The most words listed with --incomplete
+@(private = "file")
+INCOMPLETE_LIMIT :: 5
 
 
 // Copies this program to `path`, making its folder
@@ -55,6 +72,13 @@ main :: proc() {
 	utf16_only := false
 	for arg, i in os.args[1:] {
 		if arg == "--utf16" do utf16_only = true
+		if arg == "--incomplete" do s.incomplete = true
+		if arg == "--complete-empty" do s.completion = .Empty
+		if arg == "--complete-error" do s.completion = .Error
+		if arg == "--complete-delay" && i + 2 < len(os.args) {
+			ms, _ := strconv.parse_int(os.args[i + 2])
+			s.delay = time.Duration(ms) * time.Millisecond
+		}
 		if arg == "--copy-to" && i + 2 < len(os.args) {
 			os.exit(copy_self(os.args[i + 2]) ? 0 : 1)
 		}
@@ -161,7 +185,15 @@ handle :: proc(s: ^Server, body: string) {
 
 	case "textDocument/completion":
 		uri := lsp.get_string(params, "textDocument", "uri")
-		reply(s, id, completions(s, uri, lsp.get_position(lsp.get(params, "position"))))
+		if s.delay > 0 do time.sleep(s.delay)
+		switch s.completion {
+		case .Words:
+			reply(s, id, completions(s, uri, lsp.get_position(lsp.get(params, "position"))))
+		case .Empty:
+			reply(s, id, []Completion_Item{})
+		case .Error:
+			reply_error(s, id, "completion failed")
+		}
 
 	case "completionItem/resolve":
 		label := lsp.get_string(params, "label")
@@ -631,7 +663,8 @@ Completion_List :: struct {
 
 // Every word of the open documents (replacing the word before the position),
 // sorted; then "fake_snippet", a snippet, and "fake_import", which also adds a
-// line at the top
+// line at the top. With --incomplete: the first few words that start with the
+// one typed, the list incomplete if there are more
 @(private = "file")
 completions :: proc(s: ^Server, uri: string, p: lsp.Position) -> Completion_List {
 	doc := s.docs[uri]
@@ -670,6 +703,7 @@ completions :: proc(s: ^Server, uri: string, p: lsp.Position) -> Completion_List
 		edit := Text_Edit{replaced, label}
 		append(&items, Completion_Item{label = label, kind = 6, detail = "fake", text_edit = edit})
 	}
+	if s.incomplete do return incomplete_list(items[:], doc[lo:at])
 	append(&items, Completion_Item {
 		label              = "fake_snippet",
 		kind               = 15,
@@ -681,6 +715,25 @@ completions :: proc(s: ^Server, uri: string, p: lsp.Position) -> Completion_List
 	more[0] = {top, "// imported\n"}
 	append(&items, Completion_Item{label = "fake_import", kind = 9, additional_text_edits = more})
 	return {false, items[:]}
+}
+
+
+// The first INCOMPLETE_LIMIT items whose label starts with `typed`, as servers
+// that filter and cap their lists do
+@(private = "file")
+incomplete_list :: proc(items: []Completion_Item, typed: string) -> Completion_List {
+	listed := make([dynamic]Completion_Item, context.temp_allocator)
+	more := false
+	for item in items {
+		if !strings.has_prefix(item.label, typed) do continue
+
+		if len(listed) == INCOMPLETE_LIMIT {
+			more = true
+			break
+		}
+		append(&listed, item)
+	}
+	return {more, listed[:]}
 }
 
 
@@ -795,6 +848,17 @@ reply :: proc(s: ^Server, id: json.Value, result: any) {
 		`{{"jsonrpc":"2.0","id":%s,"result":%s}}`,
 		lsp.to_json(id),
 		lsp.to_json(result),
+	)
+	write(s, body)
+}
+
+
+@(private = "file")
+reply_error :: proc(s: ^Server, id: json.Value, message: string) {
+	body := fmt.tprintf(
+		`{{"jsonrpc":"2.0","id":%s,"error":{{"code":-32603,"message":%s}}}}`,
+		lsp.to_json(id),
+		lsp.to_json(message),
 	)
 	write(s, body)
 }

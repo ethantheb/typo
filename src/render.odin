@@ -66,6 +66,8 @@ render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scal
 				draw_editor(c, b, scale)
 			case ^Terminal:
 				draw_terminal(c, b, scale)
+			case Field_Draw:
+				draw_text_field(c, b, scale)
 			}
 
 		case .Image:

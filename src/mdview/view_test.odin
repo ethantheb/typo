@@ -27,8 +27,9 @@ test_opened: string
 @(private)
 test_env :: proc() {
 	env = {
-		config       = env_config,
-		input        = env_input,
+		config           = env_config,
+		input            = env_input,
+		text_line_height = env_text_line_height,
 		files        = env_files,
 		ensure_index = env_ensure_index,
 		open_file    = env_open_file,
@@ -38,7 +39,13 @@ test_env :: proc() {
 
 @(private = "file")
 env_config :: proc() -> Config {
-	return {font_size = 16, line_height = 1.5, text_line_height = 20}
+	return {font_size = 16, line_height = 1.5}
+}
+
+
+@(private = "file")
+env_text_line_height :: proc(v: ^textedit.View) -> int {
+	return int(20 * textedit.zoom(v))
 }
 
 
@@ -169,6 +176,88 @@ test_md_hides_syntax :: proc(t: ^testing.T) {
 }
 
 
+// List numbers line up on their dot with the item text after them at one x,
+// each digit in a cell as wide as the widest digit (so a number's units line
+// up), in nested lists too. Showing a number's syntax moves nothing, and a
+// caret at each of its bytes is where a click there puts it
+@(test)
+test_md_ordered_markers :: proc(t: ^testing.T) {
+	e := make_view("x\n\n1. one\n7. seven\n10. ten\n    1. nested\n    12) nested\n")
+	defer destroy_view(e)
+
+	// Each list's numbers, by line
+	lists := [][]int{{2, 3, 4}, {5, 6}}
+	for lines in lists {
+		first := number_layout(e, lines[0])
+		for line in lines {
+			n := number_layout(e, line)
+			testing.expectf(t, n.dot_end == first.dot_end, "line %d: dot at %v", line, n.dot_end)
+			testing.expectf(t, n.text_x == first.text_x, "line %d: text at %v", line, n.text_x)
+			testing.expectf(t, n.units_x == first.units_x, "line %d: units at %v", line, n.units_x)
+			testing.expectf(t, n.cells_ok, "line %d: digits not in cells", line)
+		}
+	}
+	testing.expect(t, number_layout(e, 5).text_x > number_layout(e, 2).text_x)
+
+	// With the caret on line 4 its number shows as syntax, in the same place
+	hidden := number_layout(e, 4)
+	at := buffer.line_start(&e.buf, 4) + 1
+	textedit.set_single_selection(e, {at, at, -1})
+	shown := number_layout(e, 4)
+	testing.expect_value(t, shown.dot_end, hidden.dot_end)
+	testing.expect_value(t, shown.text_x, hidden.text_x)
+	testing.expect(t, line_layout(e, 4).runs[0].color == .Marker)
+
+	// Carets in "10. " and clicks at them
+	L := line_layout(e, 4)
+	text, _ := line_text(e, 4)
+	y := L.rows[0].y + L.rows[0].h / 2
+	for k in 0 ..= 4 {
+		_, x := caret_row_x(L, text, k)
+		testing.expectf(t, index_at(L, text, x, y) == k, "a click at byte %d's caret", k)
+	}
+}
+
+
+// Where line i's list number is laid out: the end of its dot, the start of
+// the item's text and the x of its last digit; cells_ok if each digit has a
+// run as wide as the widest digit, next to the one before
+@(private = "file")
+Number_Layout :: struct {
+	dot_end, text_x, units_x: f32,
+	cells_ok:                 bool,
+}
+
+
+@(private = "file")
+number_layout :: proc(e: ^View, i: int) -> (n: Number_Layout) {
+	L := line_layout(e, i)
+	text, _ := line_text(e, i)
+
+	n.cells_ok = true
+	cell := f32(font_size(e)) * 0.5 // every character's width without a text engine
+	next_x: f32 = -1
+	for run in L.runs {
+		if !hanging(L, run) do continue
+
+		if text[run.lo] < '0' || text[run.lo] > '9' {
+			n.dot_end = run.x + run.w
+			continue
+		}
+
+		one_digit := run.hi - run.lo == 1
+		in_place := next_x < 0 || abs(run.x - next_x) < 0.01
+		n.cells_ok &= one_digit && in_place && run.w == cell
+		n.units_x = run.x
+		next_x = run.x + run.w
+	}
+
+	content := strings.index_any(text, ".)") + 2
+	_, n.text_x = caret_row_x(L, text, content)
+	return n
+}
+
+
 // A quote's bar runs through its blank ">" lines, and stops at a blank line
 @(test)
 test_md_quote_bars :: proc(t: ^testing.T) {
@@ -188,7 +277,7 @@ test_md_top_margin :: proc(t: ^testing.T) {
 	e := make_view("# Title\nbody")
 	defer destroy_view(e)
 
-	testing.expect(t, hm_y(&e.mdv.heights, 0) >= f64(body_line_height()) - 1)
+	testing.expect(t, hm_y(&e.mdv.heights, 0) >= f64(body_line_height(e)) - 1)
 	testing.expect_value(t, offset_at_point(e, e.view.x + e.mdv.col_x + 1, e.view.y + 2), 0)
 
 	set_mode(e, .Text)

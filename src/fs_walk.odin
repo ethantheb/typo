@@ -30,6 +30,29 @@ list_directory :: proc(dir: string) -> (entries: []Dir_Entry, ok: bool) {
 }
 
 
+// A folder's entries as the tree shows them, in the temp allocator: folders
+// first, then by name ignoring case. As in core:os, folder symlinks and
+// junctions count as files
+read_tree_folder :: proc(dir: string) -> (entries: []Dir_Entry, ok: bool) {
+	entries = list_directory(dir) or_return
+	for &e in entries {
+		e.is_dir = e.is_dir && !e.is_link
+	}
+	slice.sort_by(entries, dir_entry_less)
+	return entries, true
+}
+
+
+@(private = "file")
+dir_entry_less :: proc(a, b: Dir_Entry) -> bool {
+	if a.is_dir != b.is_dir do return a.is_dir
+
+	a_name := strings.to_lower(a.name, context.temp_allocator)
+	b_name := strings.to_lower(b.name, context.temp_allocator)
+	return a_name < b_name
+}
+
+
 @(private = "file")
 list_directory_generic :: proc(dir: string) -> (entries: []Dir_Entry, ok: bool) {
 	infos, err := os.read_all_directory_by_path(dir, context.temp_allocator)

@@ -97,7 +97,7 @@ apply_overlays :: proc(c: clay.Color) -> clay.Color {
 }
 
 
-@(private = "file")
+@(private)
 to_fcolor :: proc(c: clay.Color) -> sdl.FColor {
 	c := apply_overlays(c)
 	return {c.r / 255, c.g / 255, c.b / 255, c.a / 255}
@@ -199,6 +199,176 @@ fill_rounded_rect :: proc(b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Col
 		in_i, in_j := i32(1 + i), i32(1 + j)
 		out_i, out_j := in_i + RING, in_j + RING
 		copy(indices[i * 9:], []i32{0, in_i, in_j, in_i, out_i, out_j, in_i, out_j, in_j})
+	}
+
+	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
+}
+
+
+// --- Selections --------------------------------------------------------------------
+
+// A selection's padding beside its text and the radius of its corners, for
+// text of a size (all in pixels)
+selection_look :: proc(text_size: f32) -> (pad, radius: f32) {
+	return math.round(text_size * 0.2), math.round(text_size * 0.3)
+}
+
+
+// Draws one selection from its rows (pixels, top to bottom), each widened by
+// `pad` on both sides. Rows that touch and overlap make one shape: rounded on
+// the outside, curving into the inside corners where rows of different widths
+// meet. Rows that don't (a gap, or no overlap) are shapes of their own
+fill_selection :: proc(rows: []Rect, pad, radius: f32, c: clay.Color) {
+	if len(rows) == 0 do return
+
+	flush_text()
+	fc := to_fcolor(c)
+
+	for i in 0 ..< len(rows) {
+		piece := selection_piece(rows, i, pad, radius)
+		for f in piece.fillets[:piece.n_fillets] {
+			fill_fillet(f.corner, f.dir, f.radius, fc)
+		}
+
+		box := piece.box
+		fill_rounded_rect({box.x, box.y, box.w, box.h}, piece.corners, c)
+	}
+}
+
+
+// A row of a selection's shape: its box (widened by the padding), the radius
+// of each of its corners, and the inside corners where it meets the row above
+Selection_Piece :: struct {
+	box:       Rect,
+	corners:   clay.CornerRadius,
+	fillets:   [2]Fillet,
+	n_fillets: int,
+}
+
+// An inside corner's curve: the square of side `radius` at `corner` toward
+// `dir` (each ±1), less a quarter disc (see fill_fillet)
+Fillet :: struct {
+	corner, dir: [2]f32,
+	radius:      f32,
+}
+
+
+// The shape of row i of a selection (see fill_selection)
+selection_piece :: proc(rows: []Rect, i: int, pad, radius: f32) -> (p: Selection_Piece) {
+	row := rows[i]
+	r := Rect{row.x - pad, row.y, row.w + 2 * pad, row.h}
+	p.box = r
+	p.corners = {radius, radius, radius, radius}
+
+	// Where a row above or below joins it, its corners are rounded only where
+	// it reaches past that row
+	if above, ok := joined_row(rows, i, i - 1, pad); ok {
+		p.corners.topLeft = outer_radius(above.x - r.x, radius)
+		p.corners.topRight = outer_radius(r.x + r.w - (above.x + above.w), radius)
+		inner_corners(&p, above, r, radius)
+	}
+	if below, ok := joined_row(rows, i, i + 1, pad); ok {
+		p.corners.bottomLeft = outer_radius(below.x - r.x, radius)
+		p.corners.bottomRight = outer_radius(r.x + r.w - (below.x + below.w), radius)
+	}
+	return p
+}
+
+
+// Row j of a selection, widened, if it joins row i: right above or below it,
+// overlapping it sideways
+@(private = "file")
+joined_row :: proc(rows: []Rect, i, j: int, pad: f32) -> (r: Rect, ok: bool) {
+	if j < 0 || j >= len(rows) {
+		return
+	}
+
+	a, b := rows[min(i, j)], rows[max(i, j)]
+	touching := abs(a.y + a.h - b.y) <= 1
+	overlap := min(a.x + a.w, b.x + b.w) - max(a.x, b.x)
+	if !touching || overlap + 2 * pad <= 0 {
+		return
+	}
+
+	row := rows[j]
+	return {row.x - pad, row.y, row.w + 2 * pad, row.h}, true
+}
+
+
+// The radius of a corner where a row reaches `past` beyond the row it joins:
+// rounded if it does, square if not, and small enough to leave room for the
+// inside corner across from it
+@(private = "file")
+outer_radius :: proc(past, radius: f32) -> f32 {
+	if past < 0.5 do return 0
+	return min(radius, past / 2)
+}
+
+
+// The inside corners where `above` meets `r` below it: on each side where one
+// reaches further, a curve from its edge into the other's side
+@(private = "file")
+inner_corners :: proc(p: ^Selection_Piece, above, r: Rect, radius: f32) {
+	y := r.y
+
+	// Left: beside the narrower one's left edge, above or below the join
+	left := r.x - above.x
+	if left > 0.5 {
+		add_fillet(p, {{r.x, y}, {-1, 1}, min(radius, left / 2, r.h / 2)})
+	} else if left < -0.5 {
+		add_fillet(p, {{above.x, y}, {-1, -1}, min(radius, -left / 2, above.h / 2)})
+	}
+
+	// Right
+	right := above.x + above.w - (r.x + r.w)
+	if right > 0.5 {
+		add_fillet(p, {{r.x + r.w, y}, {1, 1}, min(radius, right / 2, r.h / 2)})
+	} else if right < -0.5 {
+		x := above.x + above.w
+		add_fillet(p, {{x, y}, {1, -1}, min(radius, -right / 2, above.h / 2)})
+	}
+}
+
+
+@(private = "file")
+add_fillet :: proc(p: ^Selection_Piece, f: Fillet) {
+	p.fillets[p.n_fillets] = f
+	p.n_fillets += 1
+}
+
+
+// Fills the square of side `radius` beside an inside corner, toward `dir`
+// (each ±1), less the quarter disc a curve of that radius leaves empty: the
+// shape beside it turns the corner on that curve. Its curved edge fades over
+// a pixel, like fill_rounded_rect's
+@(private = "file")
+fill_fillet :: proc(corner, dir: [2]f32, radius: f32, fc: sdl.FColor) {
+	if radius < 1 do return
+
+	clear := fc
+	clear.a = 0
+	centre := corner + dir * radius
+
+	// The corner, then along the curve a solid point and a clear one per step
+	verts: [1 + 2 * (CORNER_SEGMENTS + 1)]sdl.Vertex
+	verts[0] = {position = sdl.FPoint(corner), color = fc}
+	for s in 0 ..= CORNER_SEGMENTS {
+		a := f32(s) / CORNER_SEGMENTS * (math.PI / 2)
+		n := [2]f32{-dir.x * math.cos(a), -dir.y * math.sin(a)} // from the centre toward the corner
+		p := centre + n * radius
+		verts[1 + 2 * s] = {position = sdl.FPoint(p + n * 0.5), color = fc}
+		verts[2 + 2 * s] = {position = sdl.FPoint(p - n * 0.5), color = clear}
+	}
+
+	// A fan triangle from the corner and two edge triangles per step
+	indices: [9 * CORNER_SEGMENTS]i32
+	for s in 0 ..< CORNER_SEGMENTS {
+		solid, edge := i32(1 + 2 * s), i32(2 + 2 * s)
+		next_solid, next_edge := solid + 2, edge + 2
+		fan := []i32{0, solid, next_solid}
+		ring := []i32{solid, edge, next_edge, solid, next_edge, next_solid}
+		copy(indices[s * 9:], fan)
+		copy(indices[s * 9 + 3:], ring)
 	}
 
 	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))

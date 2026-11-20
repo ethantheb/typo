@@ -2,6 +2,8 @@ package gfx
 
 import "core:testing"
 
+import clay "../../vendor/clay-odin"
+
 // Every built-in theme has a unique key and all of its syntax colors set
 @(test)
 test_themes :: proc(t: ^testing.T) {
@@ -27,6 +29,52 @@ test_themes :: proc(t: ^testing.T) {
 		missing := spec.dark ? "light" : "dark"
 		testing.expectf(t, other, "%s has no %s counterpart", spec.key, missing)
 	}
+}
+
+
+// A selection's rows as one shape: corners rounded only where a row reaches
+// past the one it joins, inside corners curved, rows that don't touch or
+// overlap shapes of their own
+@(test)
+test_selection_shape :: proc(t: ^testing.T) {
+	rows := []Rect {
+		{100, 0, 100, 20}, // reaches past the next row on the right
+		{0, 20, 150, 20},  // past the one above on the left, the next on the right
+		{0, 40, 50, 20},   // the same left edge as the one above
+		{300, 60, 20, 20}, // no overlap with the one above: on its own
+		{300, 90, 20, 20}, // a gap above: on its own
+	}
+	R :: 4
+
+	p := selection_piece(rows, 0, 0, R)
+	testing.expect_value(t, p.corners, clay.CornerRadius{R, R, 0, R})
+	testing.expect_value(t, p.n_fillets, 0)
+
+	p = selection_piece(rows, 1, 0, R)
+	testing.expect_value(t, p.corners, clay.CornerRadius{R, 0, 0, R})
+	testing.expect_value(t, p.n_fillets, 2)
+	testing.expect_value(t, p.fillets[0], Fillet{{100, 20}, {-1, -1}, R}) // in the row above
+	testing.expect_value(t, p.fillets[1], Fillet{{150, 20}, {1, 1}, R})   // in this row
+
+	p = selection_piece(rows, 2, 0, R)
+	testing.expect_value(t, p.corners, clay.CornerRadius{0, 0, R, R})
+	testing.expect_value(t, p.n_fillets, 1)
+	testing.expect_value(t, p.fillets[0], Fillet{{50, 40}, {1, 1}, R})
+
+	for i in 3 ..< 5 {
+		p = selection_piece(rows, i, 0, R)
+		testing.expect_value(t, p.corners, clay.CornerRadius{R, R, R, R})
+		testing.expect_value(t, p.n_fillets, 0)
+	}
+
+	// Padding widens every row; a step narrower than two radii gets smaller curves
+	p = selection_piece(rows, 0, 3, R)
+	testing.expect_value(t, p.box, Rect{97, 0, 106, 20})
+	steps := []Rect{{0, 0, 103, 20}, {0, 20, 100, 20}}
+	p = selection_piece(steps, 0, 0, R)
+	testing.expect_value(t, p.corners.bottomRight, 1.5)
+	p = selection_piece(steps, 1, 0, R)
+	testing.expect_value(t, p.fillets[0].radius, 1.5)
 }
 
 

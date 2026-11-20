@@ -1,8 +1,5 @@
 package editor
 
-import "core:strings"
-import "core:unicode/utf8"
-
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
 import "gfx"
@@ -36,10 +33,12 @@ pointer_in :: proc(id: clay.ElementId) -> bool {
 // Whether UI may react to the pointer: a popup's own controls always may
 // (g.in_modal is set while they are built), the rest only while no popup covers
 // the window. The settings window's option list sits at the side and leaves the
-// window usable outside it
+// window usable outside it. The find bar covers what is under it (it can reach
+// past a narrow pane)
 ui_interactive :: proc() -> bool {
 	switch {
 	case g.dialog.open, g.menu.open, g.lsp.popup.open: return g.in_popup
+	case g.zoom_popup.open:                           return g.in_popup
 	case lsp_hover_covers_pointer():                  return g.in_popup
 	case lsp_completion_covers_pointer():             return g.in_popup
 	case lsp_rename_covers_pointer():                 return g.in_popup
@@ -47,6 +46,7 @@ ui_interactive :: proc() -> bool {
 	case g.finder.open:                               return false
 	case settings_window_docked():                    return !pointer_in(clay.ID("Settings"))
 	case g.settings_window.open:                      return false
+	case find_bar_covers_pointer():                   return g.in_find_bar
 	}
 	return true
 }
@@ -214,6 +214,7 @@ Custom_Data :: union {
 	gfx.Icon_Data,
 	^Editor,
 	^Terminal,
+	Field_Draw,
 }
 
 
@@ -241,100 +242,6 @@ custom_element :: proc(id: clay.ElementId, data: Custom_Data, size: f32 = 0) {
 	} else {
 		if clay.UI(id)(config) {}
 	}
-}
-
-
-// --- Text fields -------------------------------------------------------------------
-
-// Edits a one-line text buffer: typing, Backspace (Ctrl+Backspace clears) and
-// Ctrl+V. Returns whether the event was one of those, and whether it changed the
-// text
-text_field_event :: proc(buf: ^[dynamic]u8, event: ^sdl.Event) -> (handled, changed: bool) {
-	before := len(buf)
-
-	#partial switch event.type {
-	case .TEXT_INPUT:
-		append(buf, string(event.text.text))
-		return true, true
-
-	case .KEY_DOWN:
-		ctrl := event.key.mod & sdl.KMOD_CTRL != {}
-		switch {
-		case event.key.key == sdl.K_BACKSPACE && ctrl:
-			clear(buf)
-
-		case event.key.key == sdl.K_BACKSPACE:
-			_, size := utf8.decode_last_rune(buf[:])
-			resize(buf, len(buf) - size)
-
-		case base_key(event.key) == sdl.K_V && ctrl:
-			raw := sdl.GetClipboardText()
-			if raw == nil do return true, false
-			defer sdl.free(raw)
-
-			// On one line
-			pasted := string(cstring(raw))
-			text, _ := strings.replace_all(pasted, "\r\n", " ", context.temp_allocator)
-			text, _ = strings.replace_all(text, "\n", " ", context.temp_allocator)
-			append(buf, text)
-
-		case:
-			return false, false
-		}
-		return true, len(buf) != before
-	}
-	return false, false
-}
-
-
-// The look of a one-line text field: the text with a caret while focused, or
-// the placeholder (dimmed) while empty. A width of 0 fills the row
-input_box :: proc(
-	id: clay.ElementId,
-	text, placeholder: string,
-	focused: bool,
-	width: f32 = 0,
-	height: f32 = 32,
-	size: u16 = FONT_SIZE_UI,
-) {
-	box_width := width > 0 ? clay.SizingFixed(width) : clay.SizingGrow()
-
-	if clay.UI(id)({
-		layout = {
-			sizing = {box_width, clay.SizingFixed(height)},
-			padding = {left = 10, right = 10},
-			childAlignment = {y = .Center},
-		},
-		backgroundColor = gfx.theme.bg,
-		cornerRadius = clay.CornerRadiusAll(5),
-		border = {
-			color = focused ? gfx.theme.accent : gfx.theme.border,
-			width = clay.BorderOutside(1),
-		},
-	}) {
-		// Clipped inside the field so the clip doesn't cut off the outline
-		if clay.UI()({
-			layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}},
-			clip = {horizontal = true},
-		}) {
-			if text == "" {
-				if focused do text_caret()
-				label(placeholder, gfx.theme.text_dim, size)
-			} else {
-				label(text, gfx.theme.text_bright, size)
-				if focused do text_caret()
-			}
-		}
-	}
-}
-
-
-@(private = "file")
-text_caret :: proc() {
-	if clay.UI()({
-		layout = {sizing = {clay.SizingFixed(1.5), clay.SizingFixed(16)}},
-		backgroundColor = gfx.theme.text_bright,
-	}) {}
 }
 
 
@@ -445,16 +352,30 @@ clicked_outside :: proc(panel: clay.ElementId, opened_frame: u64) -> bool {
 // --- Tooltips ----------------------------------------------------------------------
 
 // tooltip() goes right after the element it describes. When the pointer has
-// rested on it for TOOLTIP_DELAY the tip appears beside it, on whichever side
-// keeps it on screen. A click hides it until the pointer leaves
+// rested on it for TOOLTIP_DELAY the tip appears at the pointer: below it, or
+// above when there is no room, and shifted to stay in the window. A click hides
+// it until the pointer leaves
 
 TOOLTIP_DELAY :: 500_000_000 // ns
 
+TOOLTIP_PAD_X  :: 8
+TOOLTIP_PAD_Y  :: 4
+TOOLTIP_GAP    :: 10 // between the text and the shortcut
+TOOLTIP_BELOW  :: 20 // from the pointer down to a tip below it, clear of the arrow
+TOOLTIP_ABOVE  :: 6  // from the pointer up to a tip above it
+TOOLTIP_MARGIN :: 4  // from the window's edges
+
+// Where a tip is laid out on its first frame, before Clay has measured it
+TOOLTIP_OUT_OF_SIGHT :: [2]f32{-10_000, -10_000}
+
 Tooltip_State :: struct {
-	id:         u32,  // element being hovered, or 0
-	since:      u64,  // when hovering it began
-	seen:       bool, // a tooltip() call matched the pointer this frame
-	suppressed: bool, // clicked; stay hidden until the pointer leaves
+	id:         u32,    // element being hovered, or 0
+	since:      u64,    // when hovering it began
+	seen:       bool,   // a tooltip() call matched the pointer this frame
+	suppressed: bool,   // clicked; stay hidden until the pointer leaves
+	shown:      bool,   // the tip is showing, anchored at `at`
+	placed:     bool,   // measured by Clay and placed (not out of sight)
+	at:         [2]f32, // where the pointer was when it appeared
 }
 
 
@@ -475,32 +396,38 @@ tooltip :: proc(id: clay.ElementId, text: string, shortcut := "") {
 		return
 	}
 
-	// The side that keeps it on screen
-	box, _ := element_rect(id)
-	above := box.y + box.h / 2 > f32(g.window_h) / 2
-	right := box.x + box.w / 2 > f32(g.window_w) / 2
-	attach: clay.FloatingAttachPoints
-	switch {
-	case above && right: attach = {element = .RightBottom, parent = .RightTop}
-	case above:          attach = {element = .LeftBottom, parent = .LeftTop}
-	case right:          attach = {element = .RightTop, parent = .RightBottom}
-	case:                attach = {element = .LeftTop, parent = .LeftBottom}
+	// It stays where it appeared. Its first frame lays it out out of sight, so
+	// Clay measures it; from then on it is placed by that size
+	first := !t.shown
+	if first {
+		t.shown = true
+		t.at = g.mouse_pos
 	}
 
-	if clay.UI(clay.ID("Tooltip"))({
+	tip := clay.ID("Tooltip")
+	offset := TOOLTIP_OUT_OF_SIGHT
+	if size, measured := element_rect(tip); measured && !first {
+		offset = tooltip_place(t.at, {size.w, size.h})
+		t.placed = true
+	}
+
+	if clay.UI(tip)({
 		layout = {
-			padding = {left = 8, right = 8, top = 4, bottom = 4},
-			childGap = 10,
+			padding = {
+				left = TOOLTIP_PAD_X,
+				right = TOOLTIP_PAD_X,
+				top = TOOLTIP_PAD_Y,
+				bottom = TOOLTIP_PAD_Y,
+			},
+			childGap = TOOLTIP_GAP,
 			childAlignment = {y = .Center},
 		},
 		backgroundColor = gfx.theme.panel,
 		cornerRadius = clay.CornerRadiusAll(5),
 		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 		floating = {
-			attachTo = .ElementWithId,
-			parentId = id.id,
-			attachment = attach,
-			offset = {0, above ? -6 : 6},
+			attachTo = .Root,
+			offset = offset,
 			zIndex = 300,
 			pointerCaptureMode = .Passthrough,
 		},
@@ -508,6 +435,25 @@ tooltip :: proc(id: clay.ElementId, text: string, shortcut := "") {
 		label(text, gfx.theme.text, FONT_SIZE_SMALL)
 		if shortcut != "" do label(shortcut, gfx.theme.text_dim, FONT_SIZE_SMALL)
 	}
+}
+
+
+// Where a tip of `size` goes for the pointer at `at`: below it, else above it,
+// kept inside the window
+@(private = "file")
+tooltip_place :: proc(at, size: [2]f32) -> [2]f32 {
+	window_w := f32(g.window_w)
+	window_h := f32(g.window_h)
+
+	y := at.y + TOOLTIP_BELOW
+	if y + size.y > window_h - TOOLTIP_MARGIN {
+		y = at.y - TOOLTIP_ABOVE - size.y
+	}
+
+	// The far edges it may reach, unless it is wider or taller than the window
+	right := max(window_w - size.x - TOOLTIP_MARGIN, TOOLTIP_MARGIN)
+	bottom := max(window_h - size.y - TOOLTIP_MARGIN, TOOLTIP_MARGIN)
+	return {clamp(at.x, TOOLTIP_MARGIN, right), clamp(y, TOOLTIP_MARGIN, bottom)}
 }
 
 
@@ -521,12 +467,16 @@ tooltip_end_frame :: proc() {
 }
 
 
-// A tooltip is waiting for its delay to pass; keep drawing so it can appear
+// A tooltip is waiting for its delay to pass, or to be placed once Clay has
+// measured it; keep drawing so it can appear
 tooltip_pending :: proc() -> bool {
 	t := &g.tooltip
-	return t.id != 0 &&
-	       !t.suppressed &&
-	       sdl.GetTicksNS() - t.since < TOOLTIP_DELAY + 50_000_000
+	if t.id == 0 || t.suppressed {
+		return false
+	}
+
+	waiting := sdl.GetTicksNS() - t.since < TOOLTIP_DELAY + 50_000_000
+	return waiting || (t.shown && !t.placed)
 }
 
 

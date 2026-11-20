@@ -1,7 +1,5 @@
 package buffer
 
-import "base:runtime"
-
 // A text document: a piece table stored in a balanced tree, plus undo history.
 // Offsets are byte offsets into the document. Lines are separated by '\n'; a
 // preceding '\r' is treated as part of the line ending by the line queries
@@ -42,7 +40,8 @@ buffer_init :: proc(b: ^Buffer, data: []u8) {
 	b^ = {}
 	b.rng = 0x9E3779B9
 	append(&b.nodes, Node{}) // NIL sentinel
-	store_init(&b.stores[.Original], adopt(data))
+	store_init_original(&b.stores[.Original], data)
+	store_init_added(&b.stores[.Added])
 
 	if len(data) > 0 {
 		piece := Piece{0, len(data), b.stores[.Original].total_lf, .Original}
@@ -223,8 +222,8 @@ read_node :: proc(b: ^Buffer, t: u32, base: int, start, end: int, dst: []u8, n: 
 
 	lo, hi := max(start, piece_start), min(end, piece_end)
 	if lo < hi {
-		data := b.stores[node.piece.source].data
-		src := data[node.piece.start + lo - piece_start:][:hi - lo]
+		store := &b.stores[node.piece.source]
+		src := store_bytes(store, node.piece.start + lo - piece_start, hi - lo)
 		copy(dst[n^:], src)
 		n^ += hi - lo
 	}
@@ -250,8 +249,8 @@ chunk_at :: proc(b: ^Buffer, offset: int) -> []u8 {
 
 		offset -= left
 		if offset < n.piece.length {
-			data := b.stores[n.piece.source].data
-			return data[n.piece.start + offset:][:n.piece.length - offset]
+			store := &b.stores[n.piece.source]
+			return store_bytes(store, n.piece.start + offset, n.piece.length - offset)
 		}
 
 		offset -= n.piece.length
@@ -284,7 +283,7 @@ chunks :: proc(b: ^Buffer, allocator := context.temp_allocator) -> [][]u8 {
 
 	out := make([][]u8, len(pieces), allocator)
 	for p, i in pieces {
-		out[i] = b.stores[p.source].data[p.start:][:p.length]
+		out[i] = store_bytes(&b.stores[p.source], p.start, p.length)
 	}
 	return out
 }
@@ -297,24 +296,33 @@ chunks :: proc(b: ^Buffer, allocator := context.temp_allocator) -> [][]u8 {
 // server's)
 replace_untracked :: proc(b: ^Buffer, offset, remove_len: int, text: string) {
 	remove_range(b, offset, remove_len, nil)
-	if len(text) > 0 do insert_text(b, offset, text)
+	if len(text) > 0 do insert_text(b, offset, text, nil)
 }
 
 
-// Inserts text at offset and returns the piece describing it
+// Inserts text at offset, appending the pieces describing it to `inserted` if
+// given: one per add store block the text landed in
 @(private)
-insert_text :: proc(b: ^Buffer, offset: int, text: string) -> Piece {
+insert_text :: proc(b: ^Buffer, offset: int, text: string, inserted: ^[dynamic]Piece) {
 	added := &b.stores[.Added]
 	start := store_append(added, transmute([]u8)text)
-	piece := Piece{start, len(text), lf_count(added, start, start + len(text)), .Added}
+	end := start + len(text)
 
 	l, r := split(b, b.root, offset)
-	if !try_extend_last(b, l, piece) {
-		l = merge(b, l, new_node(b, piece))
-	}
-	b.root = merge(b, l, r)
 
-	return piece
+	pos := start
+	for pos < end {
+		piece_end := min(block_end(added, pos), end)
+		piece := Piece{pos, piece_end - pos, lf_count(added, pos, piece_end), .Added}
+		if inserted != nil do append(inserted, piece)
+
+		if !try_extend_last(b, l, piece) {
+			l = merge(b, l, new_node(b, piece))
+		}
+		pos = piece_end
+	}
+
+	b.root = merge(b, l, r)
 }
 
 
@@ -340,19 +348,6 @@ remove_range :: proc(b: ^Buffer, offset, count: int, removed: ^[dynamic]Piece) {
 	if removed != nil do collect(b, m, removed)
 	free_subtree(b, m)
 	b.root = merge(b, l, r)
-}
-
-
-// Wraps an allocated slice as a full dynamic array that owns it (no copy)
-@(private)
-adopt :: proc(data: []u8, allocator := context.allocator) -> [dynamic]u8 {
-	raw := runtime.Raw_Dynamic_Array {
-		data      = raw_data(data),
-		len       = len(data),
-		cap       = len(data),
-		allocator = allocator,
-	}
-	return transmute([dynamic]u8)raw
 }
 
 

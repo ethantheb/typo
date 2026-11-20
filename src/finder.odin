@@ -67,9 +67,10 @@ Finder_Item :: struct {
 Finder :: struct {
 	open:      bool,
 	opened_at: u64, // frame it was opened on
-	query:     [dynamic]u8,
+	query:     Line_Edit,
 	selected:  int,
-	reveal:    bool, // scroll the selected row into view, once laid out
+	reveal:    bool,       // scroll the selected row into view, once laid out
+	clicked:   Maybe(int), // a row clicked in the list (in `files` or `items`), opened next frame
 
 	// What is listed: files, or a server's items
 	source:    Finder_Source,
@@ -82,6 +83,7 @@ Finder :: struct {
 	indexer:   ^thread.Thread,
 	shared:    ^Index_Shared,
 	indexing:  bool,
+	stale:     bool,            // files changed on disk since indexing began
 	files:     [dynamic]string, // full paths, in discovery order
 	root_len:  int,             // prefix length to strip for display
 
@@ -126,7 +128,8 @@ finder_open :: proc(source: Finder_Source, what := "") {
 	f.opened_at = g.frame
 	f.source = source
 	f.what = what
-	clear(&f.query)
+	f.clicked = nil
+	line_edit_clear(&f.query)
 	set_string(&f.status, "")
 	if source == .Files && f.shared == nil {
 		start_indexer()
@@ -139,11 +142,12 @@ finder_open :: proc(source: Finder_Source, what := "") {
 finder_set_items :: proc(items: []Finder_Item, selected := 0) {
 	f := &g.finder
 	clear_items()
+	f.clicked = nil
 	append(&f.items, ..items)
 	set_string(&f.status, "")
 	finder_restart_search()
 
-	if selected > 0 && len(f.query) == 0 {
+	if selected > 0 && len(f.query.text) == 0 {
 		f.selected = selected
 		f.reveal = true
 	}
@@ -162,6 +166,7 @@ finder_close :: proc() {
 
 	if f.source != .Files do lsp_finder_closed()
 	f.open = false
+	f.clicked = nil
 	clear_items()
 	set_string(&f.status, "")
 }
@@ -181,6 +186,19 @@ finder_invalidate :: proc() {
 }
 
 
+// Files were added, removed or renamed on disk: an index built or being built
+// is stale. Once any walk under way ends, it is built again if the finder lists
+// files, else dropped until needed. Patching the list in place would need a
+// lookup by path the finder doesn't keep (removing a folder removes every file
+// under it)
+finder_files_changed :: proc() {
+	f := &g.finder
+	if f.shared == nil do return // not indexed yet; built when first needed
+
+	f.stale = true
+}
+
+
 finder_destroy :: proc() {
 	finder_invalidate()
 	clear_items()
@@ -188,13 +206,16 @@ finder_destroy :: proc() {
 	delete(g.finder.status)
 	delete(g.finder.files)
 	delete(g.finder.results)
-	delete(g.finder.query)
+	line_edit_destroy(&g.finder.query)
 	fuzzy.destroy()
 }
 
 
-// Per-frame work: take newly indexed files, continue the search, and let the
-// server's source ask what it needs
+// Per-frame work, before the panes' frames: take newly indexed files, open a
+// row clicked in the last frame, close on a press outside (which does nothing
+// else), continue the search, and let the server's source ask what it needs.
+// Clicks are handled here rather than in the list's layout, whose rows' strings
+// this frame's drawing still uses
 finder_frame :: proc() {
 	f := &g.finder
 
@@ -205,7 +226,28 @@ finder_frame :: proc() {
 		f.indexing = !f.shared.done
 	}
 
+	// Files changed on disk: index again if the files are listed, else drop the
+	// index until it is needed
+	if f.stale && !f.indexing {
+		finder_invalidate()
+		if f.open && f.source == .Files {
+			start_indexer()
+			finder_restart_search()
+		}
+	}
+
 	if !f.open do return
+
+	if row, was_clicked := f.clicked.?; was_clicked {
+		open_row(row)
+		return
+	}
+	if clicked_outside(clay.ID("Finder"), f.opened_at) {
+		finder_close()
+		g.mouse_pressed = false
+		return
+	}
+
 	if f.source != .Files do lsp_finder_frame()
 	continue_search()
 }
@@ -294,6 +336,7 @@ stop_indexer :: proc() {
 	f.shared = nil
 	f.indexer = nil
 	f.indexing = false
+	f.stale = false
 }
 
 
@@ -361,7 +404,7 @@ row_count :: proc() -> int {
 @(private = "file")
 continue_search :: proc() {
 	f := &g.finder
-	query := string(f.query[:])
+	query := line_edit_string(&f.query)
 	count := row_count()
 
 	// No query: the rows in order (just the first files found)
@@ -447,41 +490,42 @@ better_match :: proc(a, b: Match) -> bool {
 }
 
 
-// Returns true if the event was consumed by the finder
+// Keys while the finder is open; it takes them all: the query field's, the
+// list's, and shortcuts that don't act on the pane behind it (Ctrl+E closes)
 finder_handle_event :: proc(event: ^sdl.Event) -> bool {
 	f := &g.finder
 	if !f.open do return false
 
-	if handled, changed := text_field_event(&f.query, event); handled {
+	if handled, changed := line_edit_event(&f.query, event); handled {
 		if changed {
 			finder_restart_search()
 			if f.source == .Workspace_Symbols do lsp_finder_query_changed()
 		}
 		return true
 	}
+	if event.type != .KEY_DOWN do return true
 
-	if event.type == .KEY_DOWN {
-		last := len(f.results) - 1
-		switch event.key.key {
-		case sdl.K_ESCAPE:
-			finder_close()
-		case sdl.K_UP:
-			move_selection(max(f.selected - 1, 0))
-		case sdl.K_DOWN:
-			move_selection(min(f.selected + 1, last))
-		case sdl.K_PAGEUP:
-			move_selection(max(f.selected - FINDER_VISIBLE_ROWS, 0))
-		case sdl.K_PAGEDOWN:
-			move_selection(min(f.selected + FINDER_VISIBLE_ROWS, last))
-		case sdl.K_RETURN, sdl.K_KP_ENTER:
-			finder_accept(f.selected)
-		case:
-			// Let global shortcuts (e.g. Ctrl+E to close) through
-			return false
+	last := len(f.results) - 1
+	switch event.key.key {
+	case sdl.K_ESCAPE:
+		finder_close()
+	case sdl.K_UP:
+		move_selection(max(f.selected - 1, 0))
+	case sdl.K_DOWN:
+		move_selection(min(f.selected + 1, last))
+	case sdl.K_PAGEUP:
+		move_selection(max(f.selected - FINDER_VISIBLE_ROWS, 0))
+	case sdl.K_PAGEDOWN:
+		move_selection(min(f.selected + FINDER_VISIBLE_ROWS, last))
+	case sdl.K_RETURN, sdl.K_KP_ENTER:
+		finder_accept(f.selected)
+	case:
+		cmd, is_command := command_for_key(event.key)
+		if is_command && field_lets_through(cmd) {
+			run_command(cmd)
 		}
-		return true
 	}
-	return false
+	return true
 }
 
 
@@ -492,19 +536,27 @@ move_selection :: proc(to: int) {
 }
 
 
-// Opens the chosen row: a file, or the place an item is at
+// Opens the result `index` (Enter)
 @(private = "file")
 finder_accept :: proc(index: int) {
 	f := &g.finder
 	if index < 0 || index >= len(f.results) {
 		return
 	}
+	open_row(f.results[index].index)
+}
 
-	row := f.results[index].index
-	if f.source == .Files {
-		g.pending = Open_File(strings.clone(f.files[row]))
-	} else if item := f.items[row]; item.path != "" {
-		jump_to(item.path, item.target)
+
+// Opens a row of the source: a file, or the place an item is at; then closes
+@(private = "file")
+open_row :: proc(row: int) {
+	f := &g.finder
+	if row >= 0 && row < row_count() {
+		if f.source == .Files {
+			g.pending = Open_File(strings.clone(f.files[row]))
+		} else if item := f.items[row]; item.path != "" {
+			jump_to(item.path, item.target)
+		}
 	}
 	finder_close()
 }
@@ -551,12 +603,9 @@ finder_ui :: proc() {
 
 	panel := clay.ID("Finder")
 	if modal(panel, FINDER_WIDTH, clay.SizingFit(), 64, clay.PaddingAll(6), 6) {
-		query := string(f.query[:])
-		input_box(clay.ID("FinderInput"), query, query_hint(), focused = true)
+		text_field(clay.ID("FinderInput"), &f.query, query_hint(), true)
 		finder_results()
 	}
-
-	if clicked_outside(panel, f.opened_at) do finder_close()
 }
 
 
@@ -618,7 +667,7 @@ finder_results :: proc() {
 		},
 		clip = {vertical = true, horizontal = true, childOffset = clay.GetScrollOffset()},
 	}) {
-		query := string(f.query[:])
+		query := line_edit_string(&f.query)
 		rows_spacer(first)
 		for i in first ..< last {
 			m := f.results[i]
@@ -628,7 +677,7 @@ finder_results :: proc() {
 			} else {
 				chosen = item_row(i, f.items[m.index], query, i == f.selected)
 			}
-			if chosen do finder_accept(i)
+			if chosen do f.clicked = m.index
 		}
 		rows_spacer(len(f.results) - last)
 	}
@@ -662,7 +711,7 @@ empty_message :: proc() -> string {
 	switch {
 	case f.status != "":   return f.status
 	case searching:        return "Searching…"
-	case len(f.query) > 0: return "No matches"
+	case len(f.query.text) > 0: return "No matches"
 	}
 	if f.source == .Workspace_Symbols do return "Type to search the project's symbols"
 	return "Nothing found"

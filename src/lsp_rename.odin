@@ -161,9 +161,10 @@ lsp_rename_close :: proc() {
 	sr := &g.lsp.rename
 	if sr.request != 0 do langs.cancel_request(sr.request, sr.client)
 
+	// The field is kept for the next rename
 	field := sr.field
-	clear(&field.text)
-	sr^ = {field = {text = field.text}}
+	line_edit_clear(&field)
+	sr^ = {field = field}
 }
 
 
@@ -175,7 +176,7 @@ lsp_rename_forget :: proc(e: ^Editor) {
 
 lsp_rename_destroy :: proc() {
 	lsp_rename_close()
-	delete(g.lsp.rename.field.text)
+	line_edit_destroy(&g.lsp.rename.field)
 	g.lsp.rename = {}
 }
 
@@ -209,19 +210,14 @@ lsp_rename_ui :: proc() {
 			zIndex = 116,
 		},
 	}) {
-		if clay.UI()({
-			layout = {
-				sizing = {clay.SizingGrow(), clay.SizingFixed(FONT_SIZE_UI + 10)},
-				padding = {left = 4, right = 4},
-				childAlignment = {y = .Center},
-			},
-			backgroundColor = gfx.theme.bg,
-			cornerRadius = clay.CornerRadiusAll(4),
-			border = {color = gfx.theme.accent, width = clay.BorderOutside(1)},
-			clip = {horizontal = true},
-		}) {
-			line_edit_ui(&sr.field, FONT_SIZE_UI, gfx.theme.text_bright)
+		look := Field_Look{
+			height  = FONT_SIZE_UI + 10,
+			padding = 4,
+			radius  = 4,
+			fit     = true,
 		}
+		text_field(clay.ID("SymbolRenameField"), &sr.field, "", true, look)
+
 		if clay.UI()({layout = {padding = {left = 4, right = 4}}}) {
 			label("Enter to rename, Esc to cancel", gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}

@@ -211,9 +211,8 @@ doc_open_pending :: proc(d: ^Doc) {
 			continue
 		}
 
-		buf := &d.view.buf
-		text := buffer.read_alloc(buf, 0, buffer.length(buf), context.allocator)
-		lsp.client_open(dc.client.client, d.uri, d.language, buf.version, text)
+		text := buffer.snapshot(&d.view.buf)
+		lsp.client_open(dc.client.client, d.uri, d.language, text)
 		dc.opened = true
 	}
 }

@@ -76,7 +76,7 @@ table_at :: proc(e: ^View, i: int) -> ^Table {
 	// Each cell's width with its text on one line (each line, where it has
 	// line breaks), from the pieces layout_table places
 	t.widths = make([]f32, cols, mv.doc_allocator)
-	p := Params{size = font_size()}
+	p := Params{size = font_size(e)}
 	for line in t.first ..= min(t.last, t.first + TABLE_MAX_ROWS) {
 		if line == delim do continue
 

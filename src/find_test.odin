@@ -53,7 +53,7 @@ close_on :: proc(e: ^Editor) {
 
 	delete(g.find.query)
 	delete(g.find.matches)
-	delete(g.find.edit.text)
+	line_edit_destroy(&g.find.edit)
 	g.find = {}
 }
 

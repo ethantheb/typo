@@ -31,10 +31,18 @@ Kind :: struct {
 	// Whether a point is over the text, where a click places the caret
 	over_text:    proc(v: ^View, p: [2]f32) -> bool,
 	max_scroll:   proc(v: ^View) -> f64,
+	// How far the view scrolls sideways (0 when everything fits), and the part
+	// of it that does (the text beside a gutter), where its sideways scroll bar
+	// goes. Optional: without it the view doesn't scroll sideways as a whole
+	sideways:     proc(v: ^View) -> (max_scroll: f32, area: gfx.Rect),
 	// The height of a line, for wheel steps and scrolling while dragging
 	scroll_step:  proc(v: ^View) -> f64,
 	// Moves the scroll target so the primary caret shows
 	reveal:       proc(v: ^View),
+	// The line to keep where it is on screen when the text changes size: the
+	// primary caret's if in view, else the top one. The kind keeps it on its
+	// next frame (View.anchor). Optional
+	anchor:       proc(v: ^View) -> Anchor,
 	// Whether two offsets are on the same visual row
 	same_row:     proc(v: ^View, a, b: int) -> bool,
 

@@ -45,6 +45,10 @@ Settings :: struct {
 	markdown_font_size:   int,
 	markdown_line_height: f64, // times the font size
 	markdown_max_width:   int, // logical pixels; 0 = the pane's width
+	words:                string, // word completions: "fallback", "enabled" or "disabled"
+	words_min_length:     int,    // a word typed this long gets word completions
+	words_in_text_files:  bool,   // also in Markdown and plain text files
+	lsp_fetch_timeout:    int,    // ms the server has before words show; 0 = no limit
 	lsp_enabled:          bool,
 	lsp_hover_delay:      int, // ms; 0 = no hover on the pointer
 	bindings:             Bindings,
@@ -88,6 +92,10 @@ Setting :: enum {
 	Markdown_Font_Size,
 	Markdown_Line_Height,
 	Markdown_Max_Width,
+	Words,
+	Words_Min_Length,
+	Words_In_Text_Files,
+	Lsp_Fetch_Timeout,
 	Lsp_Enabled,
 	Lsp_Hover_Delay,
 }
@@ -98,6 +106,7 @@ Section :: enum {
 	Appearance,
 	Font,
 	Markdown,
+	Completions,
 	Keybindings,
 	Terminal,
 	Language_Servers,
@@ -109,6 +118,7 @@ SECTION_KEYS := [Section]string {
 	.Appearance       = "appearance",
 	.Font             = "font",
 	.Markdown         = "markdown",
+	.Completions      = "completions",
 	.Keybindings      = "keybindings",
 	.Terminal         = "terminal",
 	.Language_Servers = "lsp",
@@ -130,6 +140,7 @@ Setting_Info :: struct {
 
 RENDERERS      := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
 MARKDOWN_VIEWS := [?]string{"rendered", "text"}
+WORDS_MODES    := [?]string{"fallback", "enabled", "disabled"}
 ANTIALIASING   := [?]string{"auto", "subpixel", "grayscale"}
 
 SETTINGS := [Setting]Setting_Info {
@@ -347,6 +358,49 @@ SETTINGS := [Setting]Setting_Info {
 		max         = 4000,
 		step        = 20,
 	},
+	.Words = {
+		section     = .Completions,
+		key         = "words",
+		name        = "Word completions",
+		description = "Complete words from the file: \"fallback\" when the language server " +
+		              "has nothing (no server, an empty answer or an error) or doesn't " +
+		              "answer in time, \"enabled\" alongside the server's, or \"disabled\".",
+		keywords    = "completion words buffer autocomplete suggestions",
+		default     = "fallback",
+		choices     = WORDS_MODES[:],
+	},
+	.Words_Min_Length = {
+		section     = .Completions,
+		key         = "words_min_length",
+		name        = "Word completions after",
+		description = "Characters typed before words are offered on their own. Trigger " +
+		              "completion offers them at any length.",
+		keywords    = "completion words minimum length characters",
+		default     = int(3),
+		min         = 1,
+		max         = 10,
+	},
+	.Words_In_Text_Files = {
+		section     = .Completions,
+		key         = "words_in_text_files",
+		name        = "Words in prose",
+		description = "Offer word completions in Markdown and plain text files too.",
+		keywords    = "completion words markdown text prose",
+		default     = false,
+	},
+	.Lsp_Fetch_Timeout = {
+		section     = .Completions,
+		key         = "lsp_fetch_timeout_ms",
+		name        = "Server wait",
+		description = "How long the language server has to answer, in milliseconds, before " +
+		              "the file's words show instead (with \"fallback\") or without its " +
+		              "items (with \"enabled\"). 0 waits for its answer.",
+		keywords    = "completion timeout language server lsp words",
+		default     = int(500),
+		min         = 0,
+		max         = 5000,
+		step        = 50,
+	},
 	.Lsp_Enabled = {
 		section     = .Language_Servers,
 		key         = "enabled",
@@ -404,6 +458,10 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Markdown_Font_Size:   return &s.markdown_font_size
 	case .Markdown_Line_Height: return &s.markdown_line_height
 	case .Markdown_Max_Width:   return &s.markdown_max_width
+	case .Words:                return &s.words
+	case .Words_Min_Length:     return &s.words_min_length
+	case .Words_In_Text_Files:  return &s.words_in_text_files
+	case .Lsp_Fetch_Timeout:    return &s.lsp_fetch_timeout
 	case .Lsp_Enabled:          return &s.lsp_enabled
 	case .Lsp_Hover_Delay:      return &s.lsp_hover_delay
 	}
@@ -776,7 +834,7 @@ settings_text :: proc(s: ^Settings) -> string {
 			for info, cmd in COMMANDS {
 				chords := make([dynamic]string, context.temp_allocator)
 				for c in s.bindings[cmd] {
-					if c.key != 0 do append(&chords, toml.quote(format_chord(c)))
+					if chord_bound(c) do append(&chords, toml.quote(format_chord(c)))
 				}
 
 				value: string

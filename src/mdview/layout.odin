@@ -111,6 +111,7 @@ Run :: struct {
 	checked: bool,
 	subst:   [2]i32, // text drawn in place of the bytes (a decoded entity), in Line_Layout.strings
 	dy:      f32,    // below the row's baseline: a wrapped line within a table cell
+	dx:      f32,    // the text drawn this far right of x: a digit centred in its cell
 }
 
 // Rows partition a line's bytes: row r has [lo, next row's lo)
@@ -216,9 +217,11 @@ Table :: struct {
 }
 
 
+// The size of the view's body text, at its zoom
 @(private)
-font_size :: proc() -> u16 {
-	return u16(env.config().font_size)
+font_size :: proc(e: ^View) -> u16 {
+	size := math.round(f32(env.config().font_size) * textedit.zoom(e))
+	return u16(max(size, 1))
 }
 
 
@@ -237,28 +240,28 @@ line_factor :: proc() -> f32 {
 
 // A code block's first or last line: a code row and the block's padding
 @(private)
-fence_row_height :: proc() -> f32 {
-	return math.round(f32(code_size(font_size())) * CODE_LINE_FACTOR) + 6
+fence_row_height :: proc(e: ^View) -> f32 {
+	return math.round(f32(code_size(font_size(e))) * CODE_LINE_FACTOR) + 6
 }
 
 
 @(private)
-body_line_height :: proc() -> f32 {
-	return f32(font_size()) * line_factor()
+body_line_height :: proc(e: ^View) -> f32 {
+	return f32(font_size(e)) * line_factor()
 }
 
 
 @(private)
-heading_size :: proc(level: u8) -> u16 {
+heading_size :: proc(e: ^View, level: u8) -> u16 {
 	scale := HEADING_SCALE[clamp(int(level), 1, 6) - 1]
-	return u16(math.round(f32(font_size()) * scale))
+	return u16(math.round(f32(font_size(e)) * scale))
 }
 
 
 // Space above and below a heading's text
 @(private)
-heading_pads :: proc(level: u8) -> (top, bottom: f32) {
-	size := f32(heading_size(level))
+heading_pads :: proc(e: ^View, level: u8) -> (top, bottom: f32) {
+	size := f32(heading_size(e, level))
 	return size * (level <= 2 ? 0.7 : 0.5), size * 0.15
 }
 
@@ -447,7 +450,7 @@ md_items :: proc(e: ^View, i: int, text: string, start: int) -> (items: []Item, 
 	d := markdown.line_detail(doc, i, text)
 	state := markdown.line_state(doc, i)
 	n := len(text)
-	p.size = font_size()
+	p.size = font_size(e)
 	p.right = e.mdv.col_w
 	revealed := touches(e, start, start + n)
 
@@ -575,7 +578,7 @@ md_items :: proc(e: ^View, i: int, text: string, start: int) -> (items: []Item, 
 			// As tall as when shown, so revealing the fences moves nothing; the
 			// opening one shows the language
 			p.kind = .Thin
-			p.thin_h = fence_row_height()
+			p.thin_h = fence_row_height(e)
 			if info.kind == .Fence_Open && d.info[1] > d.info[0] {
 				hide(&ib, content, int(d.info[0]))
 				add_item(&ib, {
@@ -669,9 +672,9 @@ md_items :: proc(e: ^View, i: int, text: string, start: int) -> (items: []Item, 
 	}
 	if heading > 0 {
 		p.heading = heading
-		p.size = heading_size(heading)
+		p.size = heading_size(e, heading)
 		color = heading == 6 ? .Dim : .Heading
-		p.pad_top, p.pad_bottom = heading_pads(heading)
+		p.pad_top, p.pad_bottom = heading_pads(e, heading)
 	}
 
 	item_builder_bytes(&ib, n)
@@ -1098,20 +1101,86 @@ add_hanging :: proc(L: ^Line_Layout, text: string, items: []Item, p: ^Params) {
 				depth = it.depth,
 			})
 		case it.hang != .None && it.x <= p.indent:
-			font, size := prose_font(it.style, p.heading, p.size)
-			tw := gfx.text_width(&gfx.text_system, font, size, text[it.lo:it.hi])
-			x := it.hang == .Right ? it.x - tw : it.x
-			append(&L.runs, Run{
-				lo    = it.lo,
-				hi    = it.hi,
-				x     = x,
-				w     = tw,
-				font  = font,
-				size  = size,
-				color = it.color,
-			})
+			add_marker(L, text, it, p)
 		}
 	}
+}
+
+
+// A marker hanging left of the content, shown as text (a list number, or a
+// list or quote marker being edited), as runs from it.x (or ending there).
+// Each digit takes a cell as wide as the font's widest digit, like tabular
+// figures, so numbers of the same length line up in any font
+@(private = "file")
+add_marker :: proc(L: ^Line_Layout, text: string, it: Item, p: ^Params) {
+	font, size := prose_font(it.style, p.heading, p.size)
+	s := text[it.lo:it.hi]
+
+	// Its width: the digits' cells and the rest's measured width
+	cell := widest_digit(font, size)
+	w: f32
+	for k := 0; k < len(s); {
+		j := marker_piece_end(s, k)
+		w += is_digit(s[k]) ? cell : gfx.text_width(&gfx.text_system, font, size, s[k:j])
+		k = j
+	}
+
+	// A run per digit, centred in its cell, and per stretch of other characters
+	x := it.hang == .Right ? it.x - w : it.x
+	for k := 0; k < len(s); {
+		j := marker_piece_end(s, k)
+		piece_w := gfx.text_width(&gfx.text_system, font, size, s[k:j])
+		run := Run {
+			lo    = it.lo + i32(k),
+			hi    = it.lo + i32(j),
+			x     = x,
+			w     = piece_w,
+			font  = font,
+			size  = size,
+			color = it.color,
+		}
+		if is_digit(s[k]) {
+			run.w = cell
+			run.dx = (cell - piece_w) / 2
+		}
+
+		append(&L.runs, run)
+		x += run.w
+		k = j
+	}
+}
+
+
+// Where the piece of a marker starting at byte k ends: one digit, or the
+// characters up to the next digit
+@(private = "file")
+marker_piece_end :: proc(s: string, k: int) -> int {
+	if is_digit(s[k]) do return k + 1
+
+	j := k + 1
+	for j < len(s) && !is_digit(s[j]) {
+		j += 1
+	}
+	return j
+}
+
+
+@(private = "file")
+is_digit :: proc(c: u8) -> bool {
+	return c >= '0' && c <= '9'
+}
+
+
+// The width of a font's widest digit
+@(private = "file")
+widest_digit :: proc(font: gfx.Font_Id, size: u16) -> f32 {
+	digits := "0123456789"
+
+	w: f32
+	for k in 0 ..< len(digits) {
+		w = max(w, gfx.text_width(&gfx.text_system, font, size, digits[k:k + 1]))
+	}
+	return w
 }
 
 
@@ -1664,7 +1733,8 @@ index_in_row :: proc(L: ^Line_Layout, text: string, x, y: f32) -> (row, k: int) 
 					return row, x - run.x < run.w / 2 ? int(run.lo) : int(run.hi)
 				}
 				run_text := text[run.lo:run.hi]
-				at := gfx.text_index_at(&gfx.text_system, run.font, run.size, run_text, x - run.x)
+				run_x := x - run.x - run.dx
+				at := gfx.text_index_at(&gfx.text_system, run.font, run.size, run_text, run_x)
 				return row, int(run.lo) + at
 			case .Checkbox:
 				return row, int(run.hi)

@@ -141,12 +141,12 @@ test_md_toggle_keeps_top_line :: proc(t: ^testing.T) {
 	defer destroy_view(e)
 
 	set_mode(e, .Text)
-	textedit.scroll_to(e, f64(60 * env.config().text_line_height))
+	textedit.scroll_to(e, f64(60 * env.text_line_height(e)))
 	set_mode(e, .Rendered)
 	line, _ := hm_find(&e.mdv.heights, e.scroll_y)
 	testing.expect_value(t, line, 60)
 	set_mode(e, .Text)
-	testing.expect_value(t, int(e.scroll_y) / env.config().text_line_height, 60)
+	testing.expect_value(t, int(e.scroll_y) / env.text_line_height(e), 60)
 
 	// Page Down moves the caret about a screen
 	set_mode(e, .Rendered)
@@ -776,7 +776,7 @@ test_md_code_scroll_bar :: proc(t: ^testing.T) {
 	testing.expect_value(t, e.mdv.code_scroll[2], width - box)
 	test_input.mouse_down = false
 	code_bar_mouse(e)
-	testing.expect(t, !e.mdv.code_drag.active)
+	testing.expect(t, e.mdv.code_drag.grab == nil)
 
 	// Clicking the track's left end jumps back
 	test_input.mouse_pos = {track.x + 1, track.y + 1}
@@ -812,7 +812,7 @@ rendered :: proc(e: ^View) -> string {
 		L := line_layout(e, line)
 		heading := false
 		for run in L.runs {
-			if run.kind == .Text && run.size > font_size() {
+			if run.kind == .Text && run.size > font_size(e) {
 				heading = true
 			}
 		}

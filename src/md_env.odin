@@ -10,12 +10,13 @@ import "mdview"
 
 md_env_init :: proc() {
 	mdview.env = {
-		config       = md_config,
-		input        = md_input,
-		wake         = wake_main_loop,
-		files        = md_files,
-		ensure_index = finder_ensure_index,
-		open_file    = md_open_file,
+		config           = md_config,
+		input            = md_input,
+		text_line_height = text_line_height,
+		wake             = wake_main_loop,
+		files            = md_files,
+		ensure_index     = finder_ensure_index,
+		open_file        = md_open_file,
 	}
 }
 
@@ -24,12 +25,11 @@ md_env_init :: proc() {
 md_config :: proc() -> mdview.Config {
 	s := &g.settings
 	return {
-		font_size        = s.markdown_font_size,
-		line_height      = s.markdown_line_height,
-		max_width        = s.markdown_max_width,
-		text_by_default  = s.markdown_view == "text",
-		text_line_height = editor_line_height(),
-		letter_spacing   = s.letter_spacing != 0,
+		font_size       = s.markdown_font_size,
+		line_height     = s.markdown_line_height,
+		max_width       = s.markdown_max_width,
+		text_by_default = s.markdown_view == "text",
+		letter_spacing  = s.letter_spacing != 0,
 	}
 }
 

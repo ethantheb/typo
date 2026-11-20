@@ -249,10 +249,11 @@ default_shell :: proc() -> string {
 }
 
 
-// Starts `command` (a full command line) in `cwd` with a cols x rows console.
-// `on_exit` runs on a thread-pool thread when the process ends. With
-// `bundled_conpty` it tries the bundled ConPTY first; without, it uses the
-// built-in one and deletes any extracted copies
+// Starts `command` (a full command line) in `cwd` with a cols x rows console,
+// with typo's environment plus `env` ("NAME=value" each). `on_exit` runs on a
+// thread-pool thread when the process ends. With `bundled_conpty` it tries
+// the bundled ConPTY first; without, it uses the built-in one and deletes any
+// extracted copies
 pty_spawn :: proc(
 	p: ^Pty,
 	command, cwd: string,
@@ -260,11 +261,9 @@ pty_spawn :: proc(
 	on_exit: Notify_Proc,
 	userdata: rawptr,
 	bundled_conpty: bool,
+	env: []string,
 ) -> bool {
 	p^ = {on_exit = on_exit, userdata = userdata}
-
-	// Inherited by the shell; tells programs that 24-bit color works
-	win.SetEnvironmentVariableW(win.L("COLORTERM"), win.L("truecolor"))
 
 	// The pseudo console reads from in_read and writes to out_write; we keep
 	// the other ends
@@ -334,14 +333,15 @@ pty_spawn :: proc(
 	if ok {
 		cmd := win.utf8_to_wstring(command, context.temp_allocator)
 		dir := cwd != "" ? win.utf8_to_wstring(cwd, context.temp_allocator) : nil
+		block := environment_block(env)
 		created := win.CreateProcessW(
 			nil,
 			cmd,
 			nil,
 			nil,
 			false,
-			win.EXTENDED_STARTUPINFO_PRESENT,
-			nil,
+			win.EXTENDED_STARTUPINFO_PRESENT | win.CREATE_UNICODE_ENVIRONMENT,
+			raw_data(block),
 			dir,
 			&si.StartupInfo,
 			&pi,
@@ -367,6 +367,59 @@ pty_spawn :: proc(
 		win.WT_EXECUTEONLYONCE,
 	)
 	return true
+}
+
+
+// The shell's environment block, in the temp allocator: typo's variables,
+// COLORTERM (24-bit color works) and `extra` ("NAME=value" each), which
+// replace typo's variables of the same name. Only the shell gets these, not
+// typo's other child processes
+@(private = "file")
+environment_block :: proc(extra: []string) -> []u16 {
+	vars := make([dynamic]string, context.temp_allocator)
+	append(&vars, "COLORTERM=truecolor")
+	append(&vars, ..extra)
+
+	// typo's own, except those
+	inherited, _ := os.environ(context.temp_allocator)
+	entries := make([dynamic]string, context.temp_allocator)
+	for entry in inherited {
+		if !replaced(entry, vars[:]) do append(&entries, entry)
+	}
+	append(&entries, ..vars[:])
+
+	// Each entry ends with a NUL, and the block with another
+	block := make([dynamic]u16, context.temp_allocator)
+	for entry in entries {
+		wide := win.utf8_to_utf16(entry, context.temp_allocator)
+		append(&block, ..wide)
+		append(&block, 0)
+	}
+	append(&block, 0)
+	return block[:]
+}
+
+
+// Whether one of `vars` sets the variable of `entry` (names ignore case)
+@(private = "file")
+replaced :: proc(entry: string, vars: []string) -> bool {
+	for v in vars {
+		if strings.equal_fold(variable_name(entry), variable_name(v)) {
+			return true
+		}
+	}
+	return false
+}
+
+
+// The name in "NAME=value". Windows' hidden "=C:=C:\dir" entries start with
+// "=", which is part of their name
+@(private = "file")
+variable_name :: proc(entry: string) -> string {
+	if len(entry) == 0 do return entry
+
+	eq := strings.index_byte(entry[1:], '=')
+	return eq < 0 ? entry : entry[:eq + 1]
 }
 
 

@@ -90,7 +90,10 @@ TEST_PACKAGES = [
     "src/mdview",
     "src/lsp",
     "src/fuzzy",
+    "src/words",
+    "src/diff",
     "src/langs",
+    "src/ipc",
     "src",
 ]
 

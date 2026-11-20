@@ -147,7 +147,7 @@ lsp_finder_frame :: proc() {
 
 	due, has_due := lf.due.?
 	if has_due && time.tick_since(due) >= 0 {
-		ask_workspace(string(g.finder.query[:]))
+		ask_workspace(line_edit_string(&g.finder.query))
 	}
 
 	if lf.request != 0 && !langs.request_waiting(lf.request, lf.client) {

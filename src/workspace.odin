@@ -2,7 +2,6 @@ package editor
 
 import "core:os"
 import "core:path/filepath"
-import "core:slice"
 import "core:strings"
 import "core:sync"
 
@@ -23,9 +22,10 @@ Node :: struct {
 }
 
 Workspace :: struct {
-	root:    string,
-	nodes:   [dynamic]Node, // nodes[0] is the root directory
-	visible: [dynamic]int,  // flattened, in display order; rebuilt when the tree changes
+	root:           string,
+	nodes:          [dynamic]Node, // nodes[0] is the root directory
+	visible:        [dynamic]int,  // flattened, in display order; rebuilt when the tree changes
+	loaded_version: int,           // counts changes to the folders loaded (kept across opens)
 }
 
 
@@ -75,7 +75,10 @@ workspace_destroy :: proc(ws: ^Workspace) {
 	delete(ws.nodes)
 	delete(ws.visible)
 	delete(ws.root)
+
+	version := ws.loaded_version
 	ws^ = {}
+	ws.loaded_version = version + 1
 }
 
 
@@ -157,42 +160,146 @@ is_separator :: proc(c: u8) -> bool {
 @(private = "file")
 load_children :: proc(ws: ^Workspace, index: int) {
 	ws.nodes[index].loaded = true
-	dir_path := ws.nodes[index].path
-	depth := ws.nodes[index].depth + (index == 0 ? 0 : 1)
+	ws.loaded_version += 1
 
-	// The entries, folders first
-	entries, ok := list_directory(dir_path)
+	entries, ok := read_tree_folder(ws.nodes[index].path)
 	if !ok do return
-	// As in core:os, directory symlinks and junctions show as files
-	for &e in entries {
-		e.is_dir = e.is_dir && !e.is_link
-	}
-	slice.sort_by(entries, dir_entry_less)
 
-	// The nodes. A drive root like "C:\" already ends in a separator
-	sep := is_separator(dir_path[len(dir_path) - 1]) ? "" : os.Path_Separator_String
 	for entry in entries {
-		child := len(ws.nodes)
-		append(&ws.nodes, Node {
-			name   = strings.clone(entry.name),
-			path   = strings.concatenate({dir_path, sep, entry.name}),
-			is_dir = entry.is_dir,
-			depth  = depth,
-		})
+		child := add_node(ws, index, entry)
 		// ws.nodes may have reallocated, so index rather than holding a pointer
 		append(&ws.nodes[index].children, child)
 	}
 }
 
 
-// Folders before files, then by name, ignoring case
+// Adds a node for an entry of the folder at `parent`, not yet among its
+// children. Returns its index
 @(private = "file")
-dir_entry_less :: proc(a, b: Dir_Entry) -> bool {
-	if a.is_dir != b.is_dir do return a.is_dir
+add_node :: proc(ws: ^Workspace, parent: int, entry: Dir_Entry) -> int {
+	dir_path := ws.nodes[parent].path
+	depth := ws.nodes[parent].depth + (parent == 0 ? 0 : 1)
 
-	a_name := strings.to_lower(a.name, context.temp_allocator)
-	b_name := strings.to_lower(b.name, context.temp_allocator)
-	return a_name < b_name
+	// A drive root like "C:\" already ends in a separator
+	sep := is_separator(dir_path[len(dir_path) - 1]) ? "" : os.Path_Separator_String
+	append(&ws.nodes, Node {
+		name   = strings.clone(entry.name),
+		path   = strings.concatenate({dir_path, sep, entry.name}),
+		is_dir = entry.is_dir,
+		depth  = depth,
+	})
+	return len(ws.nodes) - 1
+}
+
+
+// --- Changes on disk ---------------------------------------------------------------
+
+// The folders whose entries the tree has read, in the temp allocator
+workspace_loaded_dirs :: proc(ws: ^Workspace) -> []string {
+	dirs := make([dynamic]string, context.temp_allocator)
+	for n in ws.nodes {
+		if n.is_dir && n.loaded {
+			append(&dirs, n.path)
+		}
+	}
+	return dirs[:]
+}
+
+
+// Brings loaded folders in line with their entries listed again: new entries
+// get rows and gone ones lose theirs, with everything under them. The rest stay
+// as they were, expanded or not, keyed by path as before
+workspace_apply_listings :: proc(ws: ^Workspace, listings: []Folder_Listing) {
+	if len(ws.nodes) == 0 || len(listings) == 0 {
+		return
+	}
+
+	loaded := make(map[string]int, allocator = context.temp_allocator)
+	for n, i in ws.nodes {
+		if n.is_dir && n.loaded {
+			loaded[path_key(n.path, context.temp_allocator)] = i
+		}
+	}
+
+	removed := false
+	for l in listings {
+		index, found := loaded[path_key(l.dir, context.temp_allocator)]
+		if !found do continue
+
+		if update_children(ws, index, l.entries) do removed = true
+	}
+
+	// New nodes aren't loaded, so only removals change the loaded folders
+	if removed {
+		drop_unreachable(ws)
+		ws.loaded_version += 1
+	}
+	rebuild_visible(ws)
+}
+
+
+// Gives a folder's node the listed entries as children, keeping the nodes of
+// those it had. Returns true if some are gone (left unreachable)
+@(private = "file")
+update_children :: proc(ws: ^Workspace, index: int, entries: []Dir_Entry) -> bool {
+	old := ws.nodes[index].children
+	by_name := make(map[string]int, allocator = context.temp_allocator)
+	for child in old {
+		by_name[ws.nodes[child].name] = child
+	}
+
+	children := make([dynamic]int, 0, len(entries))
+	for entry in entries {
+		child, had := by_name[entry.name]
+		if had && ws.nodes[child].is_dir == entry.is_dir {
+			delete_key(&by_name, entry.name)
+		} else {
+			child = add_node(ws, index, entry)
+		}
+		append(&children, child)
+	}
+
+	delete(old)
+	ws.nodes[index].children = children
+	return len(by_name) > 0
+}
+
+
+// Frees the nodes no longer reachable from the root, keeping the order of the
+// rest (the root stays first)
+@(private = "file")
+drop_unreachable :: proc(ws: ^Workspace) {
+	// Reachable from the root
+	reachable := make([]bool, len(ws.nodes), context.temp_allocator)
+	stack := make([dynamic]int, context.temp_allocator)
+	append(&stack, 0)
+	for len(stack) > 0 {
+		i := pop(&stack)
+		reachable[i] = true
+		append(&stack, ..ws.nodes[i].children[:])
+	}
+
+	// Kept nodes move down; the rest are freed
+	new_index := make([]int, len(ws.nodes), context.temp_allocator)
+	kept := 0
+	for i in 0 ..< len(ws.nodes) {
+		n := ws.nodes[i]
+		if !reachable[i] {
+			delete(n.name)
+			delete(n.path)
+			delete(n.children)
+			continue
+		}
+
+		new_index[i] = kept
+		ws.nodes[kept] = n
+		kept += 1
+	}
+	resize(&ws.nodes, kept)
+
+	for &n in ws.nodes {
+		for &child in n.children do child = new_index[child]
+	}
 }
 
 

@@ -1,5 +1,6 @@
 package editor
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "core:math/rand"
@@ -21,6 +22,7 @@ import ttf "../vendor/sdl3/ttf"
 import "gfx"
 import "textedit"
 import "mdview"
+import "words"
 
 // The performance suite: `typo --perf` (run by `python build.py --test` on an
 // optimized build). It drives the real app, with a real window and renderer,
@@ -51,6 +53,7 @@ Perf :: struct {
 	cpu0:             i64,
 	frames:           [dynamic]Frame_Time, // of the current phase
 	lsp_times:        [dynamic]f64,        // language server work on the UI thread, per frame
+	words_times:      [dynamic]f64,        // word completion work on the UI thread, per frame
 	frame_t0:         time.Tick,           // when the current frame's work began
 	marks:            [Frame_Part]time.Tick,
 	first_present_ns: i64,
@@ -84,6 +87,9 @@ Phase :: struct {
 	// Limit (ms) on the language server work done on the UI thread in any frame
 	// (lsp_frame, document sync); 0 = not reported
 	lsp_limit:   f64,
+	// Limit (ms) on the word completion work done on the UI thread in any frame
+	// (taking and asking for words, filtering them); 0 = not reported
+	words_limit: f64,
 	idle:        bool, // let the app sleep between frames
 }
 
@@ -91,6 +97,7 @@ PHASES := [?]Phase {
 	{name = "startup", step = phase_startup},
 	{name = "fonts", step = phase_fonts},
 	{name = "text in cells and subpixels", step = phase_text_rendering},
+	{name = "selection shapes", step = phase_selection_shape},
 	{name = "generate test files", step = phase_generate},
 	{name = "buffer (64 MB)", step = phase_buffer},
 	{name = "syntax", step = phase_syntax},
@@ -99,12 +106,20 @@ PHASES := [?]Phase {
 	{name = "terminal emulation", step = phase_vt},
 	{name = "open code file (tree-sitter)", step = phase_open_code, frame_limit = 8},
 	{name = "idle with a file open", step = phase_idle, idle = true},
-	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8},
+	{name = "typing (tree-sitter)", step = phase_type, frame_limit = 8, words_limit = 1},
+	{
+		name        = "word completions",
+		step        = phase_word_completion,
+		frame_limit = 8,
+		words_limit = 1,
+	},
 	{name = "clicking places the caret", step = phase_click_caret},
 	{name = "moving lines", step = phase_move_lines},
 	{name = "find in a file (tree-sitter)", step = phase_find, frame_limit = 8},
 	{name = "scrolling (tree-sitter)", step = phase_scroll, frame_limit = 8},
 	{name = "resizing the window (tree-sitter)", step = phase_resize, frame_limit = 8},
+	{name = "sideways scroll bar", step = phase_sideways},
+	{name = "list numbers (rendered)", step = phase_list_numbers},
 	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
@@ -127,20 +142,24 @@ PHASES := [?]Phase {
 	},
 	{name = "resizing the window, Markdown (rendered)", step = phase_resize, frame_limit = 8},
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
+	{name = "zooming 4 MB Markdown (rendered)", step = phase_zoom_markdown, frame_limit = 8},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
 	{name = "settings scrolling at any size", step = phase_settings_scrolls},
 	{name = "settings sections collapsing", step = phase_settings_collapse, frame_limit = 8},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
+	{name = "files changed on disk", step = phase_disk_changes}, // perf_watch.odin
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
 	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},
 	{name = "open 64 MB file (lexer)", step = phase_open_large, frame_limit = 8},
 	{name = "jumping through 64 MB file", step = phase_jump_large, frame_limit = 12},
-	{name = "typing in 64 MB file", step = phase_type, frame_limit = 8},
+	{name = "typing in 64 MB file", step = phase_type, frame_limit = 8, words_limit = 1},
 	{name = "find in 64 MB file", step = phase_find, frame_limit = 12},
 	{name = "8 MB single-line file", step = phase_long_line, frame_limit = 25},
 	{name = "terminal full-screen redraws", step = phase_terminal_redraw, frame_limit = 12},
+	{name = "block elements and box drawing fill their cells", step = phase_box_glyphs},
+	{name = "terminal full of block characters", step = phase_terminal_blocks, frame_limit = 12},
 	{name = "terminal shell output (4 MB)", step = phase_terminal_output, frame_limit = 16},
 	{name = "find in the terminal", step = phase_find_terminal, frame_limit = 16},
 	{
@@ -149,6 +168,10 @@ PHASES := [?]Phase {
 		frame_limit = 8,
 	},
 	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
+	{name = "pane title bar and mouse buttons", step = phase_pane_header},
+	{name = "typo <file> in the terminal", step = phase_ipc_open},
+	{name = "text fields with the mouse and keys", step = phase_text_fields},
+	{name = "zooming panes", step = phase_zoom_panes},
 	{
 		name = "language server (typing)",
 		step = phase_lsp_typing,
@@ -219,6 +242,7 @@ perf_end :: proc() {
 	delete(p.large_text)
 	delete(p.frames)
 	delete(p.lsp_times)
+	delete(p.words_times)
 	for f in p.failures do delete(f)
 	delete(p.failures)
 	free(p)
@@ -260,8 +284,10 @@ perf_frame :: proc() -> (done, ok: bool) {
 		}
 		append(&p.frames, t)
 		append(&p.lsp_times, time.duration_milliseconds(langs.state.ui_time))
+		append(&p.words_times, time.duration_milliseconds(words_ui_time))
 	}
 	langs.state.ui_time = 0
+	words_ui_time = 0
 
 	// This frame's step, moving on to the next phase when one finishes
 	for p.phase < len(PHASES) {
@@ -294,6 +320,7 @@ start_phase :: proc(p: ^Perf) {
 	fmt.printfln("\n%s", PHASES[p.phase].name)
 	clear(&p.frames)
 	clear(&p.lsp_times)
+	clear(&p.words_times)
 
 	gpu_counter_start(&p.gpu) // first: querying the counters costs CPU time
 	p.phase_t0 = time.tick_now()
@@ -307,6 +334,10 @@ finish_phase :: proc(p: ^Perf) {
 	if phase.lsp_limit > 0 {
 		worst := slice.max(p.lsp_times[:]) if len(p.lsp_times) > 0 else 0
 		result(p, "language servers, UI thread, worst", worst, "ms", phase.lsp_limit)
+	}
+	if phase.words_limit > 0 {
+		worst := slice.max(p.words_times[:]) if len(p.words_times) > 0 else 0
+		result(p, "word completions, UI thread, worst", worst, "ms", phase.words_limit)
 	}
 
 	limit := phase.frame_limit
@@ -346,7 +377,7 @@ percentile :: proc(sorted: []f64, q: f64) -> f64 {
 
 
 // Prints a result; one over its limit (if it has one) fails the suite
-@(private = "file")
+@(private)
 result :: proc(p: ^Perf, name: string, value: f64, unit: string, limit: f64 = 0) {
 	p.results += 1
 	over := limit > 0 && value > limit
@@ -364,7 +395,7 @@ result :: proc(p: ^Perf, name: string, value: f64, unit: string, limit: f64 = 0)
 
 
 // Records a functional check; a false one fails the suite
-@(private = "file")
+@(private)
 check :: proc(p: ^Perf, name: string, ok: bool) {
 	p.results += 1
 	fmt.printfln("  %-36s %10s", name, ok ? "ok" : "FAILED")
@@ -372,13 +403,13 @@ check :: proc(p: ^Perf, name: string, ok: bool) {
 }
 
 
-@(private = "file")
+@(private)
 ms_since :: proc(t: time.Tick) -> f64 {
 	return time.duration_milliseconds(time.tick_since(t))
 }
 
 
-@(private = "file")
+@(private)
 path_in_dir :: proc(p: ^Perf, name: string) -> string {
 	return fmt.tprintf("%s%c%s", p.dir, os.Path_Separator, name)
 }
@@ -427,7 +458,7 @@ phase_text_rendering :: proc(p: ^Perf, frame: int) -> bool {
 	// letter spacing), for every face. Widths of strings that start and end
 	// alike differ by exactly the columns between
 	cell := gfx.text_char_width(ts, .Editor, size) * gfx.scale
-	column := editor_char_width() * gfx.scale
+	column := editor_char_width(1) * gfx.scale
 	whole := is_whole(cell) && is_whole(column)
 	check(p, "the editor font's columns are whole pixels", whole)
 
@@ -546,30 +577,121 @@ read_ink :: proc(s: string, alpha: f32) -> (ink: Ink) {
 	color := INK_COLOR
 	color.a = alpha
 	gfx.draw_text(text, 4, 4, color)
+
+	pixels, ok := read_window(area)
+	if !ok do return
+
+	for px in pixels {
+		r, g, b := int(px[0]), int(px[1]), int(px[2])
+		if r != int(INK_BG.r) || g != int(INK_BG.g) || b != int(INK_BG.b) {
+			ink.pixels += 1
+		}
+		ink.spread = max(ink.spread, abs(r - b))
+		ink.brightest = max(ink.brightest, r, g, b)
+		ink.darkest = min(ink.darkest, r, g, b)
+	}
+	return
+}
+
+
+// Reads back an area of what has been drawn on the window this frame: its
+// pixels as RGBA, row by row (temp)
+@(private = "file")
+read_window :: proc(area: sdl.Rect) -> (pixels: [][4]u8, ok: bool) {
 	gfx.flush_text()
+	area := area
 
 	read := sdl.RenderReadPixels(gfx.renderer, &area)
-	if read == nil do return
+	if read == nil do return nil, false
 	defer sdl.DestroySurface(read)
 
 	rgba := sdl.ConvertSurface(read, .RGBA32)
-	if rgba == nil do return
+	if rgba == nil do return nil, false
 	defer sdl.DestroySurface(rgba)
 
-	pixels := ([^]u8)(rgba.pixels)
-	for y in 0 ..< int(rgba.h) {
-		for x in 0 ..< int(rgba.w) {
-			px := pixels[y * int(rgba.pitch) + x * 4:]
-			r, g, b := int(px[0]), int(px[1]), int(px[2])
-			if r != int(INK_BG.r) || g != int(INK_BG.g) || b != int(INK_BG.b) {
-				ink.pixels += 1
-			}
-			ink.spread = max(ink.spread, abs(r - b))
-			ink.brightest = max(ink.brightest, r, g, b)
-			ink.darkest = min(ink.darkest, r, g, b)
+	w, h := int(rgba.w), int(rgba.h)
+	pixels = make([][4]u8, w * h, context.temp_allocator)
+	src := ([^]u8)(rgba.pixels)
+	for y in 0 ..< h {
+		row := src[y * int(rgba.pitch):]
+		for x in 0 ..< w {
+			pixels[y * w + x] = {row[x * 4], row[x * 4 + 1], row[x * 4 + 2], row[x * 4 + 3]}
 		}
 	}
-	return
+	return pixels, true
+}
+
+
+// Selections drawn as one shape and read back from the window: rounded outside
+// corners, curves in the inside corners, no seam where rows meet; and the time
+// a screenful of selected rows takes to draw
+@(private = "file")
+phase_selection_shape :: proc(p: ^Perf, frame: int) -> bool {
+	// Two rows (pixels): the first reaches past the second on the right, the
+	// second past the first on the left
+	area := sdl.Rect{0, 0, 200, 80}
+	gfx.fill_rect(0, 0, f32(area.w), f32(area.h), INK_BG)
+	rows := []gfx.Rect{{40, 10, 100, 20}, {20, 30, 80, 20}}
+	gfx.fill_selection(rows, 0, 6, INK_COLOR)
+
+	pixels, ok := read_window(area)
+	if !ok {
+		check(p, "selection read back", false)
+		return true
+	}
+	read := Read_Back{pixels, int(area.w)}
+
+	// The corners' pixels, by their centres' distance from the curves
+	outer := background_px(read, 40, 10) && background_px(read, 139, 29)
+	outer &= background_px(read, 20, 49) && selected_px(read, 90, 20)
+	check(p, "a selection's outside corners are round", outer)
+
+	inner := selected_px(read, 39, 29) && selected_px(read, 100, 30)
+	check(p, "its inside corners curve", inner)
+
+	seam := true
+	for x in 41 ..< 99 {
+		seam &= selected_px(read, x, 29) && selected_px(read, x, 30)
+	}
+	check(p, "no seam where its rows meet", seam)
+
+	// A screenful of rows of different lengths, as one shape
+	screen := make([]gfx.Rect, 60, context.temp_allocator)
+	for &r, i in screen {
+		r = {10, f32(i * 20), f32(100 + (i * 37) % 400), 20}
+	}
+	start := time.tick_now()
+	gfx.fill_selection(screen, 3, 5, INK_COLOR)
+	gfx.flush_text()
+	result(p, "drawing 60 selected rows", ms_since(start), "ms", 1)
+	return true
+}
+
+
+// Pixels read back (read_window), with the width of their rows
+@(private = "file")
+Read_Back :: struct {
+	pixels: [][4]u8,
+	w:      int,
+}
+
+
+// Whether a pixel read back is mostly INK_COLOR, or INK_BG
+@(private = "file")
+selected_px :: proc(r: Read_Back, x, y: int) -> bool {
+	return pixel_red(r, x, y) > (INK_BG.r + INK_COLOR.r) / 2 + 20
+}
+
+
+@(private = "file")
+background_px :: proc(r: Read_Back, x, y: int) -> bool {
+	return pixel_red(r, x, y) < INK_BG.r + 20
+}
+
+
+@(private = "file")
+pixel_red :: proc(r: Read_Back, x, y: int) -> f32 {
+	return f32(r.pixels[y * r.w + x].r)
 }
 
 
@@ -724,6 +846,20 @@ phase_buffer :: proc(p: ^Perf, frame: int) -> bool {
 		buffer.end(&b, {})
 	}
 	result(p, "random edit", f64(time.tick_since(t)) / EDITS / 1000, "µs", 50)
+
+	// A snapshot copies the pieces, never the text
+	t = time.tick_now()
+	snapshot := buffer.snapshot(&b)
+	result(p, "snapshot after the edits", ms_since(t), "ms", 2)
+
+	// The words around the middle, as the words thread collects them
+	middle := buffer.line_count(&b) / 2
+	t = time.tick_now()
+	index := words.collect(&snapshot, buffer.line_start(&b, middle), middle)
+	name := fmt.tprintf("words of %d lines (words thread)", 2 * words.WINDOW_LINES)
+	result(p, name, ms_since(t), "ms", 100)
+	words.index_release(index)
+	buffer.snapshot_release(&snapshot)
 
 	t = time.tick_now()
 	for _ in 0 ..< EDITS do buffer.undo(&b)
@@ -910,7 +1046,7 @@ open_timed :: proc(p: ^Perf, name: string) {
 
 
 // Closes every file without asking about changes
-@(private = "file")
+@(private)
 close_files :: proc() {
 	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
 		pane := g.panes.open[i]
@@ -1105,10 +1241,216 @@ phase_type :: proc(p: ^Perf, frame: int) -> bool {
 }
 
 
+// In code.odin, with no language server: a word typed lists the file's words
+// once it is three letters long, each letter filters them again (with digits,
+// thousands match), Enter inserts the chosen one and one undo takes it back.
+// The text is then as it was
+@(private = "file")
+phase_word_completion :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) step_at: time.Tick
+	@(static) typed: int
+	@(static) length: int // of the text before
+
+	cs := &g.lsp.completion
+	e := focused_editor()
+	waited := frame - p.mark_frame
+	waited_ms := ms_since(step_at)
+	word := "item_4"
+
+	if frame == 0 {
+		step, typed = 0, 0
+		p.mark_frame, step_at = frame, time.tick_now()
+		return false
+	}
+
+	switch step {
+	case 0: // its words collected; a new line in item_0
+		if e.words.index == nil && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "the file's words are collected", e.words.index != nil)
+		length = buffer.length(&e.buf)
+		at := text_offset(e, "\treturn total") - 1
+		textedit.set_single_selection(e, {at, at, -1})
+		textedit.insert(e, "\n\t")
+		step, p.mark_frame, step_at = 1, frame, time.tick_now()
+
+	case 1: // three letters, then the list
+		if typed < 3 {
+			if waited % 2 == 0 {
+				editor_text_input(e, word[typed:][:1])
+				typed += 1
+			}
+			return false
+		}
+		if !(cs.open && len(cs.shown) > 0) && waited_ms < 3000 {
+			return false
+		}
+
+		check(p, "three letters list the file's words", len(cs.shown) > 0)
+		step, p.mark_frame = 2, frame
+
+	case 2: // the rest, a letter every other frame
+		if typed < len(word) {
+			if waited % 2 == 0 {
+				editor_text_input(e, word[typed:][:1])
+				typed += 1
+			}
+			return false
+		}
+
+		listed := len(cs.shown) > 1 && cs.shown[0].index < 0
+		check(p, "each letter filters them", listed && cs.shown[0].word != word)
+		chosen := listed ? strings.clone(cs.shown[cs.selected].word) : ""
+		defer delete(chosen)
+		press(sdl.K_RETURN)
+
+		line, _ := caret_line(e)
+		check(p, "Enter inserts the chosen word", listed && line == fmt.tprintf("\t%s", chosen))
+		run_command(.Undo)
+		line, _ = caret_line(e)
+		check(p, "one undo takes it back", line == fmt.tprintf("\t%s", word))
+
+		// The text as it was
+		for _ in 0 ..< 4 {
+			if buffer.length(&e.buf) == length do break
+			run_command(.Undo)
+		}
+		check(p, "the text is as it was", buffer.length(&e.buf) == length)
+		return true
+	}
+	return false
+}
+
+
 @(private = "file")
 phase_scroll :: proc(p: ^Perf, frame: int) -> bool {
 	textedit.move(focused_editor(), .Page_Down, false)
 	return frame == 120
+}
+
+
+// A file with one wide line out of view: no sideways scroll bar until the
+// caret goes to that line's end, which shows; then the bar along the text's
+// bottom drags to either end, jumps where its track is clicked and takes the
+// pointer from the text, and a sideways wheel scrolls
+@(private = "file")
+phase_sideways :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) mouse: [2]f32
+	e := focused_editor()
+
+	switch frame {
+	case 0:
+		mouse = g.mouse_pos
+		sb := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< 300 {
+			text := strings.repeat("w", i == 150 ? 600 : 40, context.temp_allocator)
+			fmt.sbprintf(&sb, "line_%d := \"%s\"\n", i, text)
+		}
+
+		path := path_in_dir(p, "wide.odin")
+		_ = os.write_entire_file(path, transmute([]u8)strings.to_string(sb))
+		close_files()
+		panes_open_file(path)
+
+	case 5:
+		max_x, _ := editor_sideways(e)
+		check(p, "no sideways bar while the lines fit", max_x == 0)
+		end := buffer.line_end(&e.buf, 150)
+		textedit.set_single_selection(e, {end, end, -1})
+		e.reveal = true
+
+	case 6:
+		caret, shows := e.kind.char_rect(e, e.sels[0].head - 1)
+		in_view := shows && caret.x + caret.w <= e.view.x + e.view.w
+		check(p, "the caret at a wide line's end shows", in_view && e.scroll_x > 0)
+		_, thumb, bar := editor_scrollbar(e, .Horizontal)
+		check(p, "then a sideways bar shows", bar)
+
+		// Its thumb pressed, then dragged to the left end and the right
+		g.mouse_pos = {thumb.x + thumb.w / 2, thumb.y + thumb.h / 2}
+		g.mouse_down, g.mouse_pressed, g.mouse_clicks = true, true, 1
+
+	case 7:
+		track, _, _ := editor_scrollbar(e, .Horizontal)
+		g.mouse_pos.x = track.x - 40
+
+	case 8:
+		check(p, "dragging its thumb scrolls", e.scroll_x == 0)
+		track, _, _ := editor_scrollbar(e, .Horizontal)
+		g.mouse_pos.x = track.x + track.w + 40
+
+	case 9:
+		max_x, _ := editor_sideways(e)
+		check(p, "to either end", max_x > 0 && e.scroll_x == max_x)
+		g.mouse_down = false
+
+	case 10:
+		// A click near the track's left end
+		track, _, _ := editor_scrollbar(e, .Horizontal)
+		g.mouse_pos = {track.x + 4, track.y + track.h / 2}
+		check(p, "the bar takes the pointer from the text", !editor_text_hit(e, g.mouse_pos))
+		g.mouse_down, g.mouse_pressed = true, true
+
+	case 11:
+		check(p, "clicking its track jumps there", e.scroll_x == 0)
+		g.mouse_down = false
+
+	case 12:
+		g.mouse_pos = {e.view.x + e.view.w / 2, e.view.y + e.view.h / 2}
+		g.wheel = {-2, 0}
+
+	case 13:
+		check(p, "a sideways wheel scrolls", e.target_x > 0)
+		g.mouse_pos = mouse
+		return true
+	}
+	return false
+}
+
+
+// Ordered list numbers in the real Markdown font: each digit in a cell as wide
+// as the widest, so single digits line up whatever their shapes, the dots line
+// up and the items' text starts at one x
+@(private = "file")
+phase_list_numbers :: proc(p: ^Perf, frame: int) -> bool {
+	if frame == 0 {
+		path := path_in_dir(p, "lists.md")
+		_ = os.write_entire_file(path, "Lists\n\n1. one\n7. seven\n4. four\n10. ten\n")
+		close_files()
+		panes_open_file(path)
+		return false
+	}
+	if frame < 5 do return false
+
+	// Before the units digit, after the dot, before the text
+	e := focused_editor()
+	digit, dot, item: [4]f32
+	for i in 0 ..< 4 {
+		text, start := textedit.line_text(e, 2 + i)
+		at := start + strings.index_byte(text, '.')
+		digit[i] = mdview.caret_at(&e.md_view, at - 1).x
+		dot[i] = mdview.caret_at(&e.md_view, at + 1).x
+		item[i] = mdview.caret_at(&e.md_view, at + 2).x
+	}
+
+	check(p, "opens rendered", md_rendered(e))
+	check(p, "list numbers' digits line up", all_equal(digit[:]))
+	check(p, "their dots line up", all_equal(dot[:]))
+	check(p, "their items' text starts at one x", all_equal(item[:]))
+	return true
+}
+
+
+// Whether the values are the same, give or take float rounding
+@(private = "file")
+all_equal :: proc(values: []f32) -> bool {
+	for v in values {
+		if abs(v - values[0]) > 0.01 do return false
+	}
+	return true
 }
 
 
@@ -1133,7 +1475,7 @@ phase_finder :: proc(p: ^Perf, frame: int) -> bool {
 	switch {
 	case frame == 0:
 		finder_toggle()
-		append(&f.query, "large")
+		line_edit_set(&f.query, "large", 5, 5)
 		finder_restart_search()
 		p.mark_frame = -1
 
@@ -1142,8 +1484,7 @@ phase_finder :: proc(p: ^Perf, frame: int) -> bool {
 	case p.mark_frame < 0:
 		p.mark_frame = frame
 		clear(&p.frames)
-		clear(&f.query)
-		append(&f.query, "codeodin")
+		line_edit_set(&f.query, "codeodin", 8, 8)
 		finder_restart_search()
 
 	case frame < p.mark_frame + 20:
@@ -1178,10 +1519,10 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 
 	case frame <= 4:
 		search := "font"
-		append(&w.search, search[frame - 1])
+		type_text(search[frame - 1:frame])
 
 	case frame == 5:
-		clear(&w.search)
+		line_edit_clear(&w.search)
 
 	case frame <= 30:
 		w.focus = (frame - 6) % max(len(w.items), 1)
@@ -1251,6 +1592,8 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) moving_frames: int
 	@(static) moving_ok: int
 	@(static) last_panel: gfx.Rect
+	@(static) theme_before: string // owned
+	@(static) clicked_rows: int
 	if frame == 0 {
 		_ = sdl.GetWindowSize(g.window, &p.window_size.x, &p.window_size.y)
 		resize_for_check({p.window_size.x | 1, p.window_size.y})
@@ -1283,15 +1626,31 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		press(sdl.K_RETURN)
 		next_step(p, &step, frame)
 
-	case 3: // the picker shown: back to the list
+	case 3: // the picker shown: click the first theme
 		if (g.animating || waited < 2) && waited < 600 {
 			return false
 		}
 
-		press(sdl.K_ESCAPE)
+		set_string(&theme_before, g.settings.theme)
+		click_element(clay.ID("PickerRow", 0))
+		clicked_rows = 1
 		next_step(p, &step, frame)
 
-	case 4: // the panel moving back, then there: make the window shorter
+	case 4: // it applies on the next frame (the second if the first was applied)
+		if waited < 3 do return false
+		if g.settings.theme == theme_before && clicked_rows == 1 {
+			click_element(clay.ID("PickerRow", 1))
+			clicked_rows = 2
+			p.mark_frame = frame
+			return false
+		}
+
+		check(p, "clicking a theme applies it", g.settings.theme != theme_before)
+		press(sdl.K_ESCAPE)
+		check(p, "and Esc puts the theme back", g.settings.theme == theme_before)
+		next_step(p, &step, frame)
+
+	case 5: // the panel moving back, then there: make the window shorter
 		if waited < 2 do return false // the list's first layout
 		if panel_moved && waited < 600 {
 			// The panel grows into the list, laid out at its final size
@@ -1309,7 +1668,7 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		resize_for_check({p.window_size.x | 1, p.window_size.y - 100})
 		next_step(p, &step, frame)
 
-	case 5: // the new size: a server's page in a short window
+	case 6: // the new size: a server's page in a short window
 		if !resized_for_check(p, waited) do return false
 		if waited < 3 do return false
 
@@ -1318,7 +1677,7 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		resize_for_check({p.window_size.x, SHORT_WINDOW_H})
 		next_step(p, &step, frame)
 
-	case 6: // short: open a server's page
+	case 7: // short: open a server's page
 		if !resized_for_check(p, waited) do return false
 		if waited < 3 do return false
 
@@ -1326,7 +1685,7 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		press(sdl.K_RETURN)
 		next_step(p, &step, frame)
 
-	case 7: // its fields scroll, the footer stays in the panel
+	case 8: // its fields scroll, the footer stays in the panel
 		if (g.animating || waited < 3) && waited < 600 {
 			return false
 		}
@@ -1334,6 +1693,8 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		fits, more := list_scrolls(clay.ID("ServerList"))
 		check(p, "a server's page fits and scrolls", fits && more)
 
+		delete(theme_before)
+		theme_before = ""
 		press(sdl.K_ESCAPE)
 		settings_window_toggle()
 		_ = sdl.SetWindowSize(g.window, p.window_size.x, p.window_size.y)
@@ -1447,7 +1808,7 @@ phase_settings_collapse :: proc(p: ^Perf, frame: int) -> bool {
 		if waited < 2 do return false
 
 		check(p, "Collapse all leaves only the headers", count_items(Section) == len(w.items))
-		append(&w.search, "font")
+		line_edit_set(&w.search, "font", 4, 4)
 		next_step(p, &step, frame)
 
 	case 6: // then Expand all
@@ -1455,7 +1816,7 @@ phase_settings_collapse :: proc(p: ^Perf, frame: int) -> bool {
 
 		found := count_items(Setting) > 0 && count_items(Section) == 0
 		check(p, "a search shows settings in collapsed sections", found)
-		clear(&w.search)
+		line_edit_clear(&w.search)
 		next_step(p, &step, frame)
 
 	case 7:
@@ -1974,6 +2335,18 @@ press :: proc(key: sdl.Keycode) {
 }
 
 
+// A shortcut pressed, with the scancode chords match on
+@(private = "file")
+press_chord :: proc(scancode: sdl.Scancode, mod: sdl.Keymod) {
+	event: sdl.Event
+	event.type = .KEY_DOWN
+	event.key.scancode = scancode
+	event.key.key = sdl.GetKeyFromScancode(scancode, {}, true)
+	event.key.mod = mod
+	handle_key_event(&event)
+}
+
+
 // Opens the settings window and focuses a setting's row (a frame later, once
 // the rows exist). Returns true once focused
 @(private = "file")
@@ -2108,15 +2481,24 @@ phase_letter_spacing :: proc(p: ^Perf, frame: int) -> bool {
 // Jumps to 120 places spread over the file, one per frame
 @(private = "file")
 phase_jump_large :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) worst: f64
+	if frame == 0 do worst = 0
+
 	e := focused_editor()
 	textedit.scroll_to(e, max_scroll_y(e) * f64(frame) / 120)
-	return frame == 120
+	worst = max(worst, measure_view_ms(e))
+
+	if frame < 120 do return false
+	result(p, "measuring the lines in view, worst", worst, "ms", 0.5)
+	return true
 }
 
 
 @(private = "file")
 phase_long_line :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) worst: f64
 	if frame == 0 {
+		worst = 0
 		open_timed(p, "long.js")
 		return false
 	}
@@ -2128,7 +2510,26 @@ phase_long_line :: proc(p: ^Perf, frame: int) -> bool {
 	case:
 		editor_text_input(e, "x")
 	}
-	return frame == 60
+
+	worst = max(worst, measure_view_ms(e))
+	if frame < 60 do return false
+
+	result(p, "measuring the lines in view, worst", worst, "ms", 5)
+	return true
+}
+
+
+// The time the text view takes to measure the lines in view for its sideways
+// scrolling (which a frame does when they or the document changed), timed on
+// its own. The frame measures them again, so its time includes it too
+@(private = "file")
+measure_view_ms :: proc(e: ^Editor) -> f64 {
+	e.widest.first = -1
+	defer e.widest.first = -1
+
+	start := time.tick_now()
+	measure_view(e)
+	return ms_since(start)
 }
 
 
@@ -2156,6 +2557,361 @@ phase_terminal_redraw :: proc(p: ^Perf, frame: int) -> bool {
 			color := (frame + row + col) % 256
 			letter := 'a' + rune((frame + col) % 26)
 			fmt.sbprintf(&sb, "\x1b[38;5;%dm%c", color, letter)
+		}
+	}
+	strings.write_string(&sb, "\x1b[0m")
+
+	term.terminal_vt_write(s.vt, raw_data(sb.buf), len(sb.buf))
+	return frame == 120
+}
+
+
+// Rows of block elements and a box, from the terminal's top left
+@(private = "file")
+BOX_GLYPH_ROWS :: [?]string {
+	"██████████",
+	"▀▄▀▄▀▄▀▄",
+	"╭──╮",
+	"│  │",
+	"│  │",
+	"╰──╯",
+}
+
+
+@(private = "file")
+perf_box: struct {
+	stage:       enum {
+		Terminal_Settling,
+		Terminal_Drawn,
+		Editor_Settling,
+		Restoring,
+	},
+	font_size:   int,
+	font_weight: int,
+	line_height: f64,
+	parsed:      u64, // shell output parsed when it was last seen changing
+	quiet_since: int, // frame
+	terminal:    ^Pane,
+	file:        ^Pane,
+}
+
+
+// Block elements and box drawing at the user's font settings (the bundled IBM
+// Plex Mono at 16, weight 300, line height 1.4: the font's advance has a
+// fraction and its glyphs don't reach the row's height), drawn in the terminal
+// and in an editor and read back from the window. Full blocks leave no seams
+// and fill their rows, half blocks fill their halves, and a box's lines join
+// across cells and rows
+@(private = "file")
+phase_box_glyphs :: proc(p: ^Perf, frame: int) -> bool {
+	pb := &perf_box
+	path := path_in_dir(p, "blocks.txt")
+
+	if frame == 0 {
+		pb.font_size, pb.font_weight = g.settings.font_size, g.settings.font_weight
+		pb.line_height = g.settings.line_height
+		g.settings.font_size = 16
+		g.settings.font_weight = 300
+		g.settings.line_height = 1.4
+		apply_editor_font()
+
+		lines := BOX_GLYPH_ROWS
+		rows := strings.join(lines[:], "\n", context.temp_allocator)
+		_ = os.write_entire_file(path, transmute([]u8)rows)
+
+		pb.stage = .Terminal_Settling
+		pb.terminal = g.panes.focused
+		pb.parsed, pb.quiet_since = focused_terminal().session.parsed, 0
+		return false
+	}
+
+	switch pb.stage {
+	case .Terminal_Settling:
+		// Once the grid has its new size and the shell has stopped repainting it
+		s := &focused_terminal().session
+		if s.parsed != pb.parsed || g.animating {
+			pb.parsed, pb.quiet_since = s.parsed, frame
+		}
+		if frame - pb.quiet_since < 30 do return false
+
+		sb := strings.builder_make(context.temp_allocator)
+		strings.write_string(&sb, "\x1b[0m\x1b[2J")
+		for line, row in BOX_GLYPH_ROWS {
+			fmt.sbprintf(&sb, "\x1b[%d;1H%s", row + 1, line)
+		}
+		term.terminal_vt_write(s.vt, raw_data(sb.buf), len(sb.buf))
+		pb.stage = .Terminal_Drawn
+
+	case .Terminal_Drawn:
+		check_terminal_box_glyphs(p, focused_terminal())
+
+		// The same rows in a file, the caret after them
+		pb.file = panes_open_file(path)
+		pane_focus(pb.file)
+		textedit.move(focused_editor(), .Doc_End, false)
+		pb.quiet_since = frame
+		pb.stage = .Editor_Settling
+
+	case .Editor_Settling:
+		e := focused_editor()
+		if g.animating || e == nil || !e.shown {
+			pb.quiet_since = frame
+		}
+		if frame - pb.quiet_since < 10 do return false
+
+		check_editor_box_glyphs(p, e)
+
+		// Back to the terminal, maximized, at the suite's font settings
+		pane_close(pb.file, ask = false)
+		pane_focus(pb.terminal)
+		if g.panes.maximized != pb.terminal do pane_toggle_maximized()
+
+		g.settings.font_size, g.settings.font_weight = pb.font_size, pb.font_weight
+		g.settings.line_height = pb.line_height
+		apply_editor_font()
+		pb.quiet_since = frame
+		pb.stage = .Restoring
+
+	case .Restoring:
+		// Done once the terminal is back in place, at its full size
+		if g.animating do pb.quiet_since = frame
+		return frame - pb.quiet_since >= 10
+	}
+	return false
+}
+
+
+// Cells as draw_terminal or an editor places them, and what was read back over
+// them (pixels, the window's)
+@(private = "file")
+Cell_Probe :: struct {
+	ox, oy, adv, lh: f32,
+	area:            sdl.Rect,
+	pixels:          [][4]u8,
+	fg:              clay.Color, // what the glyphs are drawn in
+}
+
+
+// Draws the terminal (showing BOX_GLYPH_ROWS) over its background and checks
+// the rows' cells
+@(private = "file")
+check_terminal_box_glyphs :: proc(p: ^Perf, t: ^Terminal) {
+	scale := gfx.scale
+	fg, bg := t.colors.foreground, t.colors.background
+	pr := Cell_Probe {
+		ox  = t.view.x * scale,
+		oy  = t.view.y * scale,
+		adv = t.cell_w * scale,
+		lh  = t.cell_h * scale,
+		fg  = {f32(fg.r), f32(fg.g), f32(fg.b), 255},
+	}
+	pr.area = probe_area(pr)
+
+	fill_area(pr.area, {f32(bg.r), f32(bg.g), f32(bg.b), 255})
+	out_w, out_h: i32
+	_ = sdl.GetCurrentRenderOutputSize(gfx.renderer, &out_w, &out_h)
+	draw_terminal(t, {0, 0, f32(out_w), f32(out_h)}, scale)
+
+	check_box_cells(p, &pr, "terminal")
+}
+
+
+// Draws an editor showing BOX_GLYPH_ROWS, scrolled to the top, over its
+// background and checks the rows' cells
+@(private = "file")
+check_editor_box_glyphs :: proc(p: ^Perf, e: ^Editor) {
+	scale := gfx.scale
+	b := clay.BoundingBox{e.view.x * scale, e.view.y * scale, e.view.w * scale, e.view.h * scale}
+
+	// As the text view places its columns and lines
+	gutter := math.round(e.gutter_w * scale)
+	pr := Cell_Probe {
+		ox  = b.x + gutter + TEXT_MARGIN * scale - e.scroll_x * scale,
+		oy  = b.y,
+		adv = e.char_w * scale,
+		lh  = f32(text_line_height(e)) * scale,
+		fg  = gfx.theme.syntax[.None],
+	}
+	pr.area = probe_area(pr)
+
+	fill_area(pr.area, gfx.theme.bg)
+	draw_editor(e, b, scale)
+
+	check_box_cells(p, &pr, "editor")
+}
+
+
+// The pixels of BOX_GLYPH_ROWS' cells, two columns wider
+@(private = "file")
+probe_area :: proc(pr: Cell_Probe) -> sdl.Rect {
+	left, top := probe_x(pr, 0), probe_y(pr, 0)
+	right, bottom := probe_x(pr, 12), probe_y(pr, len(BOX_GLYPH_ROWS))
+	return {i32(left), i32(top), i32(right - left), i32(bottom - top)}
+}
+
+
+@(private = "file")
+fill_area :: proc(area: sdl.Rect, c: clay.Color) {
+	gfx.fill_rect(f32(area.x), f32(area.y), f32(area.w), f32(area.h), c)
+}
+
+
+// Reads back the cells drawn and checks BOX_GLYPH_ROWS in them
+@(private = "file")
+check_box_cells :: proc(p: ^Perf, pr: ^Cell_Probe, what: string) {
+	ok: bool
+	pr.pixels, ok = read_window(pr.area)
+	check(p, fmt.tprintf("%s: read back", what), ok)
+	if !ok do return
+
+	full := full_blocks_filled(pr^, 0)
+	halves := half_blocks_filled(pr^, 1)
+	box := box_joined(pr^, 2, 5)
+	check(p, fmt.tprintf("%s: full blocks leave no seams, fill the row", what), full)
+	check(p, fmt.tprintf("%s: half blocks fill their halves", what), halves)
+	check(p, fmt.tprintf("%s: a box's lines join across cells and rows", what), box)
+}
+
+
+// Whether the row's ten full blocks light every pixel of their cells
+@(private = "file")
+full_blocks_filled :: proc(pr: Cell_Probe, row: int) -> bool {
+	for y in probe_y(pr, row) ..< probe_y(pr, row + 1) {
+		for x in probe_x(pr, 0) ..< probe_x(pr, 10) {
+			if !probe_lit(pr, x, y) do return false
+		}
+	}
+	return true
+}
+
+
+// Whether the row's eight half blocks (upper, lower, ...) light the upper or
+// lower part of every pixel column, all the same part, the two adding up to
+// the row
+@(private = "file")
+half_blocks_filled :: proc(pr: Cell_Probe, row: int) -> bool {
+	top, bottom := probe_y(pr, row), probe_y(pr, row + 1)
+	upper_rows := -1
+
+	for col in 0 ..< 8 {
+		upper := col % 2 == 0
+		for x in probe_x(pr, col) ..< probe_x(pr, col + 1) {
+			lit := 0
+			for y in top ..< bottom {
+				if probe_lit(pr, x, y) do lit += 1
+			}
+			if lit == 0 do return false
+
+			// Lit from the top (upper) or from the bottom (lower), nowhere else
+			for y in top ..< bottom {
+				want := upper ? y < top + lit : y >= bottom - lit
+				if probe_lit(pr, x, y) != want do return false
+			}
+
+			above := upper ? lit : bottom - top - lit
+			if upper_rows < 0 do upper_rows = above
+			if above != upper_rows do return false
+		}
+	}
+	return true
+}
+
+
+// Whether the box from row `top` to row `bottom` (columns 0 to 3) has sides
+// unbroken from the end of its top corners' arcs to the start of its bottom
+// corners', across the rows between, and its top likewise from corner to corner
+@(private = "file")
+box_joined :: proc(pr: Cell_Probe, top, bottom: int) -> bool {
+	// Into the corners' cells: their arcs are straight by their last pixel
+	INTO_CORNER :: 1
+
+	// The sides, at the pixel column where │ is lit in the row below the corners
+	for col in ([]int{0, 3}) {
+		side := -1
+		y_side := probe_mid_y(pr, top + 1)
+		for x in probe_x(pr, col) ..< probe_x(pr, col + 1) {
+			if probe_lit(pr, x, y_side) {
+				side = x
+				break
+			}
+		}
+		if side < 0 do return false
+
+		from := probe_y(pr, top + 1) - INTO_CORNER
+		to := probe_y(pr, bottom) + INTO_CORNER
+		for y in from ..< to {
+			if !probe_lit(pr, side, y) do return false
+		}
+	}
+
+	// The top, at the pixel row where ─ is lit
+	edge := -1
+	x_edge := probe_mid_x(pr, 1)
+	for y in probe_y(pr, top) ..< probe_y(pr, top + 1) {
+		if probe_lit(pr, x_edge, y) {
+			edge = y
+			break
+		}
+	}
+	if edge < 0 do return false
+
+	for x in probe_x(pr, 1) - INTO_CORNER ..< probe_x(pr, 3) + INTO_CORNER {
+		if !probe_lit(pr, x, edge) do return false
+	}
+	return true
+}
+
+
+// A column's left edge and a row's top, and their middles, in window pixels
+@(private = "file")
+probe_x :: proc(pr: Cell_Probe, col: int) -> int {
+	return int(math.round(pr.ox + f32(col) * pr.adv))
+}
+
+
+@(private = "file")
+probe_y :: proc(pr: Cell_Probe, row: int) -> int {
+	return int(math.round(pr.oy + f32(row) * pr.lh))
+}
+
+
+@(private = "file")
+probe_mid_x :: proc(pr: Cell_Probe, col: int) -> int {
+	return int(math.round(pr.ox + (f32(col) + 0.5) * pr.adv))
+}
+
+
+@(private = "file")
+probe_mid_y :: proc(pr: Cell_Probe, row: int) -> int {
+	return int(math.round(pr.oy + (f32(row) + 0.5) * pr.lh))
+}
+
+
+// Whether a window pixel read back shows the glyphs' color
+@(private = "file")
+probe_lit :: proc(pr: Cell_Probe, x, y: int) -> bool {
+	px := pr.pixels[(y - int(pr.area.y)) * int(pr.area.w) + (x - int(pr.area.x))]
+	for channel in 0 ..< 3 {
+		if abs(int(px[channel]) - int(pr.fg[channel])) > 3 do return false
+	}
+	return true
+}
+
+
+// Repaints every cell with block elements and box drawing in a new color each
+// frame, like a full-screen program drawing with them
+@(private = "file")
+phase_terminal_blocks :: proc(p: ^Perf, frame: int) -> bool {
+	glyphs := []rune{'█', '▀', '▄', '▌', '▐', '░', '▒', '▓', '▛', '▟', '─', '│', '┼', '╭', '╯'}
+
+	s := &focused_terminal().session
+	sb := strings.builder_make(context.temp_allocator)
+	for row in 0 ..< int(s.rows) {
+		fmt.sbprintf(&sb, "\x1b[%d;1H", row + 1)
+		for col in 0 ..< int(s.cols) {
+			color := (frame + row + col) % 256
+			glyph := glyphs[(frame + row + col) % len(glyphs)]
+			fmt.sbprintf(&sb, "\x1b[38;5;%dm%c", color, glyph)
 		}
 	}
 	strings.write_string(&sb, "\x1b[0m")
@@ -2282,6 +3038,614 @@ phase_panes_moving :: proc(p: ^Perf, frame: int) -> bool {
 
 	pp.step += 1
 	p.mark_frame = frame
+	return false
+}
+
+
+// On the files of phase_panes_typing: the maximize button shows only while it
+// does something, the title's tooltip appears at the pointer, and the mouse's
+// back button goes back in the pane under the pointer. Each step waits for the
+// panes to settle
+@(private = "file")
+phase_pane_header :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) mouse: [2]f32
+	@(static) caret: int
+	@(static) since: time.Tick
+
+	pp := &perf_panes
+	ps := &g.panes
+	if frame == 0 {
+		step = 0
+		mouse = g.mouse_pos
+		ps.maximized = nil
+		pane_hide(pp.terminal)
+		pane_focus(pp.code)
+		p.mark_frame = frame
+		return false
+	}
+
+	// Settled: no transition for a few frames, nothing waiting to open
+	if g.animating || g.pending != nil {
+		p.mark_frame = frame
+		return false
+	}
+	if frame < p.mark_frame + 3 do return false
+
+	e := pp.code.content.(^Editor)
+	_, maximize_shown := element_rect(clay.ID("PaneMaximize", pp.code.id))
+	switch step {
+	case 0:
+		beside := maximize_shown && pane_fill(pp.code) == .Shared
+		check(p, "beside another pane: Maximize", beside)
+		pane_toggle_maximized()
+
+	case 1:
+		over := maximize_shown && pane_fill(pp.code) == .Maximized
+		check(p, "maximized over others: Restore", over)
+		pane_toggle_maximized()
+		pane_hide(pp.notes)
+
+	case 2:
+		pane_toggle_maximized()
+		alone := !maximize_shown && ps.maximized == nil
+		check(p, "the only pane: no button, no maximizing", alone)
+		pane_move(pp.notes, {kind = .Split, target = pp.code, side = .Right})
+
+	case 3:
+		check(p, "with a second pane: Maximize again", maximize_shown)
+
+		// The pointer rests on the code's title, right of its middle
+		title, _ := element_rect(clay.ID("PaneTitle", pp.code.id))
+		g.mouse_pos = {title.x + title.w * 0.7, title.y + title.h / 2}
+		since = time.tick_now()
+
+	case 4: // the tip placed (its first frame lays it out out of sight)
+		tip, tip_shown := element_rect(clay.ID("Tooltip"))
+		tip_shown &= g.tooltip.placed
+		if !tip_shown && time.tick_since(since) < 2 * time.Second {
+			return false
+		}
+		d := [2]f32{tip.x, tip.y} - g.mouse_pos
+		near := tip_shown && abs(d.x) < 30 && d.y > 0 && d.y < 40
+		check(p, "the title's tooltip is at the pointer", near)
+
+		// A jump in the code
+		caret = e.sels[e.primary].head
+		target := buffer.line_start(&e.buf, 5)
+		jump_to(e.path, target)
+
+	case 5:
+		check(p, "the jump moved the caret", e.sels[e.primary].head != caret)
+
+		// The back button over the code, while the notes have the keys
+		pane_focus(pp.notes)
+		body, _ := element_rect(clay.ID("PaneBody", pp.code.id))
+		press_mouse_button(sdl.BUTTON_X1, {body.x + body.w / 2, body.y + body.h / 2})
+
+	case 6:
+		back := ps.focused == pp.code && e.sels[e.primary].head == caret
+		check(p, "Mouse4 goes back in the pane under it", back)
+
+		// Back as it was
+		g.mouse_pos = mouse
+		pane_move(pp.terminal, {kind = .Edge, side = .Right, share = 0.3})
+		pane_focus(pp.terminal)
+		return true
+	}
+
+	step += 1
+	p.mark_frame = frame
+	return false
+}
+
+
+// --- Text fields -------------------------------------------------------------------
+
+@(private = "file")
+PERF_FIND_QUERY :: "the quick brown fox jumps over the lazy dog, again and again"
+
+@(private = "file")
+PERF_SEARCH :: "font size"
+
+
+// The find bar's field on the code of phase_panes_typing: Ctrl+A selects the
+// field's text and not the editor's; a press places the caret where the text
+// is measured, dragging selects and past the end scrolls the text, a double
+// press selects a word. Once another pane is focused, Enter goes to it; a press
+// on the field takes the keys back; Find next in another pane moves the bar
+// there. Then a press and a drag in the settings search, and Ctrl+A in the
+// finder
+@(private = "file")
+phase_text_fields :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	pp := &perf_panes
+	f := &g.find
+	field := clay.ID("FindField")
+
+	if frame == 0 {
+		g.panes.maximized = nil
+		pane_focus(pp.code)
+		e := focused_editor()
+		textedit.set_single_selection(e, {0, 0, -1})
+		check(p, "Find opens on the code", run_command(.Find) && f.pane == pp.code)
+
+		type_text(PERF_FIND_QUERY)
+		press(sdl.K_HOME)
+		step, p.mark_frame = 1, frame
+		return false
+	}
+
+	waited := frame - p.mark_frame
+	code := pp.code.content.(^Editor)
+	notes := pp.notes.content.(^Editor)
+
+	switch step {
+	case 1: // Ctrl+A in the field
+		if g.animating || waited < 2 {
+			return false
+		}
+
+		before := code.sels[code.primary]
+		press_chord(.A, sdl.KMOD_LCTRL)
+		all := f.edit.anchor == 0 && f.edit.caret == len(PERF_FIND_QUERY)
+		alone := len(code.sels) == 1 && code.sels[code.primary] == before
+		check(p, "Ctrl+A in the find field selects its text", all)
+		check(p, "Ctrl+A in the find field leaves the editor's selection", alone)
+		press(sdl.K_HOME)
+
+		// A space moves the caret, even last (the text's inked extent doesn't grow)
+		after_quick := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 9)
+		after_space := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY[:10], 10)
+		check(p, "a caret after a space is right of it", after_space > after_quick + 1)
+		next_step(p, &step, frame)
+
+	case 2: // a press after "quick", once the text scrolled back
+		if waited < 2 do return false
+
+		press_field(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 9, clicks = 1)
+		next_step(p, &step, frame)
+
+	case 3: // then a drag to after "brown"
+		placed := f.edit.anchor == 9 && f.edit.caret == 9
+		check(p, "a press in the find field places the caret", placed && find_has_keys())
+		g.mouse_pos.x = field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 15)
+		next_step(p, &step, frame)
+
+	case 4: // and on past the field's end
+		check(p, "dragging in the find field selects", f.edit.anchor == 9 && f.edit.caret == 15)
+		r, _ := element_rect(field)
+		g.mouse_pos.x = r.x + r.w + 40
+		next_step(p, &step, frame)
+
+	case 5:
+		if waited < 20 do return false
+
+		scrolled := f.edit.scroll > 0 && f.edit.caret > 15 && f.edit.anchor == 9
+		check(p, "dragging past the find field's end scrolls its text", scrolled)
+		g.mouse_down = false
+		press(sdl.K_HOME)
+		next_step(p, &step, frame)
+
+	case 6: // a double press on "brown"
+		if waited < 2 do return false
+
+		press_field(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 12, clicks = 2)
+		next_step(p, &step, frame)
+
+	case 7:
+		check(p, "a double press selects a word", f.edit.anchor == 10 && f.edit.caret == 15)
+		g.mouse_down = false
+		next_step(p, &step, frame)
+
+	case 8: // a press in the notes
+		g.mouse_pos = {notes.view.x + notes.view.w / 2, notes.view.y + notes.view.h / 2}
+		g.mouse_pressed, g.mouse_down, g.mouse_clicks = true, true, 1
+		next_step(p, &step, frame)
+
+	case 9: // Enter goes to the notes, not the field
+		g.mouse_down = false
+		check(p, "focusing another pane takes the keys from the find field", !find_has_keys())
+
+		length := buffer.length(&notes.buf)
+		current := f.current
+		press(sdl.K_RETURN)
+		went := buffer.length(&notes.buf) > length && f.current == current
+		check(p, "Enter goes to the pane focused after the find field", went)
+		run_command(.Undo)
+		next_step(p, &step, frame)
+
+	case 10: // a press on the field
+		press_field(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 4, clicks = 1)
+		next_step(p, &step, frame)
+
+	case 11: // took the keys back, and reached nothing under the bar
+		back := find_has_keys() && g.panes.focused == pp.code && f.edit.caret == 4
+		check(p, "a press on the find field gives it the keys again", back)
+		check(p, "a press on the find bar reaches nothing under it", g.panes.drag.pane == nil)
+		g.mouse_down = false
+
+		pane_focus(pp.notes)
+		run_command(.Find_Next)
+		check(p, "Find next in another pane moves the bar there", f.pane == pp.notes)
+		press(sdl.K_ESCAPE)
+		check(p, "Escape closes the bar", !f.open)
+
+		settings_window_toggle()
+		type_text(PERF_SEARCH)
+		press(sdl.K_HOME)
+		next_step(p, &step, frame)
+
+	case 12: // a press in the settings search after "font"
+		if g.animating || waited < 2 {
+			return false
+		}
+
+		search := clay.ID("SettingsSearch")
+		press_field(search, 10, FONT_SIZE_UI, PERF_SEARCH, 4, clicks = 1)
+		next_step(p, &step, frame)
+
+	case 13: // and a drag to its end
+		w := &g.settings_window
+		placed := w.search.anchor == 4 && w.search.caret == 4 && w.focus < 0
+		check(p, "a press in the settings search places the caret", placed)
+		search := clay.ID("SettingsSearch")
+		g.mouse_pos.x = field_x(search, 10, FONT_SIZE_UI, PERF_SEARCH, len(PERF_SEARCH))
+		next_step(p, &step, frame)
+
+	case 14:
+		w := &g.settings_window
+		selected := w.search.anchor == 4 && w.search.caret == len(PERF_SEARCH)
+		check(p, "dragging in the settings search selects", selected)
+		g.mouse_down = false
+		settings_window_toggle()
+
+		// Ctrl+A in the finder, over the code
+		pane_focus(pp.code)
+		textedit.set_single_selection(code, {0, 0, -1})
+		before := code.sels[code.primary]
+		finder_toggle()
+		type_text("code")
+		press_chord(.A, sdl.KMOD_LCTRL)
+		q := &g.finder.query
+		check(p, "Ctrl+A in the finder selects its query", q.anchor == 0 && q.caret == 4)
+		alone := len(code.sels) == 1 && code.sels[code.primary] == before
+		check(p, "Ctrl+A in the finder leaves the editor's selection", alone)
+		press(sdl.K_ESCAPE)
+
+		pane_focus(pp.terminal)
+		return true
+	}
+	return false
+}
+
+
+// Presses and releases a mouse button at a point, as SDL's events would
+@(private = "file")
+press_mouse_button :: proc(button: u8, at: [2]f32) {
+	event: sdl.Event
+	event.type = .MOUSE_BUTTON_DOWN
+	event.button.button = button
+	event.button.down = true
+	event.button.clicks = 1
+	event.button.x = at.x
+	event.button.y = at.y
+	mouse_button_event(&event)
+
+	event.button.type = .MOUSE_BUTTON_UP
+	event.button.down = false
+	mouse_button_event(&event)
+}
+
+
+// Runs typo itself (this program) in the terminal's shell with two files and
+// one in a folder that doesn't exist: the shell has the window's endpoint, so
+// the two open here, the second beside the first and focused, the terminal
+// still shown, and the third doesn't open
+@(private = "file")
+phase_ipc_open :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) since: time.Tick
+	sep := os.Path_Separator
+	first := path_in_dir(p, "ipc-first.md")
+	second := path_in_dir(p, fmt.tprintf("sub%cipc-second.md", sep))
+	missing := path_in_dir(p, fmt.tprintf("missing%cipc.md", sep))
+
+	if frame == 0 {
+		// The files
+		_ = os.make_directory_all(path_in_dir(p, "sub"))
+		_ = os.write_entire_file(first, transmute([]u8)string("# first\n"))
+		_ = os.write_entire_file(second, transmute([]u8)string("# second\n"))
+
+		// The command, with paths relative to the shell's folder (the workspace)
+		exe, _ := os.get_executable_path(context.temp_allocator)
+		when ODIN_OS == .Windows {
+			args := `ipc-first.md sub\ipc-second.md missing\ipc.md`
+			command := fmt.tprintf("\"%s\" %s\r", exe, args)
+		} else {
+			args := "ipc-first.md sub/ipc-second.md missing/ipc.md"
+			command := fmt.tprintf("'%s' %s\n", exe, args)
+		}
+
+		t := perf_panes.terminal
+		pane_focus(t)
+		term.session_input(&t.content.(^Terminal).session, transmute([]u8)command)
+		since = time.tick_now()
+		p.mark_frame = -1
+		return false
+	}
+
+	// Until both are open, then until the panes have settled
+	a, b := pane_with_file(first), pane_with_file(second)
+	opened := a != nil && b != nil
+	if !opened && time.tick_since(since) < 20 * time.Second {
+		return false
+	}
+	if p.mark_frame < 0 {
+		p.mark_frame = frame
+		return false
+	}
+	if g.animating do return false
+
+	check(p, "typo <file> in the terminal opens the files in this window", opened)
+	if !opened do return true
+
+	beside := pane_shown(a) && pane_shown(b) && a.rect.x < b.rect.x
+	check(p, "the second file is beside the first, and focused", beside && g.panes.focused == b)
+	check(p, "the terminal stays shown", pane_shown(perf_panes.terminal))
+	check(p, "a file in a missing folder doesn't open", pane_with_file(missing) == nil)
+
+	// Back as the later phases expect: code.odin where the first file opened
+	// (in place of the code), the second file closed
+	pane_close(b, ask = false)
+	pane_focus(a)
+	perf_panes.code = panes_open_file(path_in_dir(p, "code.odin"))
+	pane_focus(perf_panes.terminal)
+	return true
+}
+
+
+// The window x of a field's character boundary, its text not scrolled
+@(private = "file")
+field_x :: proc(id: clay.ElementId, padding: f32, size: u16, s: string, i: int) -> f32 {
+	r, _ := element_rect(id)
+	return r.x + padding + gfx.text_caret_x(&gfx.text_system, .Body, size, s, i)
+}
+
+
+// A press on a field's character boundary, held down
+@(private = "file")
+press_field :: proc(
+	id: clay.ElementId,
+	padding: f32,
+	size: u16,
+	s: string,
+	i: int,
+	clicks: int,
+) {
+	r, _ := element_rect(id)
+	g.mouse_pos = {field_x(id, padding, size, s, i), r.y + r.h / 2}
+	g.mouse_pressed, g.mouse_down, g.mouse_clicks = true, true, clicks
+}
+
+
+// The panes of phase_panes_typing before zooming
+@(private = "file")
+perf_zoom: struct {
+	char_w:  f32,          // the code's column
+	line_h:  int,          // the code's row
+	kept:    textedit.Anchor, // the code's caret line on screen
+	notes_h: f64,          // the notes' row (scroll step)
+	cell:    [2]f32,       // the terminal's
+	grid:    [2]u16,       // ... cols, rows
+}
+
+
+// Zooms the panes of phase_panes_typing, each step once the last has shown:
+// the code with Ctrl+Keypad +/- (real chords), the notes from the status bar's
+// popup, the terminal with Ctrl+Keypad +; then saves two of them as the
+// session does and restores them
+@(private = "file")
+phase_zoom_panes :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	pp := &perf_panes
+	z := &perf_zoom
+	if frame == 0 {
+		step = 0
+		p.mark_frame = 0
+	}
+	if g.animating || frame - p.mark_frame < 3 {
+		return false
+	}
+
+	code := pp.code.content.(^Editor)
+	notes := pp.notes.content.(^Editor)
+	t := pp.terminal.content.(^Terminal)
+	ctrl := sdl.KMOD_LCTRL
+
+	switch step {
+	case 0: // the caret in the middle of the code, which has the keys
+		pane_focus(pp.code)
+		textedit.show_caret(code, true)
+		mid := buffer.line_start(&code.buf, buffer.line_count(&code.buf) / 2)
+		textedit.set_single_selection(code, {mid, mid, -1})
+		code.center, code.reveal = true, true
+
+	case 1: // zoom in
+		_, shown := element_rect(clay.ID("ZoomStatus"))
+		check(p, "the status bar shows the zoom", shown)
+		z^ = {
+			char_w  = code.char_w,
+			line_h  = text_line_height(code),
+			kept    = code.kind.anchor(code),
+			notes_h = notes.kind.scroll_step(notes),
+			cell    = {t.cell_w, t.cell_h},
+			grid    = {t.session.cols, t.session.rows},
+		}
+		press_chord(.KP_PLUS, ctrl)
+
+	case 2: // only the code zoomed, its caret line in place; zoom out twice
+		zoomed := code.zoom == 1 && code.char_w > z.char_w && text_line_height(code) > z.line_h
+		check(p, "Ctrl+= zooms the focused pane", zoomed)
+
+		kept := code.kind.anchor(code)
+		in_place := kept.line == z.kept.line && abs(kept.y - z.kept.y) <= 1
+		check(p, "its caret's line stays in place", in_place)
+
+		others := notes.kind.scroll_step(notes) == z.notes_h && t.cell_w == z.cell.x
+		check(p, "the other panes keep their size", others)
+		press_chord(.KP_MINUS, ctrl)
+		press_chord(.KP_MINUS, ctrl)
+
+	case 3: // the notes get the keys; open the zoom popup
+		check(p, "Ctrl+- zooms out", code.zoom == -1 && text_line_height(code) < z.line_h)
+		pane_focus(pp.notes)
+		click_element(clay.ID("ZoomStatus"))
+
+	case 4:
+		check(p, "clicking the zoom opens its popup", g.zoom_popup.open)
+		click_element(clay.ID("ZoomIn"))
+
+	case 5:
+		zoomed := notes.zoom == 1 && notes.kind.scroll_step(notes) > z.notes_h
+		check(p, "the popup zooms rendered Markdown in", zoomed)
+		check(p, "the other panes keep their zoom", code.zoom == -1 && t.zoom == 0)
+		click_element(clay.ID("ZoomIn"))
+
+	case 6:
+		click_element(clay.ID("ZoomOut"))
+
+	case 7:
+		check(p, "the popup zooms out", notes.zoom == 1)
+		click_element(clay.ID("ZoomReset"))
+
+	case 8: // a click outside closes the popup
+		check(p, "the popup's zoom resets it", notes.zoom == 0)
+		r, _ := element_rect(pane_id(pp.code))
+		g.mouse_pos, g.mouse_pressed = {r.x + r.w / 2, r.y + r.h / 2}, true
+
+	case 9: // the terminal
+		check(p, "a click outside closes the popup", !g.zoom_popup.open)
+		check(p, "and does nothing else", g.panes.focused == pp.notes)
+		pane_focus(pp.terminal)
+		press_chord(.KP_PLUS, ctrl)
+
+	case 10: // its cells grew and its grid has fewer of them
+		grown := t.zoom == 1 && t.cell_w > z.cell.x && t.cell_h > z.cell.y
+		check(p, "Ctrl+= zooms a terminal", grown)
+		fewer := t.session.cols < z.grid.x && t.session.rows <= z.grid.y
+		check(p, "the terminal's grid resizes", fewer)
+		check(p, "the other panes keep their zoom", code.zoom == -1 && notes.zoom == 0)
+
+	case 11: // the session: saved, then restored
+		check(p, "zoom is restored from the session", zoom_restores(pp.code, pp.terminal))
+		for pane in g.panes.open do pane_init_zoom(pane, 0)
+		return true
+	}
+
+	step += 1
+	p.mark_frame = frame
+	return false
+}
+
+
+// Saves two zoomed panes as the session does (through JSON), restores them
+// beside the others and compares their zoom
+@(private = "file")
+zoom_restores :: proc(panes: ..^Pane) -> bool {
+	saved := make([dynamic]Session_Pane, context.temp_allocator)
+	for pane in panes {
+		sp, kept := session_pane(pane)
+		if !kept do return false
+		append(&saved, sp)
+	}
+
+	data, err := json.marshal(saved[:], allocator = context.temp_allocator)
+	if err != nil do return false
+	read: []Session_Pane
+	if json.unmarshal(data, &read, allocator = context.temp_allocator) != nil {
+		return false
+	}
+
+	// The file opens again in a new pane once its own is closed
+	for pane in panes {
+		if is_editor(pane) do pane_close(pane, ask = false)
+	}
+	restored := restore_panes(read)
+
+	same := len(restored) == len(panes)
+	for pane, i in restored {
+		if pane == nil {
+			same = false
+			continue
+		}
+
+		step, _ := pane_zoom(pane)
+		same &= step == textedit.zoom_step(read[i].zoom) && step != 0
+		if is_terminal(pane) do pane_close(pane, ask = false)
+	}
+	return same
+}
+
+
+// Zooms rendered notes.md a step a frame, in and out, with the caret in the
+// middle: each step re-estimates every line's height and lays out what is in
+// view, keeping the caret's line in place. Frames count after a first round
+@(private = "file")
+phase_zoom_markdown :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) kept: textedit.Anchor
+	@(static) moved: f64       // the most the caret's line moved on screen in a step
+	@(static) rows: [2]f64     // the lowest and highest row height seen
+	ZOOMS :: [?]int{1, 4, 7, 3, 0, -3, -5, -1} // 300% is 7 steps up, 50% 5 down
+
+	if frame == 0 {
+		close_files()
+		panes_open_file(path_in_dir(p, "notes.md"))
+		e := focused_editor()
+		textedit.show_caret(e, true)
+		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)
+		textedit.set_single_selection(e, {mid, mid, -1})
+		e.center, e.reveal = true, true
+		p.mark_frame = -1
+		moved = 0
+		rows = {max(f64), 0}
+		return false
+	}
+
+	// Frames count from when it shows and has settled
+	e := focused_editor()
+	if p.mark_frame < 0 {
+		if !e.shown || frame < 10 {
+			return false
+		}
+		p.mark_frame = frame
+		clear(&p.frames)
+	} else {
+		a := e.kind.anchor(e)
+		moved = max(moved, a.line == kept.line ? abs(a.y - kept.y) : max(f64))
+
+		row := e.kind.scroll_step(e)
+		rows = {min(rows[0], row), max(rows[1], row)}
+	}
+
+	// The first round opens the fonts at each size; the frames after it count
+	zooms := ZOOMS
+	n := frame - p.mark_frame
+	if n == len(zooms) {
+		worst: f64
+		for f in p.frames do worst = max(worst, f[.Update] + f[.Render])
+		result(p, "first step to each zoom, max CPU", worst, "ms")
+		clear(&p.frames)
+	}
+	if n == 120 + len(zooms) {
+		zoomed := md_rendered(e) && rows[1] > rows[0] * 3
+		check(p, "rendered Markdown zooms (50% to 300%)", zoomed)
+		check(p, "the caret's line stays in place", moved <= 1)
+		pane_init_zoom(g.panes.focused, 0)
+		return true
+	}
+
+	kept = e.kind.anchor(e)
+	pane_set_zoom(g.panes.focused, zooms[n % len(zooms)])
 	return false
 }
 
@@ -2470,7 +3834,7 @@ phase_lsp_features :: proc(p: ^Perf, frame: int) -> bool {
 		}
 
 		check(p, "Go back returns", back)
-		lh := f64(editor_line_height())
+		lh := f64(text_line_height(e))
 		line_middle := 500 * lh + lh / 2
 		view_middle := e.target_y + f64(e.view.h) / 2
 		check(p, "the place is in the middle of the view", abs(line_middle - view_middle) <= lh)
@@ -2516,7 +3880,8 @@ phase_lsp_features :: proc(p: ^Perf, frame: int) -> bool {
 // Go to symbol in file lists its outline with the caret's symbol selected, a
 // query filters it and Enter goes there; Go to symbol in project asks as the
 // query rests and goes to the one chosen; Find references lists every "total"
-// with its line, pages through them, goes to one, and Go back returns
+// with its line, pages through them, a click on one goes there (rows below it
+// still laid out), and Go back returns
 @(private = "file")
 phase_lsp_finder :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) step: int
@@ -2633,15 +3998,16 @@ phase_lsp_finder :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "each with its line", strings.has_prefix(first, "item_0 :: proc"))
 		step, p.mark_frame = 7, frame
 
-	case 7: // page through them, then go to one
+	case 7: // page through them, then click one with rows below it
 		if waited < 60 {
 			press(sdl.K_PAGEDOWN)
 			return false
 		}
 
-		row := f.results[f.selected].index
+		at := f.selected - 3
+		row := f.results[at].index
 		chosen, _ = f.items[row].target.(int)
-		press(sdl.K_RETURN)
+		click_element(clay.ID("FinderRow", u32(at)))
 		step, p.mark_frame, step_at = 8, frame, time.tick_now()
 
 	case 8: // there; then back
@@ -2650,7 +4016,7 @@ phase_lsp_finder :: proc(p: ^Perf, frame: int) -> bool {
 			return false
 		}
 
-		check(p, "Enter goes to a reference", there && !f.open)
+		check(p, "clicking a reference goes there", there && !f.open)
 		run_command(.Go_Back)
 		step, p.mark_frame, step_at = 9, frame, time.tick_now()
 
@@ -2669,10 +4035,10 @@ phase_lsp_finder :: proc(p: ^Perf, frame: int) -> bool {
 
 // In code.odin (the fake server completes every word of it): typing a word
 // opens the list, more letters filter it (about 1,500 items) and the chosen
-// item's documentation comes; Enter inserts it. "(" shows the signature, a
-// comma moves to the next parameter, ")" closes it. A snippet goes in as text
-// with its placeholder selected; an item's import goes in with it, and one undo
-// takes both back; Esc closes the list
+// item's documentation comes; clicking it (rows below it) inserts it. "("
+// shows the signature, a comma moves to the next parameter, ")" closes it. A
+// snippet goes in as text with its placeholder selected; an item's import goes
+// in with it, and one undo takes both back; Esc closes the list
 @(private = "file")
 phase_lsp_completion :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) step: int
@@ -2728,12 +4094,17 @@ phase_lsp_completion :: proc(p: ^Perf, frame: int) -> bool {
 
 		check(p, "typing filters it", chosen_completion().label == "item_42")
 		check(p, "the chosen item's documentation comes", strings.contains(docs, "docs for"))
-		press(sdl.K_RETURN)
-		step, p.mark_frame = 3, frame
+		check(p, "more items match below it", len(cs.shown) > 1)
+		click_element(clay.ID("CompletionRow", 0))
+		step, p.mark_frame, step_at = 3, frame, time.tick_now()
 
 	case 3: // inserted once; then a call
+		if cs.open && waited_ms < 1000 {
+			return false
+		}
+
 		line, _ := caret_line(e)
-		check(p, "Enter inserts it", line == "\titem_42" && !cs.open)
+		check(p, "clicking an item inserts it", line == "\titem_42" && !cs.open)
 		editor_text_input(e, "(")
 		step, p.mark_frame, step_at = 4, frame, time.tick_now()
 
@@ -3155,9 +4526,11 @@ phase_lsp_popup :: proc(p: ^Perf, frame: int) -> bool {
 
 // The language servers in the settings window, with the fake server: its row
 // says it runs, Off stops it and On starts it again; its page edits a field by
-// keys and Delete puts it back; a server is added and removed; and Install runs
-// a server's install command (the fake server copying itself onto PATH) in a
-// terminal, after which that server starts
+// keys and Delete puts it back; a server is added and removed; with only uv
+// and npm on PATH, only their install commands are offered, uv's first, and a
+// server with neither says what installing needs; and Install runs a server's
+// install command (the fake server copying itself onto PATH) in a terminal,
+// after which that server starts
 @(private = "file")
 phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) step: int
@@ -3183,11 +4556,11 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 
 		// Two servers for Odin: one runs, one isn't installed yet
 		langs.state.active = true
-		perf_server("fake", fake, "")
+		perf_server("fake", fake)
 		perf_server("fake-install", "fake-install", fmt.tprintf("%s --copy-to %s", fake, target))
 
 		// And one whose program is a path too long to show whole
-		perf_server("fake-far", "fake-far", "")
+		perf_server("fake-far", "fake-far")
 		far_name := strings.repeat("far", 40, context.temp_allocator)
 		far, _ := os.join_path({bin, far_name, far_name}, context.temp_allocator)
 		langs.server_override(&g.settings.servers, "fake-far").path = strings.clone(far)
@@ -3196,7 +4569,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		focused = g.panes.focused
 		terminals = count_terminals()
 		settings_window_toggle()
-		append(&w.search, "fake")
+		line_edit_set(&w.search, "fake", 4, 4)
 		step, p.mark_frame = 1, frame
 		return false
 	}
@@ -3273,7 +4646,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "Delete puts a field back as built in", o != nil && o.root_markers == nil)
 		press(sdl.K_ESCAPE)
 		check(p, "Esc goes back to the list", w.open && w.server_page == "")
-		clear(&w.search)
+		line_edit_clear(&w.search)
 		next_step(p, &step, frame)
 
 	case 7: // add a server
@@ -3309,15 +4682,100 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		}
 
 		check(p, "removing it goes back to the list", gone)
-		append(&w.search, "fake")
+		line_edit_set(&w.search, "fake", 4, 4)
+
+		// Installers: only uv and npm are on PATH
+		installers := path_in_dir(p, "installers")
+		_ = os.make_directory_all(installers)
+		for name in ([]string{"uv", "npm"}) {
+			stub := ODIN_OS == .Windows ? fmt.tprintf("%s.cmd", name) : name
+			stub_path, _ := os.join_path({installers, stub}, context.temp_allocator)
+			_ = os.write_entire_file(stub_path, transmute([]u8)string("exit 0\n"))
+		}
+		_ = os.set_env("PATH", installers)
+
+		// One server with commands for both and for others, one with only others
+		perf_server(
+			"fake-light",
+			"fake-light",
+			"cargo install fake-light",
+			"npm install -g fake-light",
+			"brew install fake-light",
+			"uv tool install fake-light",
+		)
+		perf_server("fake-none", "fake-none", "brew install fake-none", "cargo install fake-none")
+		settings_changed()
+		langs.recheck_programs()
 		next_step(p, &step, frame)
 
-	case 11: // Install
-		if waited < 2 do return false
-		click_element(clay.ID("ServerInstall", u32(server_row_index("fake-install"))))
+	case 11: // the lightest installer found is offered; with none found, what they need
+		light := langs.server_installs(langs.server("fake-light"))
+		none := langs.server_installs(langs.server("fake-none"))
+		install_id := clay.ID("ServerInstall", u32(server_row_index("fake-light")))
+		_, install := element_rect(install_id)
+		needs_id := clay.ID("ServerNeeds", u32(server_row_index("fake-none")))
+		_, needs := element_rect(needs_id)
+		none_install_id := clay.ID("ServerInstall", u32(server_row_index("fake-none")))
+		_, none_install := element_rect(none_install_id)
+
+		answered := !programs_checking() && light.known && none.known
+		if !(answered && install && needs) && waited < 600 {
+			return false
+		}
+
+		offered := make([dynamic]string, context.temp_allocator)
+		for x in light.offered do append(&offered, x.command)
+		want := []string{"uv tool install fake-light", "npm install -g fake-light"}
+		lightest := slice.equal(offered[:], want)
+		check(p, "only installers on PATH are offered, lightest first", lightest)
+		check(p, "Install offered when an installer is found", install)
+		check(p, "no Install when no installer is found", !none_install)
+		check(p, "it says what installing needs", needs && none.needs == "brew or cargo")
+		check(p, "rows fit the list, with what installing needs", rows_fit_list())
+		open_server_page("fake-light")
 		next_step(p, &step, frame)
 
-	case 12: // a terminal runs it, and once it is found the server starts
+	case 12: // the page lists every command found, each with its Install
+		_, first := element_rect(clay.ID("ServerPageInstall", 0))
+		_, second := element_rect(clay.ID("ServerPageInstall", 1))
+		_, third := element_rect(clay.ID("ServerPageInstall", 2))
+		if !(first && second) && waited < 600 {
+			return false
+		}
+
+		check(p, "a server's page lists the commands found", first && second && !third)
+		open_server_page("fake-none")
+		next_step(p, &step, frame)
+
+	case 13:
+		_, needs := element_rect(clay.ID("ServerPageNeeds"))
+		_, install := element_rect(clay.ID("ServerPageInstall", 0))
+		if (!needs || programs_checking()) && waited < 600 {
+			return false
+		}
+
+		check(p, "with none found, the page says what installing needs", needs && !install)
+		close_server_page()
+
+		// PATH back, and the test servers gone
+		bin := path_in_dir(p, "bin")
+		_ = os.set_env("PATH", fmt.tprintf("%s%c%s", bin, os.Path_List_Separator, old_path))
+		langs.remove_server_override(&g.settings.servers, "fake-light")
+		langs.remove_server_override(&g.settings.servers, "fake-none")
+		settings_changed()
+		langs.recheck_programs()
+		next_step(p, &step, frame)
+
+	case 14: // Install, once the programs were looked for on the PATH as it was
+		install := clay.ID("ServerInstall", u32(server_row_index("fake-install")))
+		_, shown := element_rect(install)
+		if (programs_checking() || !shown) && waited < 600 {
+			return false
+		}
+		click_element(install)
+		next_step(p, &step, frame)
+
+	case 15: // a terminal runs it, and once it is found the server starts
 		last := g.panes.open[len(g.panes.open) - 1]
 		opened := count_terminals() == terminals + 1 && is_terminal(last) && !w.open
 		if !opened && waited < 10 {
@@ -3328,7 +4786,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		if opened do install_pane = last
 		next_step(p, &step, frame)
 
-	case 13:
+	case 16:
 		c := perf_client("fake-install")
 		started := c != nil && c.state == .Running
 		if !started && waited < 1800 {
@@ -3352,7 +4810,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		delete(old_path)
 		next_step(p, &step, frame)
 
-	case 14: // once the terminal's frame and the servers have gone
+	case 17: // once the terminal's frame and the servers have gone
 		gone := !g.animating && len(langs.state.retiring) == 0
 		if !gone && waited < 600 {
 			return false
@@ -3360,7 +4818,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 		settled = time.tick_now()
 		next_step(p, &step, frame)
 
-	case 15: // and the terminal left has redrawn at its new size
+	case 18: // and the terminal left has redrawn at its new size
 		return time.tick_since(settled) > 500 * time.Millisecond
 	}
 	return false
@@ -3376,15 +4834,30 @@ next_step :: proc(p: ^Perf, step: ^int, frame: int) {
 
 
 // Adds a server for Odin files to the settings, its program a path or a name
-// on PATH
+// on PATH, with its install commands
 @(private = "file")
-perf_server :: proc(name, program, install: string) {
+perf_server :: proc(name, program: string, install: ..string) {
 	o := langs.server_override(&g.settings.servers, name)
 	o.command = make([]string, 1)
 	o.command[0] = strings.clone(program)
 	o.languages = make([]string, 1)
 	o.languages[0] = strings.clone("odin")
-	if install != "" do o.install = strings.clone(install)
+
+	if len(install) > 0 {
+		commands := make([]string, len(install))
+		for command, i in install do commands[i] = strings.clone(command)
+		o.install = commands
+	}
+}
+
+
+// Whether a program is being looked for
+@(private = "file")
+programs_checking :: proc() -> bool {
+	for _, answer in langs.state.programs {
+		if answer.checking do return true
+	}
+	return false
 }
 
 

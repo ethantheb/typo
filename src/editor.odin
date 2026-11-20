@@ -1,5 +1,6 @@
 package editor
 
+import "core:hash/xxhash"
 import "core:os"
 import "core:path/filepath"
 import "core:slice"
@@ -10,6 +11,7 @@ import "langs"
 import "markdown"
 import "syntax"
 import sdl "../vendor/sdl3"
+import "gfx"
 import "textedit"
 import "mdview"
 
@@ -30,12 +32,15 @@ Editor :: struct {
 	new_file: bool,          // path doesn't exist yet; the first save creates it
 	status:   File_Status,
 	lsp:      langs.Doc,       // the document on its language servers
+	disk:     Disk_State,      // the file on disk, as the watcher sees it (file_sync.odin)
+	words:    Word_State,      // its words, for word completions (word_completion.odin)
 
 	// View state, in logical pixels. The scroll position is in tv; it eases
 	// toward its target (see editor_animate)
-	scrollbar_drag: Maybe(f32), // grab offset within the thumb while dragging it
-	char_w:         f32,        // monospace advance of the editor font
+	scrollbar_drag: [gfx.Axis]Maybe(f32), // grab offset within the thumb while dragging it
+	char_w:         f32,                  // monospace advance of the editor font
 	gutter_w:       f32,
+	widest:         Widest_Line,          // the text view's, for sideways scrolling
 
 	// Set once laid out at its real size with nothing in view still loading
 	// (editor_ready); until then the pane is drawn empty
@@ -83,12 +88,13 @@ editor_attach :: proc(e: ^Editor) {
 }
 
 
-// Passes the buffer's edits to the highlighter, the Markdown structure and the
-// language servers
+// Passes the buffer's edits to the highlighter, the text view's widest line,
+// the Markdown structure and the language servers
 @(private = "file")
 editor_on_edit :: proc(v: ^textedit.View, changes: []buffer.Change) {
 	e := editor_of(v)
 	syntax.highlighter_update(&e.hl, &e.buf, changes)
+	widest_line_edited(e, changes)
 
 	if e.md != nil {
 		markdown.doc_edit(e.md, changes)
@@ -96,6 +102,7 @@ editor_on_edit :: proc(v: ^textedit.View, changes: []buffer.Change) {
 	}
 
 	langs.doc_changed(&e.lsp, changes)
+	if len(changes) > 0 do words_edited(e)
 }
 
 
@@ -106,12 +113,13 @@ editor_open :: proc(e: ^Editor, path: string) {
 	editor_attach(e)
 	e.path = strings.clone(path)
 
-	// Read the file
+	// Read the file; a path that doesn't exist opens as an empty, unsaved file
+	stamp, exists := file_stamp(path)
 	data: []u8
-	if os.exists(path) {
-		err: os.Error
-		data, err = os.read_entire_file(path, context.allocator)
-		if err != nil {
+	if exists {
+		err: Read_Error
+		data, err = read_file_shared(path)
+		if err != .None {
 			e.status = .Error
 			return
 		}
@@ -123,9 +131,9 @@ editor_open :: proc(e: ^Editor, path: string) {
 			return
 		}
 	} else {
-		// A path that doesn't exist opens as an empty, unsaved file
 		e.new_file = true
 	}
+	disk_opened(e, file_hash(data), stamp, exists)
 
 	// The document, its highlighting and Markdown structure
 	buffer.buffer_init(&e.buf, data)
@@ -176,6 +184,7 @@ md_toggle_view :: proc(e: ^Editor) {
 editor_path_changed :: proc(e: ^Editor) {
 	if e.status != .Text do return
 
+	disk_path_changed(e)
 	syntax.highlighter_open(&e.hl, &e.buf, e.path)
 	langs.doc_close(&e.lsp)
 	lsp_doc_open(e)
@@ -210,6 +219,8 @@ is_markdown_path :: proc(path: string) -> bool {
 
 editor_close :: proc(e: ^Editor) {
 	langs.doc_close(&e.lsp)
+	words_close(e)
+	disk_closed(e)
 	if e.status == .Text {
 		syntax.highlighter_close(&e.hl)
 		buffer.buffer_destroy(&e.buf)
@@ -235,24 +246,29 @@ editor_destroy :: proc(e: ^Editor) {
 }
 
 
+// Unsaved: edited since read or written, or the file was deleted meanwhile
 editor_is_modified :: proc(e: ^Editor) -> bool {
-	return e.status == .Text && buffer.is_modified(&e.buf)
+	return e.status == .Text && (buffer.is_modified(&e.buf) || e.disk.missing)
 }
 
 
 // Writes to a temporary file and renames it over the original, so a failed
-// save never leaves a half-written file
+// save never leaves a half-written file. The watcher is told what was written
+// (disk_saved), so it isn't taken for a change
 editor_save :: proc(e: ^Editor) -> bool {
 	if e.status != .Text do return false
-	if e.new_file do _ = os.make_directory_all(os.dir(e.path))
+	if e.new_file || e.disk.missing {
+		_ = os.make_directory_all(os.dir(e.path))
+	}
 
-	// Write the temporary file
+	// Write the temporary file, hashing what is written
 	tmp := strings.concatenate({e.path, ".typo.tmp"}, context.temp_allocator)
 	f, err := os.create(tmp)
 	if err != nil {
 		sdl.Log("save: cannot create %s", strings.clone_to_cstring(tmp, context.temp_allocator))
 		return false
 	}
+	hasher, _ := xxhash.XXH3_create_state(context.temp_allocator)
 	for chunk in buffer.chunks(&e.buf) {
 		if _, werr := os.write(f, chunk); werr != nil {
 			os.close(f)
@@ -260,6 +276,7 @@ editor_save :: proc(e: ^Editor) -> bool {
 			sdl.Log("save: write failed")
 			return false
 		}
+		xxhash.XXH3_64_update(hasher, chunk)
 	}
 	os.close(f)
 
@@ -272,6 +289,7 @@ editor_save :: proc(e: ^Editor) -> bool {
 
 	buffer.mark_saved(&e.buf)
 	e.new_file = false
+	disk_saved(e, xxhash.XXH3_64_digest(hasher))
 	langs.doc_saved(&e.lsp)
 	return true
 }
@@ -323,7 +341,7 @@ editor_run_command :: proc(e: ^Editor, cmd: Command) -> bool {
 	}
 
 	#partial switch cmd {
-	case .Save:             editor_save(e)
+	case .Save:             save_or_ask(e)
 	case .Undo:             textedit.undo(e)
 	case .Redo:             textedit.redo(e)
 	case .Select_All:       textedit.select_all(e)

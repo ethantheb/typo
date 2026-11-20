@@ -42,6 +42,7 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 		lsp_completion_ui()
 		lsp_rename_ui()
 		lsp_popup_ui()
+		zoom_popup_ui()
 		context_menu_ui()
 		dialog_ui()
 	}
@@ -245,11 +246,10 @@ status_bar :: proc() {
 			label(pane_title(p), gfx.theme.text, FONT_SIZE_SMALL)
 		}
 
-		// The language servers and the window, on the right
+		// The language servers and the pane's zoom, on the right
 		push_right()
 		lsp_status_item()
-		size := fmt.tprintf("%dx%d @%.2fx", g.window_w, g.window_h, gfx.scale)
-		label(size, gfx.theme.text_dim, FONT_SIZE_SMALL)
+		zoom_status_item()
 		if g.settings.show_fps {
 			label(fmt.tprintf("%.0f fps", g.fps), gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}
@@ -303,6 +303,7 @@ status_buttons :: proc() {
 editor_status :: proc(e: ^Editor) {
 	name := relative_to_root(e.path)
 	if e.new_file do name = fmt.tprintf("%s (new)", name)
+	if e.disk.missing do name = fmt.tprintf("%s (deleted)", name)
 	title := editor_is_modified(e) ? fmt.tprintf("%s •", name) : name
 	label(title, gfx.theme.text, FONT_SIZE_SMALL)
 
@@ -372,14 +373,13 @@ update_mouse_cursor :: proc() {
 	     lsp_hover_covers_pointer(),
 	     lsp_completion_covers_pointer():
 		// The arrow over popups that cover what is under them
-	case lsp_rename_covers_pointer():
-		if pointer_in(clay.ID("SymbolRename")) do want = .TEXT
-	case g.finder.open:
-		if pointer_in(clay.ID("FinderInput")) do want = .TEXT
-	case g.find.open && pointer_in(clay.ID("FindBar")):
-		if pointer_in(clay.ID("FindField")) do want = .TEXT
-	case g.settings_window.open && !ui_interactive():
-		if settings_window_over_text() do want = .TEXT
+	case g.over_text_field:
+		want = .TEXT
+	case lsp_rename_covers_pointer(),
+	     g.finder.open,
+	     g.find.open && pointer_in(clay.ID("FindBar")),
+	     g.settings_window.open && !ui_interactive():
+		// The arrow over the rest of a popup
 	case ps.drag.active:
 		want = .MOVE
 	case divider != nil:
@@ -427,7 +427,7 @@ editor_cursor :: proc() -> sdl.SystemCursor {
 		switch look {
 		case .Arrow: return .DEFAULT
 		case .Hand:  return .POINTER
-		case .Text:  return over_text && e.scrollbar_drag == nil ? .TEXT : .DEFAULT
+		case .Text:  return over_text && !editor_scrollbar_dragged(e) ? .TEXT : .DEFAULT
 		}
 	}
 	return .DEFAULT

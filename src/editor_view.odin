@@ -24,27 +24,33 @@ SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
 EDITOR_SHOW_WAIT :: 500_000_000
 
 
-editor_font_size :: proc() -> u16 {
-	return u16(g.settings.font_size)
+// The editor and terminal metrics below are for a pane's text at its zoom
+// factor (textedit.zoom, textedit.zoom_factor); 1 for unzoomed text
+
+
+editor_font_size :: proc(zoom: f32) -> u16 {
+	size := math.round(f32(g.settings.font_size) * zoom)
+	return u16(max(size, 1))
 }
 
 
 // Line numbers are a little smaller than the text they label
-gutter_font_size :: proc() -> u16 {
-	return max(editor_font_size(), 10) - 2
+gutter_font_size :: proc(zoom: f32) -> u16 {
+	return max(editor_font_size(zoom), 10) - 2
 }
 
 
-editor_line_height :: proc() -> int {
-	return max(int(math.round(f64(g.settings.font_size) * g.settings.line_height)), 1)
+editor_line_height :: proc(zoom: f32) -> int {
+	h := math.round(f64(editor_font_size(zoom)) * g.settings.line_height)
+	return max(int(h), 1)
 }
 
 
 // The advance of one column: the font's cell plus the letter spacing, rounded
 // to whole device pixels so every column starts on one
-editor_char_width :: proc() -> f32 {
-	font_w := gfx.text_char_width(&gfx.text_system, .Editor, editor_font_size())
-	w := font_w + f32(g.settings.letter_spacing)
+editor_char_width :: proc(zoom: f32) -> f32 {
+	font_w := gfx.text_char_width(&gfx.text_system, .Editor, editor_font_size(zoom))
+	w := font_w + f32(g.settings.letter_spacing) * zoom
 	if gfx.scale <= 0 do return max(w, 1)
 
 	return max(math.round(w * gfx.scale), 1) / gfx.scale
@@ -60,7 +66,7 @@ editor_frame :: proc(e: ^Editor, element: clay.ElementId, interactive: bool) {
 
 	r, placed := element_rect(element)
 	if placed do e.view = r
-	e.char_w = editor_char_width()
+	e.char_w = editor_char_width(textedit.zoom(e))
 
 	e.kind.frame_begin(e)
 	if interactive do editor_mouse(e)
@@ -92,7 +98,7 @@ editor_busy :: proc(e: ^Editor) -> bool {
 	       syntax.highlighter_busy(&e.hl, &e.buf) ||
 	       e.md != nil && markdown.doc_busy(e.md) ||
 	       editor_scrolling(e) ||
-	       e.scrollbar_drag != nil
+	       editor_scrollbar_dragged(e)
 }
 
 
@@ -124,9 +130,11 @@ editor_runs :: proc(
 }
 
 
+// Whether a character joins the runs of editor font text: the font has its own
+// glyph for it, and it isn't drawn as shapes filling its cell
 @(private = "file")
 editor_has_glyph :: proc(r: rune) -> bool {
-	return gfx.font_has_own_glyph(&gfx.text_system, .Editor, r)
+	return !gfx.is_box_glyph(r) && gfx.font_has_own_glyph(&gfx.text_system, .Editor, r)
 }
 
 
@@ -287,13 +295,23 @@ max_scroll_y :: proc(e: ^Editor) -> f64 {
 }
 
 
+// How far the view scrolls sideways, and the part of it that does (nothing
+// for a kind that doesn't scroll sideways as a whole)
+editor_sideways :: proc(e: ^Editor) -> (max_scroll: f32, area: gfx.Rect) {
+	if e.kind.sideways == nil do return 0, {}
+	return e.kind.sideways(e)
+}
+
+
 @(private = "file")
 clamp_scroll :: proc(e: ^Editor) {
 	max_y := max_scroll_y(e)
 	e.target_y = clamp(e.target_y, 0, max_y)
 	e.scroll_y = clamp(e.scroll_y, 0, max_y)
-	e.target_x = max(e.target_x, 0)
-	e.scroll_x = max(e.scroll_x, 0)
+
+	max_x, _ := editor_sideways(e)
+	e.target_x = clamp(e.target_x, 0, max_x)
+	e.scroll_x = clamp(e.scroll_x, 0, max_x)
 }
 
 
@@ -323,35 +341,67 @@ editor_scrolling :: proc(e: ^Editor) -> bool {
 
 // --- Scroll bar --------------------------------------------------------------------
 
-// Track and thumb along the text area's right edge (see scrollbar.odin). The
+// Track and thumb of a scroll bar (see scrollbar.odin): along the view's right
+// edge, or sideways along the bottom of the part that scrolls sideways. The
 // last line can scroll to the top, so the content is the document plus one
-// screen
-@(private = "file")
-editor_scrollbar :: proc(e: ^Editor) -> (track, thumb: gfx.Rect, ok: bool) {
-	return scrollbar_geometry(e.view, e.scroll_y, max_scroll_y(e))
+// screen. Where both show, the sideways one stops short of the corner
+editor_scrollbar :: proc(e: ^Editor, axis: gfx.Axis) -> (track, thumb: gfx.Rect, ok: bool) {
+	max_y := max_scroll_y(e)
+	max_x, area := editor_sideways(e)
+
+	if axis == .Vertical {
+		return scrollbar_geometry(e.view, .Vertical, e.scroll_y, max_y)
+	}
+
+	if max_y > 0 do area.w -= SCROLLBAR_WIDTH
+	return scrollbar_geometry(area, .Horizontal, f64(e.scroll_x), f64(max_x))
 }
 
 
 @(private = "file")
 scrollbar_hit :: proc(e: ^Editor, p: [2]f32) -> bool {
-	track, _, ok := editor_scrollbar(e)
-	return ok && gfx.rect_contains(track, p)
+	for axis in gfx.Axis {
+		track, _, ok := editor_scrollbar(e, axis)
+		if ok && gfx.rect_contains(track, p) {
+			return true
+		}
+	}
+	return false
 }
 
 
-// Handles pressing and dragging the scroll bar. Returns true while it owns the
-// mouse
+// Whether a scroll bar is being dragged
+editor_scrollbar_dragged :: proc(e: ^Editor) -> bool {
+	return e.scrollbar_drag != {}
+}
+
+
+// Handles pressing and dragging the scroll bars. Returns true while one owns
+// the mouse
 @(private = "file")
 editor_scrollbar_mouse :: proc(e: ^Editor) -> bool {
-	track, thumb, ok := editor_scrollbar(e)
-	if !ok {
-		e.scrollbar_drag = nil
-		return false
-	}
+	owned := false
+	for axis in gfx.Axis {
+		drag := &e.scrollbar_drag[axis]
+		track, thumb, ok := editor_scrollbar(e, axis)
+		if !ok {
+			drag^ = nil
+			continue
+		}
 
-	scroll, active := scrollbar_mouse(&e.scrollbar_drag, track, thumb, max_scroll_y(e))
-	if active do textedit.scroll_to(e, scroll)
-	return active
+		max_x, _ := editor_sideways(e)
+		max_scroll := axis == .Vertical ? max_scroll_y(e) : f64(max_x)
+		scroll, active := scrollbar_mouse(drag, track, thumb, axis, max_scroll)
+		if !active do continue
+
+		if axis == .Vertical {
+			textedit.scroll_to(e, scroll)
+		} else {
+			e.scroll_x, e.target_x = f32(scroll), f32(scroll)
+		}
+		owned = true
+	}
+	return owned
 }
 
 
@@ -363,19 +413,22 @@ draw_editor :: proc(e: ^Editor, b: clay.BoundingBox, scale: f32) {
 	}
 
 	e.kind.draw(e, {b.x, b.y, b.width, b.height}, scale, editor_caret_on(e))
-	draw_scrollbar(e, scale)
+	draw_scrollbars(e, scale)
 }
 
 
+// The scroll bars' thumbs, each brighter while hovered or dragged
 @(private = "file")
-draw_scrollbar :: proc(e: ^Editor, scale: f32) {
-	_, thumb, ok := editor_scrollbar(e)
-	if !ok do return
+draw_scrollbars :: proc(e: ^Editor, scale: f32) {
+	for axis in gfx.Axis {
+		track, thumb, ok := editor_scrollbar(e, axis)
+		if !ok do continue
 
-	hot := e.scrollbar_drag != nil || scrollbar_hit(e, g.mouse_pos)
-	r, c := scrollbar_thumb_look(thumb, hot)
+		hot := e.scrollbar_drag[axis] != nil || gfx.rect_contains(track, g.mouse_pos)
+		r, c := gfx.scrollbar_thumb_look(thumb, axis, hot)
 
-	b := clay.BoundingBox{r.x * scale, r.y * scale, r.w * scale, r.h * scale}
-	radius := b.width / 2
-	gfx.fill_rounded_rect(b, {radius, radius, radius, radius}, c)
+		b := clay.BoundingBox{r.x * scale, r.y * scale, r.w * scale, r.h * scale}
+		radius := min(b.width, b.height) / 2
+		gfx.fill_rounded_rect(b, {radius, radius, radius, radius}, c)
+	}
 }

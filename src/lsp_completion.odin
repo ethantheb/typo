@@ -20,7 +20,13 @@ package editor
 // call.
 //
 // Requests go out in lsp_completion_frame, after the panes' frames sent the
-// frame's edits to the server, so the server has the text they are about
+// frame's edits to the server, so the server has the text they are about.
+//
+// The file's words (word_completion.odin) join the list as Zed has them: with
+// "fallback" when no server completes, its answer is empty or an error, or it
+// hasn't answered within lsp_fetch_timeout_ms (a later answer with items then
+// replaces them); with "enabled" after the server's items. Typed, a word gets
+// them once it is words_min_length long; Trigger completion at any length
 
 import "core:fmt"
 import "core:slice"
@@ -36,6 +42,7 @@ import "lsp"
 import sdl "../vendor/sdl3"
 import "syntax"
 import "textedit"
+import "words"
 
 
 Completion_State :: struct {
@@ -48,15 +55,24 @@ Completion_State :: struct {
 	due_reason:    lsp.Completion_Trigger, // why
 	due_trigger:   string,           // owned; the trigger character typed
 	due_invoked:   bool,             // asked for: also with no word, in comments
+	server:        Server_Answer,    // what the server gave this list
+	asked_tick:    time.Tick,        // when the server was asked for this list
 
 	// The list
 	open:          bool,
 	start:         int,                       // where the word completed starts
+	invoked:       bool,                      // asked for: words at any length
+	words_mode:    Words_Mode,                // the editor's, when the list was asked for
+	word_index:    ^words.Index,              // the words shown are from it (held)
 	items:         [dynamic]lsp.Completion,   // owned
+	item_texts:    map[string]struct{},       // what the items insert: such words are left out
 	shown:         [dynamic]Shown_Completion, // the items matching the word, best first
 	selected:      int,                       // in shown
+	navigated:     bool,                      // a row chosen with the keys: answers wait for typing
+	clicked:       Maybe(Shown_Completion),   // a row clicked, inserted next frame
 	reveal:        bool,                      // scroll the selected row into view
 	incomplete:    bool,                      // typing more asks again
+	answered:      u64,                       // the buffer version the items are about
 	version:       u64,                       // of the buffer when last filtered
 	caret:         int,                       // likewise
 	generation:    int,                       // counts lists, for resolve answers
@@ -68,9 +84,17 @@ Completion_State :: struct {
 }
 
 Shown_Completion :: struct {
-	index: int, // in items
+	index: int,    // in items, or -1 for a word
+	word:  string, // a word's, in word_index
 	score: f32,
 	key:   string, // the server's order: its sort text, else its label
+}
+
+Server_Answer :: enum {
+	None,    // no server completes
+	Waiting,
+	Items,
+	Failed,  // an empty answer or an error
 }
 
 Signature_State :: struct {
@@ -147,7 +171,10 @@ ITEM_KINDS := [26]Item_Kind {
 // After text was typed in an editor: asks for completions or signature help as
 // the last character calls for, or closes the list when it ends the word
 lsp_typed :: proc(e: ^Editor, text: string) {
-	if len(text) == 0 || len(e.lsp.clients) == 0 {
+	if len(text) == 0 do return
+
+	with_words := words_mode(e) != .Disabled
+	if len(e.lsp.clients) == 0 && !with_words {
 		return
 	}
 	langs.timed()
@@ -164,10 +191,13 @@ lsp_typed :: proc(e: ^Editor, text: string) {
 	}
 
 	c := langs.client_with(&e.lsp, .Completion)
-	if c == nil do return
+	if c == nil && !with_words {
+		return
+	}
 
+	triggers := c != nil ? c.caps.completion_triggers : nil
 	switch {
-	case has_string(c.caps.completion_triggers, last):
+	case has_string(triggers, last):
 		lsp_completion_close()
 		completion_due(e, .Character, last, 0)
 	case textedit.is_word_byte(last[0]):
@@ -181,9 +211,12 @@ lsp_typed :: proc(e: ^Editor, text: string) {
 
 
 // Trigger completion: asks at once, also with no word typed. False if none of
-// the editor's servers completes
+// the editor's servers completes and it has no word completions
 lsp_trigger_completion :: proc(e: ^Editor) -> bool {
-	if langs.client_with(&e.lsp, .Completion) == nil do return false
+	no_server := langs.client_with(&e.lsp, .Completion) == nil
+	if no_server && words_mode(e) == .Disabled {
+		return false
+	}
 
 	lsp_completion_close()
 	completion_due(e, .Invoked, "", 0)
@@ -233,6 +266,20 @@ has_string :: proc(list: []string, s: string) -> bool {
 
 // --- Each frame --------------------------------------------------------------------
 
+// Before the panes' frames (which send the edit out) and before new answers
+// replace the items: inserts the item clicked in the last frame's list. Clicks
+// are handled here rather than in the list's layout, whose rows' strings this
+// frame's drawing still uses
+lsp_completion_click_frame :: proc() {
+	cs := &g.lsp.completion
+	pick, was_clicked := cs.clicked.?
+	if !was_clicked do return
+
+	cs.clicked = nil
+	accept_completion(pick)
+}
+
+
 // After the panes' frames (the edits went out): asks what is due, follows the
 // caret, and closes what lost its editor's focus
 lsp_completion_frame :: proc() {
@@ -259,10 +306,22 @@ lsp_completion_frame :: proc() {
 }
 
 
-// Whether frames must keep coming: something is to be asked once typing rests
+// Whether frames must keep coming: something is to be asked once typing rests,
+// or words are to show when the server doesn't answer in time
 lsp_completion_busy :: proc() -> bool {
+	cs := &g.lsp.completion
 	sig := &g.lsp.signature
-	return g.lsp.completion.due != nil || (sig.due && sig.request == 0)
+	words_wait := !cs.open && cs.server == .Waiting && server_time_limit() > 0
+	return cs.due != nil || words_wait || (sig.due && sig.request == 0)
+}
+
+
+// How long the server has before words show without its answer; 0 if they
+// wait for it (or the list has none)
+@(private = "file")
+server_time_limit :: proc() -> time.Duration {
+	if g.lsp.completion.words_mode == .Disabled do return 0
+	return time.Duration(g.settings.lsp_fetch_timeout) * time.Millisecond
 }
 
 
@@ -289,20 +348,30 @@ completion_step :: proc() {
 		cs.due = nil
 		ask_completions(e, caret, cs.due_reason, cs.due_trigger, cs.due_invoked)
 	}
+
+	// The server is late: the words show without it
+	limit := server_time_limit()
+	late := cs.server == .Waiting && limit > 0 && time.tick_since(cs.asked_tick) >= limit
+	if !cs.open && late {
+		cs.open = true
+		cs.caret = -1
+	}
 	if !cs.open do return
 
-	// The caret moved or the text changed: filter again while it is in the word
+	// The caret moved or the text changed (or new items came): filter again
+	// while it is in the word
 	if e.buf.version != cs.version || caret != cs.caret {
 		if !in_word(e, cs.start, caret) {
 			lsp_completion_close()
 			return
 		}
-
-		edited := e.buf.version != cs.version
 		filter_completions(e, caret)
-		if edited && cs.incomplete && cs.request == 0 {
-			ask_completions(e, caret, .Incomplete, "", true)
-		}
+	}
+
+	// An incomplete list is asked again for the text typed since it was asked,
+	// also what was typed while an answer was on its way
+	if cs.incomplete && cs.request == 0 && e.buf.version != cs.answered {
+		ask_completions(e, caret, .Incomplete, "", true)
 	}
 
 	resolve_chosen(e)
@@ -310,7 +379,8 @@ completion_step :: proc() {
 
 
 // Asks for completions at the caret, unless it is on a number, or (when not
-// asked for) there is no word or it is in a comment or string
+// asked for) there is no word or it is in a comment or string. With no server
+// that completes, the list opens with the words
 @(private = "file")
 ask_completions :: proc(
 	e: ^Editor,
@@ -322,7 +392,10 @@ ask_completions :: proc(
 	langs.timed()
 	cs := &g.lsp.completion
 	c := langs.client_with(&e.lsp, .Completion)
-	if c == nil do return
+	mode := words_mode(e)
+	if c == nil && mode == .Disabled {
+		return
+	}
 
 	// Where the word starts, for a new list
 	if !cs.open {
@@ -334,6 +407,18 @@ ask_completions :: proc(
 			return
 		}
 		cs.start = start
+		cs.invoked = invoked
+		cs.words_mode = mode
+		cs.navigated = false
+	}
+	cs.asked_at = caret
+
+	// Only words
+	if c == nil {
+		cs.server = .None
+		cs.open = true
+		cs.caret = -1
+		return
 	}
 
 	if cs.request != 0 do langs.cancel_request(cs.request, cs.client)
@@ -341,7 +426,10 @@ ask_completions :: proc(
 	langs.track_request(&e.lsp, c, .Completion, id, caret)
 	cs.client = c
 	cs.request = id
-	cs.asked_at = caret
+	if !cs.open {
+		cs.server = .Waiting
+		cs.asked_tick = time.tick_now()
+	}
 }
 
 
@@ -384,21 +472,22 @@ filter_completions :: proc(e: ^Editor, caret: int) {
 	for item, i in cs.items {
 		key := item.sort != "" ? item.sort : item.label
 		if word == "" {
-			append(&cs.shown, Shown_Completion{i, 0, key})
+			append(&cs.shown, Shown_Completion{index = i, key = key})
 			continue
 		}
 
 		matched := item.filter != "" ? item.filter : item.label
 		score, ok := fuzzy.score(word, matched)
-		if ok do append(&cs.shown, Shown_Completion{i, score, key})
+		if ok do append(&cs.shown, Shown_Completion{index = i, score = score, key = key})
 	}
+	filter_words(e, word)
 	slice.sort_by(cs.shown[:], shown_less)
 
 	cs.selected = 0
 	cs.reveal = true
 	if word != "" do return
 	for s, i in cs.shown {
-		if cs.items[s.index].preselect {
+		if s.index >= 0 && cs.items[s.index].preselect {
 			cs.selected = i
 			break
 		}
@@ -406,8 +495,65 @@ filter_completions :: proc(e: ^Editor, caret: int) {
 }
 
 
+// Adds the editor's words matching the word typed, when the list has them: not
+// the word itself, nor what an item inserts, nor (unless one was typed) words
+// with digits
+@(private = "file")
+filter_words :: proc(e: ^Editor, word: string) {
+	words_timed()
+	cs := &g.lsp.completion
+
+	// Hold the words the rows will show
+	index := e.words.index
+	if cs.word_index != index {
+		words.index_release(cs.word_index)
+		if index != nil do words.index_retain(index)
+		cs.word_index = index
+	}
+	if index == nil || !list_has_words() {
+		return
+	}
+
+	// Typed words this short get none
+	long_enough := strings.rune_count(word) >= g.settings.words_min_length
+	if !cs.invoked && !long_enough {
+		return
+	}
+
+	skip_digits := !words.has_digit(word)
+	for w in index.words {
+		typed := w == word
+		inserted := w in cs.item_texts
+		digits := skip_digits && words.has_digit(w)
+		if typed || inserted || digits {
+			continue
+		}
+
+		score, ok := fuzzy.score(word, w)
+		if ok do append(&cs.shown, Shown_Completion{index = -1, word = w, score = score, key = w})
+	}
+}
+
+
+// Whether the list shows words: alongside the server's items, or in their place
+// when it has none
+@(private = "file")
+list_has_words :: proc() -> bool {
+	cs := &g.lsp.completion
+	switch cs.words_mode {
+	case .Disabled: return false
+	case .Enabled:  return true
+	case .Fallback: return cs.server != .Items
+	}
+	return false
+}
+
+
+// The server's items first, then words; each best first
 @(private = "file")
 shown_less :: proc(a, b: Shown_Completion) -> bool {
+	a_word, b_word := a.index < 0, b.index < 0
+	if a_word != b_word do return b_word
 	if a.score != b.score do return a.score > b.score
 	return a.key < b.key
 }
@@ -422,6 +568,8 @@ resolve_chosen :: proc(e: ^Editor) {
 	}
 
 	index := cs.shown[cs.selected].index
+	if index < 0 do return
+
 	item := &cs.items[index]
 	asked := cs.resolving != 0 && cs.resolve_index == index
 	if item.resolve == "" || item.documentation != "" || asked {
@@ -458,25 +606,47 @@ lsp_completion_response :: proc(r: langs.Request, resp: lsp.Response) {
 	}
 	cs.request = 0
 
+	// Words chosen from with the keys stay until typing filters again
+	hold := cs.open && cs.navigated && only_words_shown()
+
 	list, decoded := resp.result.(lsp.Completions)
 	if resp.error != "" || !decoded || len(list.items) == 0 {
-		lsp_completion_close()
-		return
+		// Nothing: the words, if the list has them, else it closes
+		if cs.words_mode == .Disabled {
+			lsp_completion_close()
+			return
+		}
+		clear_completions()
+		cs.server = .Failed
+		cs.incomplete = false
+	} else {
+		// The items, taken from the answer (which frees what is left)
+		clear_completions()
+		for &item in list.items {
+			append(&cs.items, item)
+			cs.item_texts[item.text] = {}
+			item = {}
+		}
+		cs.server = .Items
+		cs.incomplete = list.incomplete
+		cs.answered = resp.version
+		cs.generation += 1
 	}
-
-	// The items, taken from the answer (which frees what is left)
-	clear_completions()
-	for &item in list.items {
-		append(&cs.items, item)
-		item = {}
-	}
-	cs.incomplete = list.incomplete
-	cs.generation += 1
 	cs.open = true
 
 	// Filtered in this frame's completion_step (UI work, not the server's)
+	if hold do return
 	clear(&cs.shown)
 	cs.caret = -1
+}
+
+
+@(private = "file")
+only_words_shown :: proc() -> bool {
+	for s in g.lsp.completion.shown {
+		if s.index >= 0 do return false
+	}
+	return true
 }
 
 
@@ -502,16 +672,23 @@ resolve_response :: proc(r: langs.Request, resp: lsp.Response) {
 
 // --- Inserting ---------------------------------------------------------------------
 
-// Inserts the shown item `index` at every caret, with its other edits, as one
-// undo step, then closes the list
+// Inserts a row's item at every caret, with its other edits, as one undo step,
+// then closes the list. A word replaces the word before the caret
 @(private = "file")
-accept_completion :: proc(index: int) {
+accept_completion :: proc(pick: Shown_Completion) {
 	cs := &g.lsp.completion
 	e := cs.editor
-	if e == nil || index < 0 || index >= len(cs.shown) {
+	if e == nil || pick.index >= len(cs.items) {
 		return
 	}
-	item := cs.items[cs.shown[index].index]
+
+	item: lsp.Completion
+	if pick.index >= 0 {
+		item = cs.items[pick.index]
+	} else {
+		n := len(pick.word)
+		item = {text = pick.word, select = {n, n}, lo = cs.start, hi = cs.asked_at}
+	}
 
 	// What it replaces now: text after where it was asked moved by what was
 	// typed since
@@ -603,7 +780,7 @@ lsp_completion_handle_key :: proc(event: ^sdl.Event) -> bool {
 		case sdl.K_PAGEDOWN:
 			choose(min(cs.selected + LIST_ROWS, last))
 		case sdl.K_RETURN, sdl.K_KP_ENTER, sdl.K_TAB:
-			accept_completion(cs.selected)
+			accept_completion(cs.shown[clamp(cs.selected, 0, last)])
 		case sdl.K_ESCAPE:
 			lsp_completion_close()
 		case:
@@ -629,6 +806,7 @@ choose :: proc(row: int) {
 
 	cs.selected = (row % n + n) % n
 	cs.reveal = true
+	cs.navigated = true
 }
 
 
@@ -641,13 +819,18 @@ lsp_completion_close :: proc() {
 
 	clear_completions()
 	clear(&cs.shown)
+	words.index_release(cs.word_index)
+	cs.word_index = nil
+	cs.clicked = nil
 	cs.editor = nil
 	cs.client = nil
 	cs.request = 0
 	cs.resolving = 0
 	cs.due = nil
+	cs.server = .None
 	cs.open = false
 	cs.incomplete = false
+	cs.navigated = false
 }
 
 
@@ -679,6 +862,7 @@ lsp_completion_destroy :: proc() {
 	cs := &g.lsp.completion
 	lsp_completion_close()
 	delete(cs.items)
+	delete(cs.item_texts)
 	delete(cs.shown)
 	delete(cs.due_trigger)
 	cs^ = {}
@@ -689,6 +873,7 @@ lsp_completion_destroy :: proc() {
 @(private = "file")
 clear_completions :: proc() {
 	cs := &g.lsp.completion
+	clear(&cs.item_texts)
 	for &item in cs.items do lsp.completion_destroy(&item)
 	clear(&cs.items)
 }
@@ -834,7 +1019,7 @@ completion_list :: proc(e: ^Editor, rows: int) {
 		}) {
 			rows_space(first)
 			for i in first ..< last {
-				if completion_row(i, word) do accept_completion(i)
+				if completion_row(i, word) do cs.clicked = cs.shown[i]
 			}
 			rows_space(len(cs.shown) - last)
 		}
@@ -852,11 +1037,13 @@ rows_space :: proc(rows: int) {
 
 
 // One item: its kind, its label (matched characters marked) and signature, and
-// its detail at the right. True if it was clicked
+// its detail at the right. A word is shown as one, with no more. True if it was
+// clicked
 @(private = "file")
 completion_row :: proc(row: int, word: string) -> bool {
 	cs := &g.lsp.completion
-	item := cs.items[cs.shown[row].index]
+	shown := cs.shown[row]
+	item := shown.index >= 0 ? cs.items[shown.index] : lsp.Completion{label = shown.word}
 	chosen := row == cs.selected
 	id := clay.ID("CompletionRow", u32(row))
 
@@ -871,6 +1058,7 @@ completion_row :: proc(row: int, word: string) -> bool {
 		cornerRadius = clay.CornerRadiusAll(4),
 	}) {
 		name, color := completion_kind(item.kind)
+		if shown.index < 0 do name, color = "word", gfx.theme.text_dim
 		if clay.UI()({layout = {sizing = {width = clay.SizingFixed(KIND_WIDTH)}}}) {
 			label(name, color, FONT_SIZE_SMALL)
 		}
@@ -908,7 +1096,9 @@ chosen_docs :: proc() -> bool {
 	if cs.selected < 0 || cs.selected >= len(cs.shown) {
 		return false
 	}
-	return cs.items[cs.shown[cs.selected].index].documentation != ""
+
+	index := cs.shown[cs.selected].index
+	return index >= 0 && cs.items[index].documentation != ""
 }
 
 

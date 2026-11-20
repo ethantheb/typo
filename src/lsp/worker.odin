@@ -449,7 +449,8 @@ files_changed :: proc(c: ^Client, x: Files_Changed_Command) {
 }
 
 
-// Keeps the document's text (taken from the command) and sends didOpen
+// Keeps a copy of the document's text (read from the command's snapshot) and
+// sends didOpen
 @(private = "file")
 open_doc :: proc(c: ^Client, x: ^Open_Command) {
 	w := &c.worker
@@ -458,10 +459,11 @@ open_doc :: proc(c: ^Client, x: ^Open_Command) {
 	doc := new(Doc)
 	doc.uri, x.uri = x.uri, ""
 	doc.path, _ = path_from_uri(doc.uri)
-	doc.version = x.version
-	text := string(x.text)
-	buffer.buffer_init(&doc.text, x.text)
-	x.text = nil
+	doc.version = x.text.version
+
+	data := buffer.snapshot_read_alloc(&x.text, 0, x.text.length, context.allocator)
+	text := string(data)
+	buffer.buffer_init(&doc.text, data)
 	append(&w.docs, doc)
 
 	item := Text_Document_Item{doc.uri, x.language, int(doc.version), text}

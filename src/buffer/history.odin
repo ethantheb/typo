@@ -175,9 +175,7 @@ replace :: proc(b: ^Buffer, offset, remove_len: int, text: string) {
 	e.removed.hi = len(h.pieces)
 
 	e.inserted.lo = len(h.pieces)
-	if len(text) > 0 {
-		append(&h.pieces, insert_text(b, offset, text))
-	}
+	if len(text) > 0 do insert_text(b, offset, text, &h.pieces)
 	e.inserted.hi = len(h.pieces)
 
 	append(&h.edits, e)

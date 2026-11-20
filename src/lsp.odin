@@ -8,6 +8,7 @@ package editor
 // status popup and the settings window, going to a definition, and the jump
 // list (Go back, Go forward), which every jump to another place records into
 
+import "core:fmt"
 import "core:strings"
 
 import "buffer"
@@ -103,10 +104,11 @@ lsp_destroy :: proc() {
 }
 
 
-// Each frame: the popup's clicks, what the clients and lookups reported, and
-// installs under way
+// Each frame: the popup's and the completion list's clicks, what the clients
+// and lookups reported, and installs under way
 lsp_frame :: proc() {
 	lsp_popup_frame()
+	lsp_completion_click_frame()
 	langs.frame()
 	watch_installs()
 }
@@ -240,17 +242,37 @@ lsp_step_problem :: proc(e: ^Editor, dir: int) -> bool {
 
 // --- Installing --------------------------------------------------------------------
 
-// Runs a server's install command in a new terminal. Its program is looked
-// for again as the install's output comes, and once found the server starts
-// for the open files
-lsp_install :: proc(name: string) {
+// Runs an install command of a server in a new terminal: `command`, else the
+// lightest one offered. Its program is looked for again as the install's
+// output comes, and once found the server starts for the open files
+lsp_install :: proc(name: string, command := "") {
 	server := langs.server(name)
-	if server == nil || server.install == "" {
-		return
+	if server == nil do return
+
+	command := command
+	if command == "" {
+		offered := langs.server_installs(server).offered
+		if len(offered) == 0 do return
+		command = offered[0].command
 	}
 
-	p := panes_run_in_terminal(server.install)
+	p := panes_run_in_terminal(command)
 	append(&g.lsp.installs, Lsp_Install{pane = p.id, server = strings.clone(name)})
+}
+
+
+// The tooltip of a button that runs an install command (temp)
+install_tip :: proc(x: langs.Install) -> string {
+	if x.builds do return fmt.tprintf("Run %s in a terminal (builds from source)", x.command)
+	return fmt.tprintf("Run %s in a terminal", x.command)
+}
+
+
+// What a server's install commands need when none can run, e.g. "Needs uv or
+// npm"; "" when one can, or while they are looked for (temp)
+install_needs :: proc(installs: langs.Installs) -> string {
+	if installs.needs == "" do return ""
+	return fmt.tprintf("Needs %s", installs.needs)
 }
 
 

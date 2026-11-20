@@ -123,16 +123,16 @@ rename_end :: proc() {
 	delete(r.path)
 	delete(r.error)
 
-	// The text buffer is kept for the next rename
-	text := r.edit.text
-	clear(&text)
-	r^ = {edit = {text = text}}
+	// The field is kept for the next rename
+	edit := r.edit
+	line_edit_clear(&edit)
+	r^ = {edit = edit}
 }
 
 
 rename_destroy :: proc() {
 	rename_end()
-	delete(g.rename.edit.text)
+	line_edit_destroy(&g.rename.edit)
 }
 
 
@@ -235,22 +235,14 @@ rename_field :: proc(size: u16) {
 	r.shown = true
 
 	id := clay.ID("RenameField")
-	if clay.UI(id)({
-		layout = {
-			sizing = {clay.SizingGrow(), clay.SizingFixed(f32(size) + 7)},
-			padding = {left = 4, right = 4},
-			childAlignment = {y = .Center},
-		},
-		backgroundColor = gfx.theme.bg,
-		cornerRadius = clay.CornerRadiusAll(4),
-		border = {
-			color = r.error != "" ? gfx.theme.error : gfx.theme.accent,
-			width = clay.BorderOutside(1),
-		},
-		clip = {horizontal = true},
-	}) {
-		line_edit_ui(&r.edit, size, gfx.theme.text_bright)
+	look := Field_Look{
+		height  = f32(size) + 7,
+		size    = size,
+		padding = 4,
+		radius  = 4,
+		edge    = r.error != "" ? gfx.theme.error : gfx.theme.accent,
 	}
+	text_field(id, &r.edit, "", true, look)
 
 	if r.error == "" do return
 

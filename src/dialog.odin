@@ -39,6 +39,12 @@ Removing_Server :: struct {
 	name: string, // owned; a server the settings added
 }
 Applying_Edit :: struct {} // a language server's edit of files that aren't open
+Reloading :: struct {
+	path: string, // owned; a file changed on disk under unsaved edits (file_sync.odin)
+}
+Overwriting :: struct {
+	path: string, // owned; a file being saved over a version typo hasn't read
+}
 
 Dialog_Purpose :: union {
 	Unsaved_Step,
@@ -47,6 +53,8 @@ Dialog_Purpose :: union {
 	Notice,
 	Removing_Server,
 	Applying_Edit,
+	Reloading,
+	Overwriting,
 }
 
 Dialog :: struct {
@@ -98,6 +106,8 @@ dialog_close :: proc() {
 	#partial switch p in d.purpose {
 	case Deleting:        delete(p.path)
 	case Removing_Server: delete(p.name)
+	case Reloading:       delete(p.path)
+	case Overwriting:     delete(p.path)
 	}
 
 	serial := d.serial
@@ -156,6 +166,12 @@ dialog_apply :: proc(choice: int) {
 
 	case Applying_Edit:
 		lsp_edit_confirmed(confirmed)
+
+	case Reloading:
+		reload_answer(p.path, reload = confirmed)
+
+	case Overwriting:
+		overwrite_answer(p.path, confirmed)
 
 	case Unsaved_Step:
 		unsaved_answer((^Pane)(p), choice)

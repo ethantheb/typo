@@ -141,6 +141,24 @@ pane_live :: proc(p: ^Pane) -> bool {
 }
 
 
+// How a pane takes the work area
+Pane_Fill :: enum {
+	Shared,    // beside other panes (or under a maximized one)
+	Maximized, // over other panes, which wait behind it
+	Alone,     // the only pane shown
+}
+
+
+pane_fill :: proc(p: ^Pane) -> Pane_Fill {
+	ps := &g.panes
+	switch {
+	case ps.root != nil && ps.root.pane == p: return .Alone
+	case ps.maximized == p:                   return .Maximized
+	}
+	return .Shared
+}
+
+
 // The open editor of a file, if any (paths compare without case on Windows)
 editor_with_path :: proc(path: string) -> ^Editor {
 	for p in g.panes.open {
@@ -213,10 +231,11 @@ is_editor :: proc(p: ^Pane) -> bool {
 }
 
 
+// The pane a file is open in, if any (paths compare without case on Windows)
 pane_with_file :: proc(path: string) -> ^Pane {
 	for p in g.panes.open {
 		e, is_file := p.content.(^Editor)
-		if is_file && e.path == path {
+		if is_file && same_path(e.path, path) {
 			return p
 		}
 	}
@@ -313,9 +332,19 @@ next_terminal_number :: proc() -> int {
 }
 
 
-// Opens a file, or finds the pane it is open in, shows it and focuses it
+// Opens a file, or finds the pane it is open in, shows it and focuses it. A
+// file opened in place of another takes its zoom
 panes_open_file :: proc(path: string) -> ^Pane {
+	opened := pane_with_file(path) == nil
 	p := pane_for_file(path)
+
+	if opened && !pane_shown(p) {
+		d := place_for(p)
+		if step, ok := pane_zoom(d.target); ok && d.kind == .Swap {
+			pane_init_zoom(p, step)
+		}
+	}
+
 	pane_show(p)
 	workspace_reveal(&g.workspace, path)
 	return p
@@ -552,7 +581,9 @@ tree_changed :: proc() {
 	ps := &g.panes
 	ps.divider.tile = nil
 
-	if ps.maximized != nil && !pane_shown(ps.maximized) {
+	// Only a shown pane with others behind it stays maximized
+	m := ps.maximized
+	if m != nil && (!pane_shown(m) || pane_fill(m) == .Alone) {
 		ps.maximized = nil
 	}
 	if ps.focused != nil && !pane_shown(ps.focused) {
@@ -608,14 +639,17 @@ terminal_toggle :: proc() {
 }
 
 
+// Maximizes the focused pane over the others, or restores it. The only pane
+// shown already fills the work area
 pane_toggle_maximized :: proc() {
 	ps := &g.panes
-	if ps.focused == nil do return
+	p := ps.focused
+	if p == nil do return
 
-	if ps.maximized == ps.focused {
-		ps.maximized = nil
-	} else {
-		ps.maximized = ps.focused
+	switch pane_fill(p) {
+	case .Shared:    ps.maximized = p
+	case .Maximized: ps.maximized = nil
+	case .Alone:
 	}
 }
 
@@ -869,7 +903,7 @@ panes_frame :: proc() {
 
 	busy := ps.divider.tile != nil || ps.drag.active
 	for p in ps.open {
-		live := interactive && pane_live(p) && !busy && !find_bar_hovered(p)
+		live := interactive && pane_live(p) && !busy
 		switch c in p.content {
 		case ^Editor:
 			if p.visible do editor_frame(c, body_id(p), live)
@@ -906,12 +940,19 @@ update_focus :: proc() {
 		return
 	}
 
+	p := pane_under_pointer()
+	if p != nil do pane_focus(p)
+}
+
+
+// The pane in view under the pointer, if any
+pane_under_pointer :: proc() -> ^Pane {
 	for p in g.panes.open {
 		if pane_live(p) && pointer_in(pane_id(p)) {
-			pane_focus(p)
-			return
+			return p
 		}
 	}
+	return nil
 }
 
 
@@ -1238,8 +1279,7 @@ pane_element :: proc(p: ^Pane) {
 
 	// The focused pane is outlined, unless it is the only one in view
 	border := gfx.theme.border
-	alone := ps.maximized != nil || (ps.root != nil && ps.root.pane != nil)
-	if focused && !alone {
+	if focused && pane_fill(p) == .Shared {
 		border = gfx.theme.accent
 		border.a = 70
 	}
@@ -1283,8 +1323,6 @@ pane_element :: proc(p: ^Pane) {
 // Icon and title (the handle to drag the pane by), then the pane's buttons
 @(private = "file")
 pane_header :: proc(p: ^Pane, focused: bool) {
-	ps := &g.panes
-
 	if clay.UI()({
 		layout = {
 			sizing = {clay.SizingGrow(), clay.SizingFixed(PANE_HEADER_HEIGHT)},
@@ -1324,17 +1362,7 @@ pane_header :: proc(p: ^Pane, focused: bool) {
 			}
 		}
 
-		maximized := p == ps.maximized
-		if icon_button(
-			clay.ID("PaneMaximize", p.id),
-			maximized ? .Restore : .Maximize,
-			22,
-			14,
-			maximized ? "Restore" : "Maximize",
-			first_chord_label(.Maximize_Pane),
-		) {
-			defer_action(Pane_Op{p, .Maximize})
-		}
+		maximize_button(p)
 
 		if is_terminal(p) {
 			if icon_button(clay.ID("PaneHide", p.id), .Minus, 22, 14, "Put on the shelf") {
@@ -1345,6 +1373,34 @@ pane_header :: proc(p: ^Pane, focused: bool) {
 		close_id := clay.ID("PaneClose", p.id)
 		if icon_button(close_id, .Close, 22, 14, "Close", first_chord_label(.Close_Pane)) {
 			defer_action(Pane_Op{p, .Close})
+		}
+	}
+}
+
+
+// Maximize beside other panes, Restore over them, nothing for the only pane
+// shown. Its slot eases open and shut, so the buttons beside it slide
+@(private = "file")
+maximize_button :: proc(p: ^Pane) {
+	fill := pane_fill(p)
+
+	// The slot fits the button, or nothing
+	if clay.UI(clay.ID("PaneMaximizeSlot", p.id))({
+		layout = {sizing = {height = clay.SizingFixed(22)}},
+		clip = {horizontal = true},
+		transition = transition({.Width}),
+	}) {
+		if fill != .Alone {
+			maximized := fill == .Maximized
+			pressed := icon_button(
+				clay.ID("PaneMaximize", p.id),
+				maximized ? .Restore : .Maximize,
+				22,
+				14,
+				maximized ? "Restore" : "Maximize",
+				first_chord_label(.Maximize_Pane),
+			)
+			if pressed do defer_action(Pane_Op{p, .Maximize})
 		}
 	}
 }

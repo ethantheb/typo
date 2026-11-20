@@ -32,7 +32,8 @@ Protocol client (src/lsp). Developed on Windows.
 - The user usually has their own typo open. Launch test instances with
   `Start-Process -PassThru` and target only that PID (screenshots, Stop-Process).
 - Synthetic keys (SendKeys) and posted mouse messages don't reach SDL. Show states
-  through launch arguments (`typo -t <folder>`, `typo <file>`) or perf phases.
+  through launch arguments (`typo -t <folder>`, `typo <file>`) or perf phases. From a
+  shell inside typo (`TYPO_IPC` set), `typo <file>` opens in that window: add `--new`.
 - Screenshots: user32 `PrintWindow(hwnd, dc, 2)` on the test window's handle, bitmap
   sized from `GetWindowRect`. Not `CopyFromScreen` (it grabs whatever window is on top).
   Check new UI with a copy of the user's settings.toml too.
@@ -63,11 +64,14 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   hover, reports "FIXME" as a diagnostic, lists lines "name :: ..." (with indented
   "name := ..." inside) as symbols and a word's places in its documents as
   references, completes every word of its documents (plus "fake_snippet", a snippet,
-  and "fake_import", with an edit at the top), resolves items with documentation,
+  and "fake_import", with an edit at the top; with `--incomplete`, only the first few
+  words starting with the typed one, as an incomplete list), resolves items with
+  documentation,
   gives "name(a, b, c)" as signature help in "name(", renames a word in its documents
   and in the small files of its root folder with the same extension that aren't open,
-  sends workspace/applyEdit (each "FIXME" to "FIXED") on "fake/apply", takes `--utf16`,
-  and exits on "fake/crash";
+  sends workspace/applyEdit (each "FIXME" to "FIXED") on "fake/apply", takes `--utf16`
+  (and `--incomplete`, `--complete-empty`, `--complete-error`, `--complete-delay <ms>`
+  for completion), and exits on "fake/crash";
   `--copy-to <path>` copies the program there (the perf suite's install command).
   The lsp tests, the app's lsp_test and the perf suite's language server phase use it.
 - Patched dependencies (patches made with `git diff` in `build/deps/<name>`; `build.py`
@@ -102,14 +106,18 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   rewrites the list, `-define:SPEC_DETAILS=n` prints n failures.
 - Perf suite (`src/perf.odin`, run as `typo-perf --perf`): an optimized build that opens
   a real window (shown unfocused behind the other windows; events other than quit,
-  wake-ups and display scale changes are ignored), runs scripted phases (startup, text in cells and subpixels, read back
-  from the window, parsing, typing, scrolling, resizing,
-  rendered Markdown, huge files, finder, find in files and the terminal, moving lines,
-  settings window, context menu and dialogs, terminal, panes, idle CPU/GPU) and exits
+  wake-ups and display scale changes are ignored), runs scripted phases (startup,
+  text in cells and subpixels, read back from the window, selection shapes,
+  parsing, typing, scrolling, resizing, the sideways scroll bar, rendered Markdown,
+  huge files, finder, find in files and the terminal, moving lines, settings
+  window, context menu and dialogs, files changed on disk, terminal, block elements
+  and box drawing read back from the terminal and an editor, panes, zoom,
+  `typo <file>` in the terminal, text fields, idle CPU/GPU) and exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
-  setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed` and sending keys through
-  `handle_key_event`; a synthetic key has no scancode, which chords match on, so
-  shortcuts are run with `run_command`. Figures are affected
+  setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed`, sending other mouse
+  buttons through `mouse_button_event` and keys through `handle_key_event`; chords
+  match on the scancode, so a shortcut is run with `run_command`, or sent with its
+  scancode (`press_chord`) when the key path is what is tested. Figures are affected
   by other load; rerun once before investigating a result just over. A feature with a
   per-frame or per-keystroke cost gets a phase or result; a UI behavior gets a check.
 - `TYPO_SETTINGS` points typo at another settings.toml (the perf suite uses a temp one);
@@ -122,8 +130,9 @@ Packages import downward only: `editor` (src/) -> `mdview` -> `textedit` -> `gfx
 language servers, `editor` -> `langs` -> `lsp`: `lsp` imports only core and `buffer`
 (its copies of documents); `langs` (the app's servers, documents, problems and
 requests, no UI) imports `lsp`, `textedit`, `buffer` and `toml`, and reaches the app
-only through `langs.env`, set in lsp.odin. `fuzzy` (the fzy-style scorer) stands
-alone.
+only through `langs.env`, set in lsp.odin. `fuzzy` (the fzy-style scorer), `ipc`
+(a typo's endpoint and its clients) and `diff` (line diffs) stand alone; `words` (a
+document's words, for completion) imports `buffer` and `textedit`.
 
 The UI thread does UI: input, editing buffers, layout, drawing. Work that waits on
 something or can take long (language servers, file system searches, parsing what
@@ -136,16 +145,36 @@ other processes send) runs on other threads, which hand over finished results.
   calls the kind and never branches on which view it is. A new view (e.g. CSV) is a new
   `Kind` with its state in `View.kind_data`. What is the same in every view (`move`,
   `key`, undo, multi-cursor, `copy_text`/`paste`) is in textedit.
+- **Scrolling sideways.** A kind's `sideways` gives how far the view scrolls sideways
+  and the part that does; the editor clamps to it and draws a bar along that part's
+  bottom (editor_view.odin; bars on either axis share gfx/scrollbar.odin's geometry
+  and dragging with list_scrollbar and code blocks' bars). TEXT_KIND scrolls as far as
+  the widest line it has shown (`Widest_Line`: the lines in view and the caret's are
+  measured; an edit to the widest forgets it until it is in view again), so a huge
+  file costs no more than a small one. Rendered Markdown fits the pane; its code blocks scroll on their
+  own (mdview/code.odin).
+- **Selections** are drawn by `gfx.fill_selection` from a selection's rows: one shape,
+  padded and rounded (`gfx.selection_look`), its inside corners curved. Both kinds draw
+  what goes behind the text first, then the selections, then the text.
 - **Markdown files** also have `Editor.md` (`markdown.Doc`) and `Editor.md_view`
   (`mdview.View`: points at the editor's textedit.View and the doc, holds the rendered
   state). `mdview.attach` connects them; `mdview.set_mode` switches the view's kind.
-  mdview reaches app state (settings, pointer, frame, workspace files, opening a file)
-  only through `mdview.env`, set in `md_env.odin`.
+  mdview reaches app state (settings, pointer, frame, workspace files, opening a file,
+  the text view's row height) only through `mdview.env`, set in `md_env.odin`.
 - **Edits** go through `textedit.apply` (every selection, one undo step), or
   `textedit.apply_edits` (separate ranges with the selections they leave, or the
   selections moved through them; one undo step: completions, rename). Consumers take
   them once per frame with `textedit.take_changes`, which runs `View.on_edit`
   (highlighter, Markdown parse, rendered caches). `buffer.version` counts changes.
+- **Snapshots** (buffer/snapshot.odin): a buffer's bytes never move. The original
+  store is the file as loaded, and the add store fills blocks that double in size
+  (`FIRST_BLOCK` first), with no piece spanning two. A store's blocks are a
+  reference-counted `Store_Memory`. `buffer.snapshot` copies the piece list
+  (O(pieces), never the text) and takes a reference, so any thread can read the text
+  as it was (`snapshot_read`, `spans`, `snapshot_line_start`) while the UI thread goes
+  on editing, and after the buffer is destroyed. Its holder releases it
+  (`snapshot_release`, on any thread). Work on a document's text off the UI thread
+  takes a snapshot: the language server's open, the reload diff, the word index.
 - **Panes** (panes.odin): each open file (`^Editor`) or terminal (`^Terminal`) is a
   `Pane` in `g.panes.open`. Shown panes are the leaves of a split tree (`Tile`) filling
   `work_rect()`; terminals not shown wait on the shelf, listed under the file tree.
@@ -157,12 +186,26 @@ other processes send) runs on other threads, which hand over finished results.
   Every change of place is a `Drop` applied by `drop_apply` (also run on a temp copy
   of the tree for the drag preview); a pane leaving the layout fades out as an empty
   frame (`Leaving`). Keys go to `g.panes.focused`, which is always a pane in view:
-  focusing a pane (`pane_focus`) restores a maximized pane that would cover it. Files
+  focusing a pane (`pane_focus`) restores a maximized pane that would cover it.
+  `pane_fill` says how a pane takes the work area (beside others, maximized over
+  them, or alone); the title's maximize button and the focus outline follow it, and
+  the only pane shown is never maximized. Files
   open in place of the editor in use (`place_for`). Element ids carry `Pane.id`
   ("Pane", "PaneBody", "PaneTitle"); tree rows are keyed by path (`tree_row_id`), so
   a press matched against last frame's layout finds the same file after the tree
   re-sorts. Whatever holds a `^Pane` (menu, rename, drag, pending `Pane_Op`) is
   cleared in `pane_close`.
+- **Zoom** (zoom.odin): each pane's text has its own size, a step from 100% in
+  `textedit.ZOOM_LEVELS` (50%..300%): `textedit.View.zoom` for an editor (both kinds),
+  `Terminal.zoom`. The interface doesn't zoom. Zoom in/out/reset act on the focused
+  pane, from keys or the status bar's zoom item and its popup; `pane_zoom`,
+  `pane_set_zoom`. The metrics take the zoom factor: `editor_font_size(zoom)`,
+  `editor_char_width(zoom)`, `editor_line_height(zoom)` (a text view's row:
+  `text_line_height(v)`); mdview scales `mdview.Config`'s sizes (given at 100%) by
+  `textedit.zoom`, so its caches, keyed by the font size, follow. `textedit.set_zoom`
+  asks the kind for an anchor (`Kind.anchor`: the caret's line, else the top line)
+  that the kind puts back in place on its next frame. A file opened in place of
+  another takes its zoom; the session keeps each pane's (percent).
 - **Find** (find.odin, find_term.odin): one bar (`g.find`), on one pane at a time, at
   its top right. In an editor the buffer is searched a slice per frame
   (`FIND_PLAIN_BYTES`, less with a regex), so huge files stay responsive; matches go
@@ -170,25 +213,71 @@ other processes send) runs on other threads, which hand over finished results.
   the selection. Case folding is ASCII only (offsets stay put). In a terminal,
   libghostty's search does the work (scrollback included, kept in step with output);
   it only ignores ASCII case, so the option buttons are off there, and "next" goes up
-  toward older output. While typing in the field it takes the keys first
-  (`find_handle_event`); editing commands don't reach the pane behind it.
+  toward older output. The field has the keys (`find_has_keys`) after Find or a
+  press on it, until a press elsewhere in its pane or another pane is focused: then
+  the bar stays on its pane without the keys, and Enter, Esc and typing go to the
+  focused pane. While it has them it takes them first (`find_handle_event`), and
+  `PANE_EDIT_COMMANDS` don't reach the pane behind it. Find, and Find next/previous
+  (F3), act on the focused pane: from another pane they move the bar there. The bar
+  covers what is under it (`find_bar_covers_pointer` in `ui_interactive`; it is
+  built with `g.in_find_bar`), as it can reach past a narrow pane.
+- **Text fields** (line_edit.odin): every text input (find bar, finder, settings
+  search, text settings and server fields, picker filter, renaming in place, the
+  symbol rename field) is a `Line_Edit` drawn by `text_field`. Its owner decides
+  focus (before calling, so the press that focuses it places the caret) and handles
+  Enter, Esc, Tab and Up/Down; `line_edit_event` does the rest: editing keys, and
+  `FIELD_COMMANDS` (select all, clipboard, undo) through the bindings, so they never
+  reach a pane. `text_field` takes the mouse (press, Shift+press, double and triple
+  press, drag, scrolling past either end) and scrolls the text to keep the caret in
+  view. Its text is a custom element (`Field_Draw`, `draw_text_field`); positions
+  come from `gfx.text_caret_x`/`text_caret_at`, the text engine's layout of the
+  string it draws.
 - **Moving lines** (`textedit.move_lines`): each block of lines the selections cover
   swaps with its neighbor line, keeping the line break between them, as one undo step.
 - **Carets** and the terminal cursor don't blink. A press shows the caret at once; it
   hides only while a selection drag has moved (`Editor.drag_moved`).
+- **Changes on disk** (fs_watch*.odin, file_sync.odin): a watcher thread, started at
+  launch, waits on the workspace folder (ReadDirectoryChangesW, recursive, overlapped,
+  woken by an event for stop, a new root or a job; elsewhere a 2 s walk, fs_watch_other)
+  and polls open files outside it. Events inside `FINDER_IGNORED_DIRS` are dropped; the
+  rest gather into a burst (`Watch_Pending`) handed over once quiet `WATCH_QUIET` or
+  after `WATCH_MAX_DELAY`; an overflow looks at everything again. The thread lists the
+  burst's folders among the tree's loaded ones (`watch_set_dirs`) and the tree takes
+  them in place (`workspace_apply_listings`); added/removed/renamed entries mark the
+  finder's index stale (rebuilt if it lists files, else dropped until needed). Open
+  files are registered with the hash and size/write time of the text typo last read or
+  wrote (`watch_file_open`, `watch_file_synced` after a save or reload), so typo's own
+  writes aren't changes; a changed one is read once it holds still (`WATCH_STABLE`),
+  with full sharing (`read_file_shared`; retried while locked). Without unsaved edits
+  it reloads: the thread diffs it against a snapshot of the text (`diff.lines`) and
+  `reload_apply` makes the hunks one undo step, carets and scroll kept. With unsaved
+  edits a dialog asks (Reload / Keep my version); saving over a version typo hasn't read
+  asks first (`save_or_ask`). A deleted or moved-away file stays open, unsaved
+  (`Disk_State.missing`). Results carry a generation (or a reload serial); older ones
+  are dropped. settings.toml keeps its own poll (it is usually outside the workspace).
 - **Terminal** (terminal*.odin, term/): on Windows the shell runs in ConPTY, which keeps
   its own copy of the screen, and the two must stay row for row the same or the shell
   draws on the wrong row. So on resize ghostty doesn't pull scrollback down (growing
   adds blank rows at the bottom) and its reflow trims trailing spaces
   (`term.session_init`, patches/ghostty.patch). The grid is resized only once panes
   stop animating.
+- **Box drawing and blocks** (gfx/box_glyphs.odin): box drawing, block elements,
+  Powerline separators and Symbols for Legacy Computing (`gfx.is_box_glyph`) aren't
+  drawn from the font but as shapes filling the exact cell, so they join across cells
+  and rows whatever the font's advance and the line height. The shapes and their
+  snapping to pixels are Windows Terminal's built-in glyphs (MIT; the table in
+  box_glyphs_table.odin), light lines as thick as the font's own `─`. Each glyph is
+  rasterized once per cell size into an atlas; a `gfx.Box_Batch` draws a row's glyphs
+  in one call. The terminal (runs of their own in `build_row`) and the text view
+  (`editor_has_glyph`) both draw them this way; rendered Markdown doesn't.
 - **Language servers** (lsp/, langs/, lsp*.odin): `lsp` knows servers, JSON-RPC and
   protocol types, not editors. Nothing about a server runs on the UI thread: each
   `lsp.Client` has its own thread (lsp/worker.odin) that starts the process, does the
   handshake, encodes and parses all JSON, writes the log, and keeps a copy of each
   open document's text (a `buffer.Buffer`, edited with `replace_untracked`) to convert
   between byte offsets and the server's lines and UTF-8/UTF-16 columns. The UI thread
-  queues commands (`client_open`, `client_change` with byte-offset `lsp.Edit`s,
+  queues commands (`client_open` with a snapshot, `client_change` with byte-offset
+  `lsp.Edit`s,
   `request` at an offset) and takes decoded events with `lsp.client_poll`
   (`Diagnostics` as sorted byte ranges, `Response` with `Hover` or `[]Place`), each
   tagged with the document version its offsets are in. The process has reader,
@@ -198,8 +287,8 @@ other processes send) runs on other threads, which hand over finished results.
   `lsp.SERVERS` merged with settings.toml's `[lsp.<name>]` tables (`langs.Server_Override`,
   langs/config.odin; `build_server_list`). A table's `path` points at the program (run
   with the command's arguments), else the command's first word is looked up on PATH.
-  Defaults are the popular servers; alternatives (ty, basedpyright, marksman) are in
-  the table, off. `langs` keeps the app's side in `langs.state`: a file's document
+  Defaults are the popular servers; alternatives (ty, basedpyright, taplo, marksman)
+  are in the table, off. `langs` keeps the app's side in `langs.state`: a file's document
   (`Editor.lsp`, a `langs.Doc` whose `view` points at the editor's) attaches to every
   enabled, installed server of its language (one `langs.Client` per server and project
   root) and is opened on each at once (the client's thread holds it until the server
@@ -225,10 +314,22 @@ other processes send) runs on other threads, which hand over finished results.
   `set_override_field_text`), plus Restart, Log, Reset or Remove; "Add a server" adds a
   table. Changes are queued (`Server_Op`) and applied next frame
   (`settings_servers_frame`), since this frame's render commands may use the strings
-  they replace. Install (`lsp_install`) opens a terminal whose shell runs the server's
-  install command and stays open (`panes_run_in_terminal`, `shell_running`); the program
-  is looked for again as output comes (`watch_installs`), and once found the server
+  they replace. Install (`lsp_install`) opens a terminal whose shell runs an install
+  command and stays open (`panes_run_in_terminal`, `shell_running`); the program is
+  looked for again as output comes (`watch_installs`), and once found the server
   starts. settings.toml is written on a saver thread (`settings_save_later`).
+- **Installing servers** (lsp/install.odin, `langs.server_installs`): a server has
+  several install commands (`Server_Spec.install`; a table's `install`, one string or
+  a list, replaces them). Each command's program (its first word) is looked up on PATH
+  on the lookup thread, cached with the servers' programs (`state.programs`, looked up
+  again when the settings window or the status popup opens), and only commands whose
+  program is found are offered, ordered by `lsp.INSTALLERS` weights (uv/pipx, then
+  pip as `pip`, `py -m pip`, `python -m pip`, and npm, then winget/scoop/choco/brew,
+  rustup, go, unknown programs, cargo last; ties keep the server's order). Install
+  (settings row, server page, status popup) runs the lightest, its tooltip the exact
+  command; the server page lists every command found, each with its Install; go and
+  cargo say "builds from source". With none found there is no Install, a "Needs uv,
+  npm or pip" line instead, and Locate… stays.
 - **Language features** (langs/requests.odin, langs/problems.odin, lsp.odin,
   lsp_hover.odin): a request goes to the first running client of the document that
   can do it (`langs.client_with`, `lsp.Feature`); `langs.Request` remembers the
@@ -249,6 +350,21 @@ other processes send) runs on other threads, which hand over finished results.
   editor's right-click menu (context_menu.odin) moves the caret to the click unless
   it is inside the selection, then lists Go to definition, Find references, Cut,
   Copy, Paste, Select all, each running its `Command`.
+- **`typo <file>` in typo's terminals** (ipc/, ipc_open.odin): each typo listens on
+  its own endpoint (`ipc.Server`, own thread): a named pipe `\\.\pipe\typo-<pid>-<random>`
+  with a DACL for the current user only (the default one lets everyone read), else a
+  Unix socket (0600) in a 0700 folder. Only its terminals' shells get it, as
+  `TYPO_IPC` (`ipc_shell_env`, passed to `term.session_spawn`; typo's own environment
+  and so language servers never have it, and a new typo unsets an inherited one). Run
+  there, `typo <files>` (`forward_to_window`, before SDL starts) sends their absolute
+  paths, prints the reply's messages (`attach_console`) and exits 1 if any was
+  refused; a folder, `--new`/`-n`, `-t` or an endpoint that doesn't answer start a
+  new window instead. Messages are length-prefixed frames of NUL-ended fields with a
+  version (`ipc/message.odin`), validated on both sides. The server's thread checks the
+  paths (a folder, or a missing parent folder, is refused; a missing file opens empty)
+  and queues the rest; `ipc_frame` turns a request into `Open_Files`: the first file
+  where a file goes (`place_for`, so the terminal stays), the others each beside the
+  one before, the last focused, and the window raised.
 - **The finder** (finder.odin) lists a `Finder_Source`: the workspace's files
   (Ctrl+E), or a server's `Finder_Item`s (lsp_symbols.odin): a file's outline
   (Ctrl+Shift+O, the caret's symbol selected), the project's symbols (Ctrl+T, asked
@@ -258,7 +374,8 @@ other processes send) runs on other threads, which hand over finished results.
   `preview`, files that aren't open read there), sorts an outline into the file's
   order and references by file (the asked one first); the items take the answer's
   strings over. Every source is filtered locally with `fuzzy.score`, incrementally,
-  and only the rows in view are laid out. Accepting goes through `jump_to`.
+  and only the rows in view are laid out. Accepting goes through `jump_to`; a row
+  clicked in the layout is opened next frame by `finder_frame`.
 - **Completion and signature help** (lsp_completion.odin): `lsp_typed` (from
   `editor_text_input`) marks completions due: once identifier typing rests
   `COMPLETION_DELAY` (not on a number, nor in a comment or string by the highlighter),
@@ -267,14 +384,38 @@ other processes send) runs on other threads, which hand over finished results.
   the server first. The client's thread decodes items (`lsp.Completion`: what each
   replaces as offsets, snippets reduced to plain text with what to select, other edits);
   the list takes them over and filters them against the word before the caret
-  (`fuzzy.score`, then the server's sort text), asking again when the list was
-  incomplete. While the list shows, `lsp_completion_handle_key` takes Up/Down/Page
-  Up/Down/Enter/Tab/Esc. Inserting (`accept_completion`) moves the item's range by what
+  (`fuzzy.score`, then the server's sort text). An incomplete list is asked again
+  whenever the buffer is past the version its items are about (`answered`), so text
+  typed while an answer was on its way is asked about too. While the list shows,
+  `lsp_completion_handle_key` takes Up/Down/Page Up/Down/Enter/Tab/Esc; a row clicked
+  in the layout is inserted next frame (`lsp_completion_click_frame`, before the panes'
+  frames). Inserting (`accept_completion`) moves the item's range by what
   was typed since it was asked, uses the same span at every caret, adds its other edits
   (e.g. an import) and makes them one undo step with `textedit.apply_edits`. The chosen
   item is resolved for its documentation. Signature help (Ctrl+Shift+Space, or a
   signature trigger character) is asked again while it shows and the caret moves or the
   text changes; a null answer closes it. Both close when their editor loses the keys.
+- **Word completions** (word_completion.odin, words/), as Zed has them: the settings'
+  completions section sets `words` ("fallback", "enabled", "disabled"),
+  `words_min_length` (3), `lsp_fetch_timeout_ms` (500) and `words_in_text_files`
+  (off: no words in Markdown or .txt files; files typo has no language for still get
+  them). An editor's words (`words.Index`: identifier-like runs not starting with a
+  digit, once each, sorted, from `words.WINDOW_LINES` either side of the caret's line
+  but no more than `WINDOW_BYTES` either side of it, less the run at the caret) are
+  collected by the words thread (`words.Indexer`) from a snapshot when the editor
+  gets the keys, again once typing in it rests `WORDS_DELAY` (edits only:
+  `take_changes` runs `on_edit` every frame), or when the caret nears an end of the
+  bytes read (`words_frame`). Only the file's own words, as Zed. The list (`Server_Answer`) opens with words when no server
+  completes, when the answer is empty or an error, or when it is late
+  (`server_time_limit`); a later answer with items replaces them, unless a row was
+  chosen with the keys (`navigated`), then they stay until the next letter. With
+  "enabled" words follow the server's items. Word rows (`Shown_Completion.index`
+  -1, kind "word") skip the word typed, what an item inserts and, unless a digit is
+  typed, words with digits; the list holds the index its rows show (`word_index`).
+  A typed word gets words once it is long enough; Trigger completion at any length.
+  Accepting one replaces the word before every caret through `accept_completion`.
+  `words_timed` marks the UI thread's share, which the perf suite limits per frame
+  (`words_limit`).
 - **Rename and workspace edits** (lsp_rename.odin, lsp_edits.odin, lsp/edits.odin):
   Rename (F2) renames the symbol at the caret when the editor's server can, else the
   pane. prepareRename (or the identifier at the caret) gives the name; a field over it
@@ -289,7 +430,8 @@ other processes send) runs on other threads, which hand over finished results.
 
 ### A frame (`app_iterate`, main.odin)
 
-1. Apply the pending `Action`, update focus, run `finder_frame` and `panes_frame`
+1. Apply the pending `Action` and the watcher's results (`file_sync_frame`), update
+   focus, run `finder_frame` and `panes_frame`
    (divider and pane drags, then each pane's `editor_frame`/`terminal_frame`), which
    read last frame's layout (`element_rect`, `pointer_in`) and handle the mouse.
 2. `build_ui` (layout.odin) declares the Clay tree; editors and terminals are custom
@@ -303,14 +445,18 @@ other processes send) runs on other threads, which hand over finished results.
   other threads call `wake_main_loop`.
 - Strings used by a frame's render commands must outlive the frame's drawing: per-frame
   strings use the temp allocator, and opening files/folders, closing panes and UI
-  buttons that change the panes are deferred via `g.pending` (`defer_action`).
+  buttons that change the panes are deferred via `g.pending` (`defer_action`). A click
+  found while declaring a list (`clicked`) that would free or replace what the list
+  shows (its rows, the buffer) is only recorded, and applied before the next frame's
+  panes (the finder's and completion list's rows, the context menu's `chosen`).
 
 ## Layout
 
 ```
 src/                 package editor: the app
   main.odin          App state (global `g`), SDL callbacks, frame loop, idle, deferred actions
-  keymap.odin        Command enum, default bindings, chords, run_command
+  keymap.odin        Command enum, default bindings, chords (a key, or a mouse side
+                     button: "Mouse4" back, "Mouse5" forward), run_command
   settings.odin      Settings model: SETTINGS table, TOML load/save (saver thread), file
                      watcher
   settings_ui.odin   Settings window from SETTINGS, sections collapsible (kept in
@@ -318,14 +464,15 @@ src/                 package editor: the app
   settings_servers.odin  Language servers in the settings window: rows, a server's page,
                      Add/Remove, Install
   render.odin        Clay render commands -> gfx calls; Clay text measurement
-  ui.odin            Widgets (label, button, icon, input_box, list_row, tooltip, modal),
+  ui.odin            Widgets (label, button, icon, list_row, tooltip, modal),
                      hit tests (clicked, pointer_in), transition, element_at
-  scrollbar.odin     Scroll bar parts, list_scrollbar, wheel routing
+  scrollbar.odin     Scroll bars (either axis, on gfx/scrollbar.odin), list_scrollbar,
+                     wheel routing
   layout.odin        Window layout: sidebar (file tree, shelf), status bar, mouse cursor
   panes.odin         Panes: shelf, split tree, drops, divider and pane dragging,
                      pane UI, focus, pane commands
   editor.odin        Editor: open/save, Markdown attachment, keys, commands, clipboard
-  editor_view.odin   Editor per-frame update, mouse selection, scrolling, scroll bar,
+  editor_view.odin   Editor per-frame update, mouse selection, scrolling, scroll bars,
                      drawing, all through the view's kind
   text_view.odin     TEXT_KIND: line grid, gutter, highlighting, line/column movement
   md_env.odin        mdview.env: the app state mdview may see
@@ -335,7 +482,8 @@ src/                 package editor: the app
   context_menu.odin  Right-click menu on tree rows, pane titles and shelf terminals
   rename.odin        Renaming in place (tree row, shelf row or pane title; F2), and
                      naming a new file or folder in a new tree row
-  line_edit.odin     One-line text editing: caret, selection, words, clipboard
+  line_edit.odin     The text field every input uses: editing keys, words, clipboard,
+                     undo, the mouse, sideways scrolling (Line_Edit, text_field)
   fs_ops*.odin       Create, rename and delete, keeping open files (path, highlighting,
                      Markdown mode), the tree and the finder in step. On Windows,
                      delete goes to the Recycle Bin through IFileOperation; an item
@@ -348,12 +496,21 @@ src/                 package editor: the app
   workspace.odin     Lazy file tree, folder dialog
   session.odin       The session (folder, window, panes and layout) saved on exit to
                      session.json and reopened when started with no arguments
-  fs_walk*.odin      Recursive file listing
+  ipc_open.odin      `typo <file>` from typo's terminals: the listener, its queue, the
+                     shells' TYPO_IPC, and the command line's side (forward_to_window)
+  fs_walk*.odin      Directory listing (the tree's order: read_tree_folder), recursive
+                     file listing
+  fs_watch*.odin     Watcher thread: notifications, bursts, folder listings, reading
+                     and diffing changed open files; file_stamp, read_file_shared
+  file_sync.odin     The watcher's results applied: tree, finder, reloads, the
+                     "changed on disk" dialogs, saving over a newer version
   lsp.odin           Language servers in the app: langs.env, responses by feature, F8,
                      installs, go to definition, the jump list
   lsp_symbols.odin   Symbols and references in the finder: asking, answers as items
-  lsp_completion.odin  Completion (list under the caret, filtering, inserting) and
-                     signature help (above the caret)
+  lsp_completion.odin  Completion (list under the caret, filtering, inserting, the
+                     file's words in it) and signature help (above the caret)
+  word_completion.odin  Each editor's words for completion: the words thread, when
+                     they are collected, words_mode per file
   lsp_rename.odin    Renaming a symbol: prepareRename, the field over the name
   lsp_edits.odin     Workspace edits: open files in their editors, other files after a
                      dialog on a writer thread, answering workspace/applyEdit
@@ -362,13 +519,21 @@ src/                 package editor: the app
                      stop, disable, log; turn on, install (in a terminal), locate a
                      server's program (file dialog, saved as its path) or turn off
                      a server not found
+  zoom.odin          Zoom per pane: commands, the status bar item and its popup
   perf*.odin         Perf suite and CPU/GPU counters
   *_test.odin        App tests (editor_test, md_view_test: a Markdown file in the editor,
-                     panes_test: the split tree, find_test: searching an editor)
-src/gfx/             Drawing: draw.odin (primitives on gfx.renderer, clips, overlays),
-                     text.odin (gfx.text_system, font ids, measurement, contrast),
+                     panes_test: the split tree, find_test: searching an editor,
+                     line_edit_test: keys in a text field, fs_watch_test: bursts,
+                     the tree following listings, reloads)
+src/gfx/             Drawing: draw.odin (primitives on gfx.renderer, clips, overlays,
+                     selection shapes), scrollbar.odin (scroll bar geometry, dragging
+                     and look along either axis),
+                     text.odin (gfx.text_system, font ids, measurement, caret
+                     positions, contrast),
                      fonts.odin (bundled IBM Plex, Instrument Sans, installed-font scan), theme.odin
-                     (THEMES, gfx.theme), geometry.odin (Rect), icon.odin
+                     (THEMES, gfx.theme), geometry.odin (Rect), icon.odin,
+                     box_glyphs.odin (box drawing and blocks as shapes; data in
+                     box_glyphs_table.odin)
 src/textedit/        Editing core: view.odin (View, marks), kind.odin (Kind, move, key,
                      undo, multi-cursor, moving lines, clipboard), edit.odin (selections,
                      normalize, apply, line/column/word helpers, visible_runs)
@@ -392,7 +557,8 @@ src/mdview/          Rendered Markdown view
 src/markdown/        Parser: doc.odin (incremental), block.odin (line classifier),
                      inline.odin, query.odin, refs.odin, html.odin, highlight.odin (text
                      view colors); spec suite
-src/buffer/          Piece table (treap), newline index, undo, change log
+src/buffer/          Piece table (treap), stores in blocks that never move, newline
+                     index, undo, change log, snapshots
 src/syntax/          Highlighter: tree-sitter (Odin, TOML), line lexer (others)
 src/term/            libghostty-vt bindings, Session (vt + pty + reader thread)
 src/langs/           The app's language servers, no UI: config.odin ([lsp.<name>]
@@ -401,7 +567,8 @@ src/langs/           The app's language servers, no UI: config.odin ([lsp.<name>
                      on their servers: open, change, save, close), problems.odin
                      (published, shifted by edits, counted), requests.odin (which
                      client, matching responses)
-src/lsp/             LSP client: registry.odin (LANGUAGES, SERVERS, roots), client.odin
+src/lsp/             LSP client: registry.odin (LANGUAGES, SERVERS, roots), install.odin
+                     (INSTALLERS: install commands' programs and weights), client.odin
                      (the UI thread's side: commands, events), worker.odin (the
                      client's thread: handshake, documents, JSON, progress, log),
                      connection.odin (process threads), lookup.odin (PATH and root
@@ -412,6 +579,12 @@ src/lsp/             LSP client: registry.odin (LANGUAGES, SERVERS, roots), clie
                      in a document, file URIs), process_*/exec_* (spawning, PATH
                      search); fake_server/ for tests
 src/fuzzy/           fzy-style scorer (files, symbols, completions)
+src/words/           A document's words from a snapshot (collect, Index) and the
+                     thread that collects them (Indexer)
+src/ipc/             A typo's endpoint: message.odin (frames, requests, replies,
+                     validation), server.odin (server thread, send), ipc_windows.odin
+                     (named pipe, its DACL, overlapped I/O), ipc_unix.odin (socket)
+src/diff/            Line diffs (Myers), for reloading files changed on disk
 src/toml/            Minimal TOML reader
 vendor/              clay-odin, tree-sitter* (do not edit); sdl3: Odin's SDL3 bindings with
                      foreign imports pointed at the static libraries
@@ -440,7 +613,7 @@ Use Clay before writing UI machinery; read `ref/clay_docs.md` and
   does that), not to any clipping element.
 - **Stacking** (floating zIndex): panes 2-3, popups (`modal`, finder, settings) 100,
   scroll bar thumbs 110, hover popup 115, completion list, signature and rename field
-  116, context menu and language server popup 120, dialog 150, tooltips 300.
+  116, context menu, language server and zoom popups 120, dialog 150, tooltips 300.
 
 ## Markdown
 
@@ -471,6 +644,9 @@ Rendered view (`mdview`):
   row (`cell_drag`); typing, deleting, cutting or pasting over cells empties them and
   keeps the pipes (`replace_cells`). `<br>` breaks a cell's line; arrows, Backspace and
   Delete treat it as one character. Cells are byte ranges of a row (`Table_Cell`).
+- List numbers hang left of the item text, ending a few pixels before it; each digit
+  takes a cell as wide as the font's widest digit (tabular figures, which SDL_ttf can't
+  ask the font for), so numbers line up on their dot in any font (`add_marker`).
 - While the mouse is down, reveal state is frozen (`hold_reveal`) so text doesn't move
   under a drag; on release the selection grows to what copying takes (`snap_selection`).
 - Caches (`begin_caches`): per document (inlines, tables, code blocks, code highlights)
@@ -544,22 +720,29 @@ path_deleted :: proc(path: string) {
 ## Conventions
 
 - Reuse helpers: `clicked`, `pointer_in`, `element_rect`, `gfx.rect_contains`,
-  `gfx.draw_text`, `gfx.fill_rect`, `gfx.push_clip_box`, `input_box` +
-  `text_field_event`, `modal` + `clicked_outside`, `dialog_show` (never a blocking
-  native box), `resolve_unsaved` before closing files, `textedit.line_span`,
+  `gfx.draw_text`, `gfx.fill_rect`, `gfx.push_clip_box`, `Line_Edit` + `text_field` +
+  `line_edit_event` (any text input), `modal` + `clicked_outside`, `dialog_show`
+  (never a blocking native box), `resolve_unsaved` before closing files, `textedit.line_span`,
   `textedit.next_col`, `set_string`, `list_scrollbar` (with `SCROLLBAR_GUTTER` right
   padding), `list_row` (sidebar rows), `gfx.draw_caret`.
 - New setting: a `Setting` value, a `Settings` field, a `SETTINGS` entry, a
   `setting_value` case. Long-list string settings set `picker = true` and fill
   `picker_options`; related number settings go in `picker_extras`.
 - New command: a `Command` value, a `COMMANDS` entry, a case in `run_command` or
-  `editor_run_command`.
+  `editor_run_command`. A chord may name a mouse side button (`MOUSE_BUTTONS`); its
+  press runs the command next frame on the pane under the pointer, which it focuses
+  (`button_chord_frame`), or is recorded by the settings window.
+- Tooltips (`tooltip`, right after their element) appear at the pointer where it
+  rested: below it, above when there is no room, shifted to stay in the window.
 - Pointer input goes through `ui_interactive` (via `clicked`, pane frame procs,
   tooltips); a new popup that blocks all or part of the window belongs there. While
   the dialog or context menu is open only their own UI (built with `g.in_popup`) reacts;
   showing a dialog closes the menu, and a rename field stays open under a dialog.
 - A file or folder name typed by the user goes through `rename_path`/`create_path`,
   which refuse names the OS can't use; deleting goes through `ask_delete_file`.
+- Reading a file the user works on goes through `read_file_shared` (never blocks other
+  programs); writing one an editor shows goes through `editor_save`, which tells the
+  watcher what it wrote.
 - Fonts: three configurable families. The interface uses `.Body`/`.SemiBold`/`.Bold`
   (`ui_font`, default Instrument Sans Medium; set by `apply_ui_font`, which has Clay's
   measurements reset next frame); editor and terminal use `.Editor`/`.Editor_Bold`
@@ -567,7 +750,10 @@ path_deleted :: proc(path: string) {
   (`apply_markdown_font`). Bundled faces are picked by weight. Column width:
   `editor_char_width` (includes letter spacing, whole device pixels: the editor
   font's faces are laid out in cells, `gfx.CELL_FONTS`); row height:
-  `editor_line_height`. Text antialiasing (`gfx.Antialiasing`): subpixel (LCD)
+  `editor_line_height`; both at a pane's zoom factor (see Zoom). A caret's place in
+  proportional text: `gfx.text_caret_x` and `gfx.text_caret_at` (`gfx.text_width`
+  is the inked extent, short of a trailing space). Text antialiasing
+  (`gfx.Antialiasing`): subpixel (LCD)
   below 2x scale when the system uses ClearType, else grayscale; drawing anything
   but text outside gfx calls `gfx.flush_text` first.
 - Temp allocator for per-frame data; free owned data (tests use the tracking allocator).
@@ -591,9 +777,12 @@ The architecture should allow these without rewrites:
 - **LSP decisions (the user's)**: servers come from `lsp.SERVERS` plus `[lsp.<name>]`
   tables in settings.toml (no separate languages.toml); pointing typo at a program
   (`path`) is preferred over searching other editors' folders; a missing server gets
-  Install, which runs its install command in a terminal (no managed downloads);
-  popular servers on by default (pyright + ruff for Python), alternatives off (ty,
-  basedpyright, marksman). The user uses ty, ols and rust-analyzer.
+  Install, which runs an install command in a terminal (no managed downloads): only
+  commands whose installer is on PATH are offered, lightest installer first (if both
+  uv and cargo are there, uv); install commands in the table are only ones verified to
+  install a working server; popular servers on by default (pyright + ruff for Python,
+  tombi for TOML), alternatives off (ty, basedpyright, taplo, marksman). The user uses
+  ty, ols and rust-analyzer.
 - **LSP gaps** (candidates for next):
   - Rendered Markdown doesn't draw `View.problems` or provide `char_at`/`char_rect`,
     so hover, completion, signature help and the rename field don't show there.
@@ -605,8 +794,9 @@ The architecture should allow these without rewrites:
     long list isn't inside `langs.timed`; a crash isn't noticed while a child of the
     server still holds its stdout.
   - Still on the UI thread: reading settings.toml when it changes on disk, reading a
-    file when it opens, copying a document's text for `client_open` (~0.1 ms per
-    400 KB).
+    file when it opens and writing it on save.
+  - On Windows `python` may be the Microsoft Store's alias, which only offers to
+    install Python: `python -m pip` is offered then (when neither pip nor py is found).
   - A program installed where PATH only reaches in new processes isn't found until
     typo restarts (Locate… covers it). Workspace settings and initialization options
     are only edited in settings.toml.
@@ -625,3 +815,10 @@ The architecture should allow these without rewrites:
   icon). The table cell code (`Table_Cell`, cell lookup, rectangle drag,
   `replace_cells`) is private to mdview and reads the Markdown doc; move it to a shared
   place, over a source of rows, before reusing it.
+- **Several windows** (dragging panes between them): typo has one window, with one
+  `g`, renderer, text system and Clay context. Several would need per-window state
+  (renderer, gfx caches and atlas, Clay context, panes and layout, focus) split from
+  what the process shares (settings, language servers, documents), with each
+  window's frame run against its own state, and panes (with their editors or
+  terminals) handed between windows. Keep new window-wide state in `g` grouped so
+  it can move into a per-window struct.

@@ -39,6 +39,7 @@ Session_Pane :: struct {
 	scroll_y: f64,
 	scroll_x: f32,
 	rendered: bool, // a Markdown file shown rendered
+	zoom:     int,  // percent; 0 (left out) for 100
 }
 
 Session_Tile :: struct {
@@ -101,25 +102,9 @@ session_save :: proc() {
 	panes := make([dynamic]Session_Pane)
 	index := make(map[^Pane]int)
 	for p in ps.open {
-		sp: Session_Pane
-		switch c in p.content {
-		case ^Editor:
-			if !pane_shown(p) || c.new_file {
-				continue
-			}
+		sp, kept := session_pane(p)
+		if !kept do continue
 
-			sp = {
-				file     = c.path,
-				scroll_y = c.target_y,
-				scroll_x = c.target_x,
-				rendered = md_rendered(c),
-			}
-			if len(c.sels) > 0 {
-				sp.caret = c.sels[c.primary].head
-			}
-		case ^Terminal:
-			sp = {name = p.name}
-		}
 		index[p] = len(panes)
 		append(&panes, sp)
 	}
@@ -143,6 +128,35 @@ session_save :: proc() {
 	if err == nil {
 		_ = os.write_entire_file(path, data)
 	}
+}
+
+
+// A pane as saved. A file not shown, or not created yet, isn't kept
+session_pane :: proc(p: ^Pane) -> (sp: Session_Pane, kept: bool) {
+	switch c in p.content {
+	case ^Editor:
+		if !pane_shown(p) || c.new_file || c.disk.missing {
+			return
+		}
+
+		sp = {
+			file     = c.path,
+			scroll_y = c.target_y,
+			scroll_x = c.target_x,
+			rendered = md_rendered(c),
+		}
+		if len(c.sels) > 0 {
+			sp.caret = c.sels[c.primary].head
+		}
+
+	case ^Terminal:
+		sp = {name = p.name}
+	}
+
+	if step, ok := pane_zoom(p); ok {
+		sp.zoom = textedit.zoom_percent(step)
+	}
+	return sp, true
 }
 
 
@@ -224,18 +238,22 @@ restore_window :: proc(w, h: i32, maximized: bool) {
 }
 
 
-// Opens the saved panes: files with their caret and scroll, terminals under
-// their names. A file that is gone, or listed twice, leaves a nil
-@(private = "file")
+// Opens the saved panes: files with their caret, scroll and zoom, terminals
+// under their names with their zoom. A file that is gone, or listed twice,
+// leaves a nil
 restore_panes :: proc(saved: []Session_Pane) -> []^Pane {
 	panes := make([]^Pane, len(saved), context.temp_allocator)
 
 	for sp, i in saved {
+		zoom := sp.zoom > 0 ? textedit.zoom_step(sp.zoom) : 0
+
 		if sp.file == "" {
-			panes[i] = panes_add_terminal()
+			p := panes_add_terminal()
+			pane_init_zoom(p, zoom)
 			if sp.name != "" {
-				panes[i].name = strings.clone(sp.name)
+				p.name = strings.clone(sp.name)
 			}
+			panes[i] = p
 			continue
 		}
 		if !os.is_file(sp.file) do continue
@@ -254,6 +272,9 @@ restore_panes :: proc(saved: []Session_Pane) -> []^Pane {
 
 		e, is_editor := p.content.(^Editor)
 		if is_editor && e.status == .Text {
+			// The zoom first: the scroll position is in its line heights
+			pane_init_zoom(p, zoom)
+
 			at := caret_in(&e.buf, sp.caret)
 			textedit.set_single_selection(e, {at, at, -1})
 			e.scroll_y, e.target_y = sp.scroll_y, sp.scroll_y

@@ -8,6 +8,7 @@ import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "gfx"
+import "ipc"
 import sdl "../vendor/sdl3"
 import "langs"
 import "mdview"
@@ -29,6 +30,7 @@ App :: struct {
 	mouse_clicks:    int, // 1, 2, 3 for single/double/triple click of the last press
 	last_press_pos:  [2]f32,
 	wheel:           [2]f32,
+	button_chord:    Maybe(Chord), // a mouse button a binding may name went down
 
 	frame:           u64,
 	window_shown:    bool,
@@ -53,15 +55,18 @@ App :: struct {
 	rename:          Inline_Rename,
 	find:            Find,
 	in_popup:        bool, // building the dialog's or context menu's UI (see ui_interactive)
+	in_find_bar:     bool, // building the find bar (see ui_interactive)
 	right_pressed:   bool, // the right button went down this frame
 	quit:            bool, // set once quitting was confirmed
 	finder:          Finder,
 	lsp:             Lsp_State,
+	zoom_popup:      Zoom_Popup,
 	settings:        Settings,
 	fonts:           gfx.System_Fonts,
 	settings_window: Settings_Window,
 	in_modal:        bool, // building a popup's UI (see ui_interactive)
 	animating:       bool, // a Clay transition was unfinished at the end of the last layout
+	over_text_field: bool, // the pointer is over a text field (or selecting in one) this frame
 	measure_stale:   bool, // the interface font changed: Clay's measurements are reset next frame
 	tooltip:         Tooltip_State,
 	pending:         Action,
@@ -85,6 +90,15 @@ WAKE_FRAMES :: 3
 
 main :: proc() {
 	g.ctx = context
+	startup = parse_args()
+
+	// In one of typo's terminals, files open in that window
+	if code, forwarded := forward_to_window(startup); forwarded {
+		os.exit(code)
+	}
+
+	// This window's children never see another window's endpoint
+	os.unset_env(ipc.ENV_NAME)
 
 	result := sdl.EnterAppMainCallbacks(0, nil, app_init, app_iterate, app_event, app_quit)
 	os.exit(int(result))
@@ -92,22 +106,30 @@ main :: proc() {
 
 
 Args :: struct {
-	path:     string, // folder to open, or a file; the working directory if empty
-	terminal: bool,   // start with a terminal filling the window (folders only)
-	perf:     bool,   // run the performance suite (perf.odin) and exit
+	paths:      []string, // a folder or files, then more files; the working directory if none
+	terminal:   bool,     // start with a terminal filling the window (folders only)
+	new_window: bool,     // in a typo terminal, open a new window instead of using that one
+	perf:       bool,     // run the performance suite (perf.odin) and exit
 }
 
+@(private = "file")
+startup: Args
 
-// typo [--terminal | -t] [--perf] [folder | file]
+
+// typo [--terminal | -t] [--new | -n] [--perf] [folder | file] [file...]
 @(private = "file")
 parse_args :: proc() -> (args: Args) {
+	paths := make([dynamic]string)
 	for arg in os.args[1:] {
 		switch arg {
 		case "--terminal", "-t": args.terminal = true
+		case "--new", "-n":      args.new_window = true
 		case "--perf":           args.perf = true
-		case:                    if args.path == "" do args.path = arg
+		case:                    append(&paths, arg)
 		}
 	}
+
+	args.paths = paths[:]
 	return
 }
 
@@ -115,8 +137,8 @@ parse_args :: proc() -> (args: Args) {
 app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.AppResult {
 	context = g.ctx
 
-	args := parse_args()
-	if args.perf do args.path = perf_begin()
+	args := startup
+	if args.perf do args.paths = []string{perf_begin()}
 
 	// SDL
 	_ = sdl.SetAppMetadata("typo", "0.1", "dev.typo")
@@ -150,6 +172,15 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	// Language servers, which the perf suite starts only in its own phase
 	if g.perf == nil do lsp_init()
 
+	// `typo <file>` from this window's terminals
+	ipc_init()
+
+	// Changes other programs make to files (fs_watch.odin)
+	watch_init()
+
+	// The words of files, for word completions
+	words_init()
+
 	// Clay
 	min_memory := uint(clay.MinMemorySize())
 	g.clay_memory = make([]u8, min_memory)
@@ -164,7 +195,7 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		g.settings.restore_session &&
 		session_restore()
 	if !restored {
-		open_path(args.path, args.terminal)
+		open_paths(args.paths, args.terminal)
 	}
 
 	// Text input stays on; the focused pane or popup consumes TEXT_INPUT events
@@ -172,7 +203,6 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	g.last_ticks = sdl.GetTicksNS()
 	return .CONTINUE
 }
-
 
 // The named SDL backend, or SDL's default (Direct3D 11 on Windows) for "auto"
 // or when the named one can't be created
@@ -198,32 +228,54 @@ create_renderer :: proc(name: string) -> bool {
 }
 
 
-// Opens the startup path: a folder (with the sidebar), or a single file in its
-// folder's workspace. A path ending in a separator that doesn't exist is created
-// as a folder; any other missing path opens as a new file, created on first save
+// Opens the startup paths: a folder (with the sidebar), or a file in its
+// folder's workspace, then any further files (further folders are ignored). A
+// first path ending in a separator that doesn't exist is created as a folder;
+// any other missing path opens as a new file, created on first save
 @(private = "file")
-open_path :: proc(path: string, terminal: bool) {
+open_paths :: proc(paths: []string, terminal: bool) {
 	cwd := os.get_working_directory(context.temp_allocator) or_else "."
-	root := path != "" ? path : cwd
+	root := len(paths) > 0 ? paths[0] : cwd
 
-	ends_in_separator := strings.has_suffix(root, "/") || strings.has_suffix(root, `\`)
-	if !os.exists(root) && ends_in_separator {
+	if !os.exists(root) && ends_in_separator(root) {
 		_ = os.make_directory_all(root)
 	}
 
-	// A folder
+	// The workspace: a folder, or a file's folder
+	files := paths
 	if os.is_dir(root) {
 		open_folder(root)
 		g.sidebar_visible = true
 		if terminal do panes_new_terminal()
-		return
+
+		// The folder was the first path, unless none was given (the working directory)
+		files = len(paths) > 0 ? paths[1:] : nil
+	} else {
+		file := os.get_absolute_path(root, context.temp_allocator) or_else root
+		dir := filepath.dir(file)
+		open_folder(os.is_dir(dir) ? dir : cwd)
 	}
 
-	// A file
-	file := os.get_absolute_path(root, context.temp_allocator) or_else root
-	dir := filepath.dir(file)
-	open_folder(os.is_dir(dir) ? dir : cwd)
-	g.pending = Open_File(strings.clone(file))
+	// The files
+	opening := make([dynamic]string)
+	for path in files {
+		if os.is_dir(path) do continue
+
+		file := os.get_absolute_path(path, context.temp_allocator) or_else path
+		append(&opening, strings.clone(file))
+	}
+
+	if len(opening) > 0 {
+		g.pending = Open_Files{paths = opening[:]}
+	} else {
+		delete(opening)
+	}
+}
+
+
+// Whether a path names a folder by its form ("notes/")
+ends_in_separator :: proc(path: string) -> bool {
+	return strings.has_suffix(path, "/") || strings.has_suffix(path, `\`)
 }
 
 
@@ -268,18 +320,24 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		apply_editor_font()
 		apply_markdown_font()
 	}
+	ipc_frame()
 	apply_pending_action()
 	dialog_frame()
+	file_sync_frame()
 	context_menu_frame()
+	zoom_popup_frame()
+	settings_window_frame()
 	settings_servers_frame()
 	lsp_frame()
 	lsp_edits_frame()
 	lsp_rename_frame()
 	rename_frame()
 	update_focus()
+	button_chord_frame()
 	finder_frame()
 	find_frame()
 	panes_frame()
+	words_frame()
 	lsp_completion_frame()
 	lsp_hover_frame()
 	g.wake_frames = max(g.wake_frames - 1, 0)
@@ -315,8 +373,10 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 
 	// End of the frame
 	g.wheel = {}
+	g.over_text_field = false
 	g.mouse_pressed = false
 	g.right_pressed = false
+	g.button_chord = nil
 	g.frame += 1
 	gfx.text_end_frame(&gfx.text_system)
 	schedule_next_frame()
@@ -329,12 +389,14 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 needs_continuous_frames :: proc() -> bool {
 	switch {
 	case g.pending != nil,
+	     ipc_busy(),
 	     finder_busy(),
 	     find_busy(),
 	     panes_busy(),
 	     langs.busy(),
 	     lsp_hover_busy(),
 	     lsp_completion_busy(),
+	     words_busy(),
 	     smooth_scrolling(),
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
@@ -408,10 +470,15 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 }
 
 
-@(private = "file")
 mouse_button_event :: proc(event: ^sdl.Event) {
 	right_down := event.button.button == sdl.BUTTON_RIGHT && event.button.down
 	if right_down do g.right_pressed = true
+
+	// A button bindings may name (the side buttons) acts like a key, next frame
+	chord, is_chord := chord_from_button(event.button.button)
+	if is_chord && event.button.down {
+		g.button_chord = chord
+	}
 
 	if event.button.button == sdl.BUTTON_LEFT {
 		g.mouse_down = event.button.down
@@ -430,6 +497,26 @@ mouse_button_event :: proc(event: ^sdl.Event) {
 	}
 
 	g.mouse_pos = {event.button.x, event.button.y}
+}
+
+
+// A mouse button bound as a chord, pressed since last frame: recorded while the
+// settings window waits for a keybinding, else its command runs on the pane under
+// the pointer, which it focuses as a click would
+@(private = "file")
+button_chord_frame :: proc() {
+	chord, pressed := g.button_chord.?
+	if !pressed do return
+
+	if settings_window_record(chord) do return
+	if !ui_interactive() do return
+
+	cmd, bound := command_for_chord(chord)
+	if !bound do return
+
+	p := pane_under_pointer()
+	if p != nil do pane_focus(p)
+	run_command(cmd)
 }
 
 
@@ -452,6 +539,10 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 	if g.lsp.popup.open && escape {
 		lsp_popup_close()
+		return
+	}
+	if g.zoom_popup.open && escape {
+		zoom_popup_close()
 		return
 	}
 
@@ -506,12 +597,15 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	session_save()
 
+	ipc_destroy()
+	watch_destroy()
 	finder_destroy()
 	find_destroy()
 	menu_close()
 	rename_destroy()
 	dialog_destroy()
 	panes_destroy()
+	words_destroy()
 	lsp_destroy()
 	jumps_destroy()
 	settings_window_destroy()
@@ -524,6 +618,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	delete(g.md_modes)
 	workspace_destroy(&g.workspace)
 	gfx.text_destroy(&gfx.text_system)
+	gfx.box_glyphs_destroy()
 	delete(g.clay_memory)
 
 	if g.perf != nil do perf_end()
@@ -567,6 +662,21 @@ window_handle :: proc() -> rawptr {
 }
 
 
+// Brings the window to the front, restoring it if minimized. Windows lets a
+// window come forward only while its process or the one that asked (typo in
+// a terminal allows it) is in front; otherwise its taskbar button flashes.
+// The perf suite's window stays behind
+@(private = "file")
+raise_window :: proc() {
+	if g.perf != nil do return
+
+	if .MINIMIZED in sdl.GetWindowFlags(g.window) {
+		_ = sdl.RestoreWindow(g.window)
+	}
+	_ = sdl.RaiseWindow(g.window)
+}
+
+
 @(private = "file")
 set_window_icon :: proc() {
 	if g.window == nil do return
@@ -602,6 +712,13 @@ Open_Beside  :: distinct string // owned, full path; in a new pane beside the on
 Open_Folder  :: distinct string // owned
 Run_Command  :: distinct Command
 
+// Files from the command line or a typo started in a terminal: the first
+// where a file goes, the others each beside the one before
+Open_Files :: struct {
+	paths: []string, // owned, full paths
+	raise: bool,     // bring the window to the front
+}
+
 Pane_Op :: struct {
 	pane: ^Pane,
 	op:   enum {
@@ -615,6 +732,7 @@ Action :: union {
 	Toggle_Node,
 	Open_File,
 	Open_Beside,
+	Open_Files,
 	Open_Folder,
 	Run_Command,
 	Pane_Op,
@@ -660,6 +778,12 @@ apply_pending_action :: proc() {
 		panes_open_file_beside(string(a))
 		delete(string(a))
 
+	case Open_Files:
+		panes_open_file(a.paths[0])
+		for path in a.paths[1:] do panes_open_file_beside(path)
+		if a.raise do raise_window()
+		delete_paths(a.paths)
+
 	case Open_Folder:
 		files := make([dynamic]^Pane, context.temp_allocator)
 		for p in g.panes.open {
@@ -689,6 +813,7 @@ open_folder :: proc(path: string) {
 
 	langs.stop_all()
 	workspace_open(&g.workspace, path)
+	watch_set_root(path)
 	title := fmt.ctprintf("%s - typo", folder_name(path))
 	_ = sdl.SetWindowTitle(g.window, title)
 	finder_invalidate()

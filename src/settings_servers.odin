@@ -1,11 +1,12 @@
 package editor
 
 // The language servers in the settings window: under "Language servers", a row
-// for each server, grouped by language, with its state, Install and Locate…
-// when its program isn't found, and an Off/On switch; then a row that adds a
-// server. Enter or the chevron opens a server's page in place of the list,
-// which edits its [lsp.<name>] table: program, command, languages, files and
-// install command, with Restart, its log, and Reset or Remove.
+// for each server, grouped by language, with its state, Install (or what
+// installing needs) and Locate… when its program isn't found, and an Off/On
+// switch; then a row that adds a server. Enter or the chevron opens a server's
+// page in place of the list, which edits its [lsp.<name>] table: program,
+// command, languages, files and install commands, with the install commands
+// found, Restart, its log, and Reset or Remove.
 //
 // Changes are queued and applied at the start of the next frame
 // (settings_servers_frame): this frame's render commands may still use the
@@ -57,7 +58,7 @@ Server_Op_Kind :: enum {
 	Reset,
 	Remove,
 	Add,
-	Install,
+	Install, // the install command in `value`
 	Locate,
 	Restart,
 	Show_Log,
@@ -84,7 +85,8 @@ SERVER_FIELD_HELP := [langs.Server_Field]string {
 	.Extensions   = "Files of a language typo doesn't know (the first language), " +
 	                "e.g. vue.",
 	.Root_Markers = "Files or folders that mark a project's root, e.g. pyproject.toml.",
-	.Install      = "A command line that installs it, run in a terminal by Install.",
+	.Install      = "Command lines that install it, separated by semicolons. Install " +
+	                "runs the lightest whose program is on PATH, in a terminal.",
 }
 
 // segmented's ids for the servers' switches start here, past the settings'
@@ -93,6 +95,10 @@ SERVER_SWITCH_IDS :: 4096
 
 @(private = "file")
 FIELD_LABEL_WIDTH :: 110
+
+// The widest a row's "Needs ..." label gets
+@(private = "file")
+NEEDS_MAX_WIDTH :: 220
 
 
 // --- Rows --------------------------------------------------------------------------
@@ -228,14 +234,18 @@ server_row :: proc(row: Server_Row, index: int, list: clay.ElementId) {
 }
 
 
-// Install (when it has an install command) and Locate…
+// Install, which runs the lightest install command found, or what installing
+// needs when none is; then Locate…
 @(private = "file")
 missing_buttons :: proc(row: Server_Row, index: int) {
-	if can_install(row) {
-		tip := fmt.tprintf("Run %s in a terminal", row.server.install)
-		if button(clay.ID("ServerInstall", u32(index)), "Install", tip) {
-			queue_server_op(.Install, row.name)
+	installs := row_installs(row)
+	if len(installs.offered) > 0 {
+		lightest := installs.offered[0]
+		if button(clay.ID("ServerInstall", u32(index)), "Install", install_tip(lightest)) {
+			queue_server_op(.Install, row.name, value = lightest.command)
 		}
+	} else if installs.needs != "" {
+		needs_label(clay.ID("ServerNeeds", u32(index)), install_needs(installs))
 	}
 
 	tip := "Choose where its program is installed"
@@ -245,10 +255,27 @@ missing_buttons :: proc(row: Server_Row, index: int) {
 }
 
 
+// How a server can be installed; nothing while it is being installed
 @(private = "file")
-can_install :: proc(row: Server_Row) -> bool {
-	s := row.server
-	return s != nil && s.install != "" && s.path == "" && !lsp_installing(row.name)
+row_installs :: proc(row: Server_Row) -> langs.Installs {
+	if row.server == nil || lsp_installing(row.name) {
+		return {}
+	}
+	return langs.server_installs(row.server)
+}
+
+
+// What installing a server needs, beside its row's buttons: cut short if it is
+// long, the whole of it in its tooltip
+@(private = "file")
+needs_label :: proc(id: clay.ElementId, text: string) {
+	if clay.UI(id)({
+		layout = {sizing = {width = clay.SizingFit({max = NEEDS_MAX_WIDTH})}},
+		clip = {horizontal = true},
+	}) {
+		label(text, gfx.theme.text_faint, FONT_SIZE_SMALL)
+	}
+	tooltip(id, text)
 }
 
 
@@ -444,7 +471,7 @@ apply_server_op :: proc(op: Server_Op) {
 		w.server_focus = .Command
 
 	case .Install:
-		lsp_install(op.name)
+		lsp_install(op.name, op.value)
 		if w.open do settings_window_toggle()
 
 	case .Locate:
@@ -554,9 +581,10 @@ start_server_edit :: proc(field: langs.Server_Field) {
 	w.server_editing = field
 	w.server_focus = field
 
-	clear(&w.edit_buf)
+	// The caret at the end of the text
 	o := langs.find_server_override(g.settings.servers[:], w.server_page)
-	append(&w.edit_buf, langs.override_field_text(o, field))
+	text := langs.override_field_text(o, field)
+	line_edit_set(&w.edit, text, len(text), len(text))
 }
 
 
@@ -570,7 +598,7 @@ finish_server_edit :: proc(commit: bool) {
 	if !commit do return
 
 	o := langs.find_server_override(g.settings.servers[:], w.server_page)
-	text := string(w.edit_buf[:])
+	text := line_edit_string(&w.edit)
 	if strings.trim_space(text) != langs.override_field_text(o, field) {
 		queue_server_op(.Set_Field, w.server_page, field, text)
 	}
@@ -612,7 +640,7 @@ server_page_handle_event :: proc(event: ^sdl.Event) -> bool {
 				return true
 			}
 		}
-		text_field_event(&w.edit_buf, event)
+		line_edit_event(&w.edit, event)
 		return true
 	}
 	if event.type != .KEY_DOWN do return event.type == .TEXT_INPUT
@@ -690,6 +718,7 @@ server_page :: proc(width, height: f32) {
 		}) {
 			page_state(row)
 			for field in page_fields(row.name) do field_row(row, field, list)
+			page_installs(row, list)
 			page_actions(row, list)
 		}
 		list_scrollbar(list, &w.scrollbar_drag)
@@ -773,6 +802,7 @@ field_row :: proc(row: Server_Row, field: langs.Server_Field, list: clay.Element
 	} else if editing && g.mouse_pressed && !pointer_in(id) {
 		finish_server_edit(commit = true) // clicking elsewhere keeps what was typed
 	}
+	editing = w.server_editing == field
 
 	if clay.UI(clay.ID("ServerFieldRow", u32(field)))({
 		layout = {
@@ -790,8 +820,9 @@ field_row :: proc(row: Server_Row, field: langs.Server_Field, list: clay.Element
 		}
 
 		text := langs.override_field_text(row.override, field)
-		if editing do text = string(w.edit_buf[:])
-		input_box(id, text, field_placeholder(row, field), editing, 0, 28, 13)
+		look := Field_Look{height = 28, size = 13, within = list}
+		edit := editing ? &w.edit : nil
+		text_field(id, edit, field_placeholder(row, field), editing, look, text)
 	}
 }
 
@@ -827,11 +858,71 @@ field_placeholder :: proc(row: Server_Row, field: langs.Server_Field) -> string 
 }
 
 
-// Install, Locate…, Restart and Log; then Reset (a changed built-in server) or
-// Remove (one the settings added). `list` is the scroll area they sit in
+// While a server's program isn't found: each install command whose program is,
+// lightest first, with its Install button; else what they need. `list` is the
+// scroll area they sit in
+@(private = "file")
+page_installs :: proc(row: Server_Row, list: clay.ElementId) {
+	if !server_state(row).missing do return
+
+	installs := row_installs(row)
+	if len(installs.offered) == 0 && installs.needs == "" {
+		return
+	}
+
+	if clay.UI()({
+		layout = {
+			sizing = {width = clay.SizingGrow()},
+			layoutDirection = .TopToBottom,
+			padding = {left = FIELD_LABEL_WIDTH + 12},
+			childGap = 2,
+		},
+	}) {
+		for x, i in installs.offered do install_line(row, x, i, list)
+
+		// The text lines up with the buttons' labels
+		if installs.needs != "" {
+			if clay.UI(clay.ID("ServerPageNeeds"))({
+				layout = {sizing = {width = clay.SizingGrow()}, padding = {left = 6}},
+			}) {
+				paragraph(install_needs(installs), gfx.theme.text_faint)
+			}
+		}
+	}
+}
+
+
+// An install command with its Install button
+@(private = "file")
+install_line :: proc(row: Server_Row, x: langs.Install, index: int, list: clay.ElementId) {
+	if clay.UI()({
+		layout = {
+			sizing = {width = clay.SizingGrow()},
+			childGap = 8,
+			childAlignment = {y = .Center},
+		},
+	}) {
+		id := clay.ID("ServerPageInstall", u32(index))
+		if button(id, "Install", install_tip(x), within = list) {
+			queue_server_op(.Install, row.name, value = x.command)
+		}
+
+		// The command, cut short if the page is narrow
+		if clay.UI()({
+			layout = {sizing = {width = clay.SizingGrow()}, childGap = 8},
+			clip = {horizontal = true},
+		}) {
+			label(x.command, gfx.theme.text_dim, FONT_SIZE_SMALL)
+			if x.builds do label("builds from source", gfx.theme.text_faint, FONT_SIZE_SMALL)
+		}
+	}
+}
+
+
+// Locate…, Restart and Log; then Reset (a changed built-in server) or Remove
+// (one the settings added). `list` is the scroll area they sit in
 @(private = "file")
 page_actions :: proc(row: Server_Row, list: clay.ElementId) {
-	state := server_state(row)
 	running := false
 	logged := false
 	for c in langs.state.clients {
@@ -848,12 +939,6 @@ page_actions :: proc(row: Server_Row, list: clay.ElementId) {
 			childAlignment = {y = .Center},
 		},
 	}) {
-		if state.missing && can_install(row) {
-			tip := fmt.tprintf("Run %s in a terminal", row.server.install)
-			if button(clay.ID("ServerPageInstall"), "Install", tip, within = list) {
-				queue_server_op(.Install, row.name)
-			}
-		}
 		if row.server != nil {
 			tip := "Choose where its program is installed"
 			if button(clay.ID("ServerPageLocate"), "Locate…", tip, within = list) {

@@ -62,6 +62,7 @@ console_out: ^os.File
 // When started from a terminal, print to that terminal instead. The shell
 // doesn't wait for a GUI program, so the output follows its next prompt
 attach_console :: proc() {
+	if console_out != nil do return
 	if win.GetStdHandle(win.STD_OUTPUT_HANDLE) != nil do return // a console or a redirect
 	if !win.AttachConsole(ATTACH_PARENT_PROCESS) do return
 
@@ -78,6 +79,7 @@ attach_console :: proc() {
 
 	console_out = os.new_file(uintptr(handle), "CONOUT$")
 	os.stdout = console_out
+	os.stderr = console_out
 	fmt.println()
 }
 

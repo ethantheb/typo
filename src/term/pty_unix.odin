@@ -49,6 +49,7 @@ default_shell :: proc() -> string {
 }
 
 
+// `env` ("NAME=value" each) is added to the shell's environment.
 // `bundled_conpty` only applies on Windows
 pty_spawn :: proc(
 	p: ^Pty,
@@ -57,6 +58,7 @@ pty_spawn :: proc(
 	on_exit: Notify_Proc,
 	userdata: rawptr,
 	bundled_conpty: bool,
+	env: []string,
 ) -> bool {
 	p^ = {on_exit = on_exit, userdata = userdata}
 
@@ -76,6 +78,13 @@ pty_spawn :: proc(
 	shell_command := strings.clone_to_cstring(command, context.temp_allocator)
 	argv := [4]cstring{"/bin/sh", "-c", shell_command, nil}
 	dir := strings.clone_to_cstring(cwd, context.temp_allocator)
+	names := make([]cstring, len(env), context.temp_allocator)
+	values := make([]cstring, len(env), context.temp_allocator)
+	for entry, i in env {
+		name, _, value := strings.partition(entry, "=")
+		names[i] = strings.clone_to_cstring(name, context.temp_allocator)
+		values[i] = strings.clone_to_cstring(value, context.temp_allocator)
+	}
 
 	pid := posix.fork()
 	if pid < 0 {
@@ -97,6 +106,7 @@ pty_spawn :: proc(
 		if cwd != "" do posix.chdir(dir)
 		posix.setenv("TERM", "xterm-256color", true)
 		posix.setenv("COLORTERM", "truecolor", true)
+		for name, i in names do posix.setenv(name, values[i], true)
 		posix.execvp(argv[0], &argv[0])
 		posix._exit(127)
 	}

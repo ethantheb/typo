@@ -769,3 +769,65 @@ first_rune_len :: proc(s: string) -> int {
 	_, n := utf8.decode_rune_in_string(s)
 	return n
 }
+
+
+// --- Carets in a line of text ------------------------------------------------------
+// Where the text engine puts a one-line string's characters when it draws it
+// (text_width is the inked extent, which counts a trailing space short). In
+// logical pixels. Without a text engine each character is half the font size
+
+// The x of the character boundary at byte i
+text_caret_x :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, i: int) -> f32 {
+	if i <= 0 || len(s) == 0 {
+		return 0
+	}
+	if ts.engine == nil {
+		return f32(strings.rune_count(s[:min(i, len(s))])) * f32(size) * 0.5
+	}
+
+	font := text_get_font(ts, id, size)
+	if font == nil do return 0
+	text := text_get(ts, font, s)
+	if text == nil do return 0
+
+	// The start of the character at i, or the end of the last one
+	sub: ttf.SubString
+	if i >= len(s) {
+		_ = ttf.GetTextSubString(text, i32(len(s)), &sub)
+		return f32(sub.rect.x + sub.rect.w) / scale
+	}
+	_ = ttf.GetTextSubString(text, i32(i), &sub)
+	return f32(sub.rect.x) / scale
+}
+
+
+// The character boundary nearest to x
+text_caret_at :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, x: f32) -> int {
+	if x <= 0 || len(s) == 0 {
+		return 0
+	}
+
+	// Without a text engine: the nearest column
+	if ts.engine == nil {
+		cols := int(x / (f32(size) * 0.5) + 0.5)
+		for _, i in s {
+			if cols == 0 do return i
+			cols -= 1
+		}
+		return len(s)
+	}
+
+	font := text_get_font(ts, id, size)
+	if font == nil do return 0
+	text := text_get(ts, font, s)
+	if text == nil do return 0
+
+	// The character under x, then whichever of its edges is nearer
+	sub: ttf.SubString
+	px := x * scale
+	_ = ttf.GetTextSubStringForPoint(text, i32(px), 0, &sub)
+	if px < f32(sub.rect.x) + f32(sub.rect.w) / 2 {
+		return int(sub.offset)
+	}
+	return min(int(sub.offset + sub.length), len(s))
+}

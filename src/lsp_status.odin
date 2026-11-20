@@ -4,8 +4,9 @@ package editor
 // dot for its servers' state (the servers in its tooltip), and a popup listing
 // every running server with Restart,
 // Stop/Start, Disable and its log, then the focused file's servers that are off
-// (Turn on) or not found (Install, which runs its install command in a
-// terminal, Locate…, which picks the program in a file dialog, and Turn off).
+// (Turn on) or not found (Install, which runs the lightest install command
+// found in a terminal, Locate…, which picks the program in a file dialog, and
+// Turn off).
 // A chosen action runs at the start of the next frame, since this frame's
 // render commands still use the client's strings
 
@@ -500,6 +501,9 @@ other_servers :: proc() {
 			continue
 		}
 
+		installs: langs.Installs
+		if missing do installs = langs.server_installs(&server)
+
 		if clay.UI(clay.ID("LspServer", u32(i)))({
 			layout = {
 				sizing = {width = clay.SizingGrow()},
@@ -529,8 +533,8 @@ other_servers :: proc() {
 				} else if installing {
 					label("installing…", gfx.theme.text_faint, FONT_SIZE_SMALL)
 				} else {
-					if server.install != "" && server.path == "" {
-						tip := fmt.tprintf("Run %s in a terminal", server.install)
+					if len(installs.offered) > 0 {
+						tip := install_tip(installs.offered[0])
 						if button(clay.ID("LspInstall", u32(i)), "Install", tip) {
 							choose_server(server.name, .Install)
 						}
@@ -548,16 +552,34 @@ other_servers :: proc() {
 				}
 			}
 
-			// How to install it, or that the program it was pointed at is gone
-			if missing {
-				how := server.install != "" ? server.install : server.url
-				if server.path != "" do how = fmt.tprintf("Not found at %s", server.path)
+			how := missing ? install_how(&server, installs) : ""
+			if how != "" {
 				if clay.UI()({layout = {padding = {left = 16}}}) {
 					paragraph(how, gfx.theme.text_faint)
 				}
 			}
 		}
 	}
+}
+
+
+// Under a server not found: that the program it was pointed at is gone, else
+// the command Install runs, else what installing needs, else where to read
+// about it (temp)
+@(private = "file")
+install_how :: proc(server: ^langs.Server, installs: langs.Installs) -> string {
+	switch {
+	case server.path != "":
+		return fmt.tprintf("Not found at %s", server.path)
+	case !installs.known:
+		return ""
+	case len(installs.offered) > 0:
+		x := installs.offered[0]
+		return x.builds ? fmt.tprintf("%s (builds from source)", x.command) : x.command
+	case installs.needs != "":
+		return install_needs(installs)
+	}
+	return server.url
 }
 
 

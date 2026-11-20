@@ -30,7 +30,7 @@ PICKER_ROW_HEIGHT :: 32
 Settings_Window :: struct {
 	open:            bool,
 	opened_at:       u64, // frame it was opened on
-	search:          [dynamic]u8,
+	search:          Line_Edit,
 	recording:       Maybe(Command), // waiting for a key press to bind
 
 	// Keyboard focus: an index into `items`, or -1 for the search field.
@@ -42,25 +42,46 @@ Settings_Window :: struct {
 	collapse_to:     Maybe(bit_set[Section]), // clicked; applied before the next frame's rows
 
 	editing:         Maybe(Setting), // text setting being typed into
-	edit_buf:        [dynamic]u8,
+	edit:            Line_Edit, // the text setting or server field being typed into
 
 	// The option list of a picker setting, and the settings shown below it
 	picking:         bool,
 	picker:          Setting,      // the list shown
 	original:        string,       // its value when the list opened, restored on cancel
 	original_extras: [Setting]f64, // likewise for picker_extras
-	filter:          [dynamic]u8,
+	filter:          Line_Edit,
 	picker_reveal:   bool,         // scroll the current option into view
 	extra_focus:     int,          // keyboard focus: -1 = the list, else a picker_extras index
 	scrollbar_drag:  Maybe(f32),   // of the list shown (see list_scrollbar)
 	dark_themes:     bool,         // the theme list shows dark themes, else light ones
+	picker_click:    Picker_Click, // applied before the next frame's layout
 
 	// A language server's page, shown in place of the list (settings_servers.odin)
 	server_page:     string, // owned; the server's name, or ""
 	server_focus:    langs.Server_Field,
-	server_editing:  Maybe(langs.Server_Field), // being typed into, in edit_buf
+	server_editing:  Maybe(langs.Server_Field), // being typed into, in edit
 	server_ops:      [dynamic]Server_Op,  // applied next frame
 }
+
+// A click in a picker's page. It is applied at the start of the next frame
+// (settings_window_frame): applying an option replaces a settings string and
+// may reopen fonts, which this frame's layout and drawing still use
+Picker_Click :: union {
+	Picker_Option_Click, // an option: apply it, or keep it if it was applied
+	Picker_Themes,       // the dark or light themes
+	Picker_Back,         // back to the settings, the value restored
+}
+
+Picker_Option_Click :: struct {
+	value: string, // owned
+	keep:  bool,   // a second click on the applied option: keep it and close
+}
+
+Picker_Themes :: struct {
+	dark: bool,
+}
+
+Picker_Back :: struct {}
 
 // A row in the settings list
 Setting_Item :: union {
@@ -106,18 +127,21 @@ settings_window_toggle :: proc() {
 	w.focus = -1
 	w.refocus = nil
 	w.collapse_to = nil
-	clear(&w.search)
+	line_edit_clear(&w.search)
 
-	if w.open do g.finder.open = false
+	if w.open {
+		g.finder.open = false
+		langs.recheck_programs() // servers and installers may have been installed since
+	}
 }
 
 
 settings_window_destroy :: proc() {
 	w := &g.settings_window
-	delete(w.search)
+	line_edit_destroy(&w.search)
 	delete(w.items)
-	delete(w.edit_buf)
-	delete(w.filter)
+	line_edit_destroy(&w.edit)
+	line_edit_destroy(&w.filter)
 	delete(w.original)
 	delete(w.server_page)
 	for op in w.server_ops {
@@ -125,17 +149,6 @@ settings_window_destroy :: proc() {
 		delete(op.value)
 	}
 	delete(w.server_ops)
-}
-
-
-// Whether the pointer is over a text field (for the I-beam cursor)
-settings_window_over_text :: proc() -> bool {
-	for field in langs.Server_Field {
-		if pointer_in(clay.ID("ServerField", u32(field))) do return true
-	}
-	return pointer_in(clay.ID("SettingsSearch")) ||
-	       pointer_in(clay.ID("SettingField")) ||
-	       pointer_in(clay.ID("PickerFilter"))
 }
 
 
@@ -165,12 +178,12 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 			}
 		}
 
-		text_field_event(&w.edit_buf, event)
+		line_edit_event(&w.edit, event)
 		return true
 	}
 
 	// Waiting for a keybinding
-	if cmd, recording := w.recording.?; recording {
+	if w.recording != nil {
 		if event.type == .KEY_DOWN {
 			switch {
 			case event.key.key == sdl.K_ESCAPE:
@@ -178,17 +191,21 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 			case is_modifier_key(event.key.key):
 				// Wait for the actual key
 			case:
-				bind_command(cmd, chord_from_event(event.key))
-				w.recording = nil
+				settings_window_record(chord_from_event(event.key))
 			}
 		}
 		return true
 	}
 
-	// Typing goes back to the search field
-	if _, changed := text_field_event(&w.search, event); changed {
+	// The search field has the keys while no row is focused. Typing or
+	// Backspace on a row goes back to it
+	backspace := event.type == .KEY_DOWN && event.key.key == sdl.K_BACKSPACE
+	if event.type == .TEXT_INPUT || backspace {
 		w.focus = -1
-		return true
+	}
+	if w.focus < 0 {
+		handled, _ := line_edit_event(&w.search, event)
+		if handled do return true
 	}
 	if event.type != .KEY_DOWN do return event.type == .TEXT_INPUT
 
@@ -250,8 +267,11 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 		// the window; swallow the rest
 		if cmd, ok := command_for_key(key); ok {
 			#partial switch cmd {
-			case .Find:          w.focus = -1
-			case .Open_Settings: return false
+			case .Find:
+				w.focus = -1
+				line_edit_select_all(&w.search)
+			case .Open_Settings:
+				return false
 			}
 		}
 	}
@@ -259,12 +279,14 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 }
 
 
+// Starts typing into a text setting, with the caret at the end
 @(private = "file")
 start_text_edit :: proc(x: Setting) {
 	w := &g.settings_window
 	w.editing = x
-	clear(&w.edit_buf)
-	append(&w.edit_buf, setting_value(&g.settings, x).(^string)^)
+
+	value := setting_value(&g.settings, x).(^string)^
+	line_edit_set(&w.edit, value, len(value), len(value))
 }
 
 
@@ -276,7 +298,7 @@ finish_text_edit :: proc(commit: bool) {
 
 	w.editing = nil
 	if commit {
-		value := strings.trim_space(string(w.edit_buf[:]))
+		value := strings.trim_space(line_edit_string(&w.edit))
 		set_string(setting_value(&g.settings, x).(^string), value)
 		settings_changed()
 	}
@@ -400,6 +422,21 @@ reset_item :: proc(item: Setting_Item) {
 @(private = "file")
 confirm_reset_all :: proc() {
 	ask_reset_settings()
+}
+
+
+// While a keybinding waits for keys, binds the chord pressed (a key, or a mouse
+// button) to its command. Returns whether it was waiting
+settings_window_record :: proc(chord: Chord) -> bool {
+	w := &g.settings_window
+	cmd, recording := w.recording.?
+	if !w.open || !recording {
+		return false
+	}
+
+	bind_command(cmd, chord)
+	w.recording = nil
+	return true
 }
 
 
@@ -574,7 +611,7 @@ open_picker :: proc(x: Setting) {
 	set_string(&w.original, current_value(x))
 	for e in picker_extras(x) do w.original_extras[e] = number_value(e)
 
-	clear(&w.filter)
+	line_edit_clear(&w.filter)
 	w.picker_reveal = true
 	w.extra_focus = -1
 
@@ -599,12 +636,67 @@ close_picker :: proc(commit: bool) {
 	if !w.picking do return
 
 	w.picking = false
+	drop_picker_click()
 	if commit {
 		settings_changed()
 	} else {
 		set_string(setting_value(&g.settings, w.picker).(^string), w.original)
 		for e in picker_extras(w.picker) do set_number_value(e, w.original_extras[e])
 		apply_settings()
+	}
+}
+
+
+// Before the layout: applies the picker's click from the last frame
+settings_window_frame :: proc() {
+	w := &g.settings_window
+	click := w.picker_click
+	w.picker_click = nil
+	if !w.open || !w.picking {
+		free_picker_click(click)
+		return
+	}
+
+	switch c in click {
+	case Picker_Option_Click:
+		if c.keep {
+			close_picker(commit = true)
+			settings_window_toggle()
+		} else {
+			preview_option(c.value)
+		}
+		delete(c.value)
+
+	case Picker_Themes:
+		show_dark_themes(c.dark)
+
+	case Picker_Back:
+		close_picker(commit = false)
+	}
+}
+
+
+// Queues a click in the picker's page for the next frame, in place of any queued
+@(private = "file")
+queue_picker_click :: proc(click: Picker_Click) {
+	w := &g.settings_window
+	free_picker_click(w.picker_click)
+	w.picker_click = click
+}
+
+
+@(private = "file")
+drop_picker_click :: proc() {
+	w := &g.settings_window
+	free_picker_click(w.picker_click)
+	w.picker_click = nil
+}
+
+
+@(private = "file")
+free_picker_click :: proc(click: Picker_Click) {
+	if c, is_option := click.(Picker_Option_Click); is_option {
+		delete(c.value)
 	}
 }
 
@@ -668,7 +760,7 @@ show_dark_themes :: proc(dark: bool) {
 		if same_family do break
 	}
 
-	clear(&w.filter)
+	line_edit_clear(&w.filter)
 	preview_option(gfx.THEMES[next].key)
 	w.picker_reveal = true
 }
@@ -678,16 +770,18 @@ show_dark_themes :: proc(dark: bool) {
 picker_handle_event :: proc(event: ^sdl.Event) -> bool {
 	w := &g.settings_window
 
-	// Typing in the filter: keep the current option while it still matches, else
-	// show the first match
-	if _, changed := text_field_event(&w.filter, event); changed {
-		options := picker_options(w.picker, string(w.filter[:]))
-		if len(options) > 0 && option_index(options, current_value(w.picker)) < 0 {
-			preview_option(options[0].value)
-		}
-		w.picker_reveal = true
-		w.extra_focus = -1 // typing goes back to the list
-		return true
+	// The filter has the keys while the list is focused, but for Left and Right
+	// in an empty filter (they switch between dark and light themes). Typing or
+	// Backspace on an extra setting goes back to the list
+	is_key := event.type == .KEY_DOWN
+	if event.type == .TEXT_INPUT || (is_key && event.key.key == sdl.K_BACKSPACE) {
+		w.extra_focus = -1
+	}
+	arrow := is_key && (event.key.key == sdl.K_LEFT || event.key.key == sdl.K_RIGHT)
+	if w.extra_focus < 0 && !(arrow && len(w.filter.text) == 0) {
+		handled, changed := line_edit_event(&w.filter, event)
+		if changed do filter_changed()
+		if handled do return true
 	}
 	if event.type != .KEY_DOWN do return event.type == .TEXT_INPUT
 
@@ -735,12 +829,28 @@ picker_handle_event :: proc(event: ^sdl.Event) -> bool {
 		// window, cancelling the list
 		if cmd, ok := command_for_key(key); ok {
 			#partial switch cmd {
-			case .Find:          w.extra_focus = -1
-			case .Open_Settings: return false
+			case .Find:
+				w.extra_focus = -1
+				line_edit_select_all(&w.filter)
+			case .Open_Settings:
+				return false
 			}
 		}
 	}
 	return true
+}
+
+
+// The filter changed: the current option stays while it still matches, else
+// the first match shows
+@(private = "file")
+filter_changed :: proc() {
+	w := &g.settings_window
+	options := picker_options(w.picker, line_edit_string(&w.filter))
+	if len(options) > 0 && option_index(options, current_value(w.picker)) < 0 {
+		preview_option(options[0].value)
+	}
+	w.picker_reveal = true
 }
 
 
@@ -816,7 +926,7 @@ picker_page_rows :: proc() -> int {
 @(private = "file")
 move_option :: proc(dir: int) {
 	w := &g.settings_window
-	options := picker_options(w.picker, string(w.filter[:]))
+	options := picker_options(w.picker, line_edit_string(&w.filter))
 	if len(options) == 0 do return
 
 	// From the current option, or from an end if none is shown
@@ -920,7 +1030,7 @@ settings_page :: proc(width, height: f32) {
 		}) {
 			label("Settings", gfx.theme.text_bright, 16, .SemiBold)
 			push_right()
-			if len(w.search) == 0 do collapse_all_button() // a search shows every section
+			if len(w.search.text) == 0 do collapse_all_button() // a search shows every section
 			close_id := clay.ID("SettingsClose")
 			if icon_button(close_id, .Close, 26, 18, "Close", "Esc") {
 				settings_window_toggle()
@@ -961,7 +1071,7 @@ search_field :: proc() {
 	}
 
 	focused := w.recording == nil && w.editing == nil && w.focus < 0
-	input_box(id, string(w.search[:]), "Search settings", focused, height = 34)
+	text_field(id, &w.search, "Search settings", focused, {height = 34})
 }
 
 
@@ -993,7 +1103,8 @@ settings_list :: proc() {
 		},
 		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
 	}) {
-		query := strings.to_lower(string(g.settings_window.search[:]), context.temp_allocator)
+		search := line_edit_string(&g.settings_window.search)
+		query := strings.to_lower(search, context.temp_allocator)
 		collapsed := query == "" ? collapsed_set() : {} // a search shows what it finds
 		shown := 0
 		for key, section in SECTION_KEYS {
@@ -1409,17 +1520,24 @@ text_setting_field :: proc(x: Setting, value: string) {
 	id := clay.ID("SettingField")
 	editing := w.editing == x
 
-	if clicked(id, clay.ID("SettingsList")) {
+	list := clay.ID("SettingsList")
+	if clicked(id, list) {
 		if !editing do start_text_edit(x)
 	} else if editing && g.mouse_pressed && !pointer_in(id) {
 		finish_text_edit(commit = true) // clicking elsewhere keeps what was typed
 	}
+	editing = w.editing == x
 
 	default := x == .Terminal_Shell ? fmt.tprintf("%s (default)", term.default_shell()) : ""
-	text := editing ? string(w.edit_buf[:]) : value
-	input_box(id, text, default, editing, 260, 28, 13)
+	look := Field_Look{width = 260, height = 28, size = 13, within = list}
+	text_field(id, editing ? &w.edit : nil, default, editing, look, value)
 	if !editing do tooltip(id, "Edit", "Enter")
 }
+
+
+// A keybinding may be a key or a mouse side button (MOUSE_BUTTONS)
+@(private = "file")
+RECORDING_PROMPT :: "Press a key or side button…  (Esc cancels)"
 
 
 @(private = "file")
@@ -1452,7 +1570,7 @@ keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 		}) {
 			bound := bindings_label(g.settings.bindings[cmd], " / ")
 			switch {
-			case recording:   label("Press keys…  (Esc cancels)", gfx.theme.accent, FONT_SIZE_SMALL)
+			case recording:   label(RECORDING_PROMPT, gfx.theme.accent, FONT_SIZE_SMALL)
 			case bound == "": label("Unbound", gfx.theme.text_dim, FONT_SIZE_SMALL)
 			case:             label(bound, gfx.theme.text, FONT_SIZE_SMALL)
 			}
@@ -1536,7 +1654,7 @@ footer :: proc() {
 picker_page :: proc(width, height: f32) {
 	w := &g.settings_window
 	x := w.picker
-	options := picker_options(x, string(w.filter[:]))
+	options := picker_options(x, line_edit_string(&w.filter))
 	current := current_value(x)
 	list := clay.ID("PickerList")
 
@@ -1570,7 +1688,7 @@ picker_page :: proc(width, height: f32) {
 		}) {
 			back_id := clay.ID("PickerBack")
 			if icon_button(back_id, .Chevron_Left, 26, 18, "Back to settings", "Esc") {
-				close_picker(commit = false)
+				queue_picker_click(Picker_Back{})
 			}
 			label(SETTINGS[x].name, gfx.theme.text_bright, 16, .SemiBold)
 		}
@@ -1579,10 +1697,13 @@ picker_page :: proc(width, height: f32) {
 		if x == .Theme {
 			shown := w.dark_themes ? 0 : 1
 			choice, changed := segmented(u32(Setting.Theme), {"Dark", "Light"}, shown)
-			if changed do show_dark_themes(choice == 0)
+			if changed do queue_picker_click(Picker_Themes{dark = choice == 0})
 		}
+		// The filter has the keys while the list (not an extra setting) does
 		placeholder := x == .Theme ? "Filter themes" : "Filter fonts"
-		input_box(clay.ID("PickerFilter"), string(w.filter[:]), placeholder, true)
+		filter_id := clay.ID("PickerFilter")
+		if clicked(filter_id) do w.extra_focus = -1
+		text_field(filter_id, &w.filter, placeholder, w.extra_focus < 0)
 
 		// The options
 		if clay.UI(list)({
@@ -1685,12 +1806,8 @@ option_row :: proc(
 ) {
 	id := clay.ID("PickerRow", u32(index))
 	if clicked(id, list) {
-		if selected && g.mouse_clicks >= 2 {
-			close_picker(commit = true)
-			settings_window_toggle()
-		} else {
-			preview_option(o.value)
-		}
+		keep := selected && g.mouse_clicks >= 2
+		queue_picker_click(Picker_Option_Click{value = strings.clone(o.value), keep = keep})
 	}
 
 	if clay.UI(id)({

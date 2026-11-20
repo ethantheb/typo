@@ -5,9 +5,10 @@ import "core:math"
 import clay "../vendor/clay-odin"
 import "gfx"
 
-// Scroll bars: a thumb along the right edge of a scrolling area. Dragging it
-// scrolls; clicking the track jumps there. The editor draws its own in
-// draw_editor; Clay scroll containers get one from list_scrollbar
+// Scroll bars: a thumb along the right edge of a scrolling area, or its bottom
+// edge for sideways scrolling. Dragging it scrolls; clicking the track jumps
+// there. The editor draws its own in draw_editor; Clay scroll containers get
+// one from list_scrollbar. The geometry and dragging are gfx's (gfx/scrollbar.odin)
 
 
 SCROLLBAR_WIDTH     :: 12
@@ -18,61 +19,37 @@ SCROLLBAR_MIN_THUMB :: 28
 SCROLLBAR_GUTTER :: SCROLLBAR_WIDTH + 6
 
 
-// Track and thumb for `area` scrolled down by `scroll` out of `max_scroll`
-// (the content is max_scroll plus one area). ok = false when nothing scrolls
+// Track and thumb for `area` scrolled by `scroll` out of `max_scroll` along an
+// axis (the content is max_scroll plus the area): the track runs along the
+// area's right edge, or its bottom edge sideways. ok = false when nothing scrolls
 scrollbar_geometry :: proc(
 	area: gfx.Rect,
+	axis: gfx.Axis,
 	scroll, max_scroll: f64,
 ) -> (track, thumb: gfx.Rect, ok: bool) {
-	if max_scroll <= 0 || area.h <= 0 {
-		return
-	}
+	page := f64(axis == .Vertical ? area.h : area.w)
 
 	track = {area.x + area.w - SCROLLBAR_WIDTH, area.y, SCROLLBAR_WIDTH, area.h}
+	if axis == .Horizontal {
+		track = {area.x, area.y + area.h - SCROLLBAR_WIDTH, area.w, SCROLLBAR_WIDTH}
+	}
 
-	content := f32(max_scroll + f64(area.h))
-	h := max(area.h * area.h / content, min(SCROLLBAR_MIN_THUMB, area.h))
-	y := area.y + f32(clamp(scroll / max_scroll, 0, 1)) * (area.h - h)
-	thumb = {track.x, y, track.w, h}
-
-	return track, thumb, true
+	thumb, ok = gfx.scrollbar_thumb(track, axis, scroll, max_scroll, page, SCROLLBAR_MIN_THUMB)
+	return track, thumb, ok
 }
 
 
-// Pressing and dragging the bar. `drag` holds the grab offset within the thumb
-// while dragging. Returns the scroll position to show while it owns the mouse
+// Pressing and dragging a bar with the app's pointer. `drag` holds the grab
+// offset within the thumb while dragging. Returns the scroll position to show
+// while it owns the mouse
 scrollbar_mouse :: proc(
 	drag: ^Maybe(f32),
 	track, thumb: gfx.Rect,
+	axis: gfx.Axis,
 	max_scroll: f64,
 ) -> (scroll: f64, active: bool) {
-	if g.mouse_pressed && gfx.rect_contains(track, g.mouse_pos) {
-		// Clicking the track centres the thumb there
-		drag^ = gfx.rect_contains(thumb, g.mouse_pos) ? g.mouse_pos.y - thumb.y : thumb.h / 2
-	}
-
-	grab, dragging := drag.?
-	if !dragging do return
-	if !g.mouse_down {
-		drag^ = nil
-		return
-	}
-
-	frac: f32
-	span := track.h - thumb.h
-	if span > 0 {
-		frac = clamp((g.mouse_pos.y - grab - track.y) / span, 0, 1)
-	}
-	return f64(frac) * max_scroll, true
-}
-
-
-// The thumb as drawn: inset in its track, stronger while hovered or dragged
-scrollbar_thumb_look :: proc(thumb: gfx.Rect, active: bool) -> (r: gfx.Rect, color: clay.Color) {
-	color = gfx.theme.text_dim
-	color.a = active ? 150 : 70
-	inset: f32 = active ? 2 : 3
-	return {thumb.x + inset, thumb.y + 2, thumb.w - inset * 2, thumb.h - 4}, color
+	pointer := gfx.Pointer_State{g.mouse_pos, g.mouse_pressed, g.mouse_down}
+	return gfx.scrollbar_drag(drag, track, thumb, track, axis, max_scroll, pointer)
 }
 
 
@@ -89,7 +66,8 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 	}
 
 	max_scroll := f64(data.contentDimensions.height - data.scrollContainerDimensions.height)
-	track, thumb, scrolls := scrollbar_geometry(area, f64(-data.scrollPosition.y), max_scroll)
+	scroll := f64(-data.scrollPosition.y)
+	track, thumb, scrolls := scrollbar_geometry(area, .Vertical, scroll, max_scroll)
 	if !scrolls {
 		drag^ = nil
 		return
@@ -98,15 +76,15 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 	// Dragging
 	interactive := ui_interactive()
 	if interactive {
-		if scroll, active := scrollbar_mouse(drag, track, thumb, max_scroll); active {
-			data.scrollPosition.y = -f32(scroll)
-			_, thumb, _ = scrollbar_geometry(area, scroll, max_scroll)
+		if to, active := scrollbar_mouse(drag, track, thumb, .Vertical, max_scroll); active {
+			data.scrollPosition.y = -f32(to)
+			_, thumb, _ = scrollbar_geometry(area, .Vertical, to, max_scroll)
 		}
 	}
 
 	// The thumb
 	hovered := interactive && gfx.rect_contains(track, g.mouse_pos)
-	r, color := scrollbar_thumb_look(thumb, drag^ != nil || hovered)
+	r, color := gfx.scrollbar_thumb_look(thumb, .Vertical, drag^ != nil || hovered)
 	if clay.UI()({
 		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
 		backgroundColor = color,
