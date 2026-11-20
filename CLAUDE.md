@@ -75,7 +75,17 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   - `patches/sdl_ttf.patch`: glyphs at quarter-pixel positions, with text measured
     the way it is drawn (`Glyph_Pixel_X`); `TTF_SetFontHinting` actually enabling
     subpixel rendering (upstream never stored it); `TTF_SetFontCoverageTable`, which
-    `gfx/text.odin` uses for per-font gamma and contrast.
+    `gfx/text.odin` uses for per-font gamma and contrast; glyph images exactly the
+    size of the box the engine stretches them over (the glyph's box, padded for the
+    LCD filter and the italic slant, `Glyph_Padding`); `TTF_SetFontCellAdvance`
+    (advances in whole cells: the editor font's faces); `TTF_SetFontLCD` (FreeType's
+    LCD rendering in the text engine, `TTF_IMAGE_LCD`, drawn in two passes with custom
+    blend modes: `target * (1 - coverage) + color * coverage` per channel), queued and
+    drawn together by `TTF_FlushRendererText`, which `gfx.flush_text` calls before
+    anything else is drawn, a clip changes or the frame is presented. Overlapping
+    glyphs in the queue go in separate layers (`LCDLayerFor`, a tile grid), each drawn
+    in both passes before the next. Renderers without the blend modes (software) get
+    grayscale text (`renderer_has_lcd_blend`).
   - `patches/ghostty.patch`: when scrollback isn't pulled on resize (set on Windows),
     reflow also trims trailing spaces, as ConPTY does (see Terminal below). Applied
     while `GHOSTTY_PATCH` is on.
@@ -91,7 +101,9 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   other failure, or a listed example passing, fails the test. `-define:SPEC_WRITE=true`
   rewrites the list, `-define:SPEC_DETAILS=n` prints n failures.
 - Perf suite (`src/perf.odin`, run as `typo-perf --perf`): an optimized build that opens
-  a real window, runs scripted phases (startup, parsing, typing, scrolling, resizing,
+  a real window (shown unfocused behind the other windows; events other than quit,
+  wake-ups and display scale changes are ignored), runs scripted phases (startup, text in cells and subpixels, read back
+  from the window, parsing, typing, scrolling, resizing,
   rendered Markdown, huge files, finder, find in files and the terminal, moving lines,
   settings window, context menu and dialogs, terminal, panes, idle CPU/GPU) and exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
@@ -418,6 +430,11 @@ Use Clay before writing UI machinery; read `ref/clay_docs.md` and
   reports it there, then drop it.
 - **Fades**: `overlayColor`, applied by the renderer to everything inside, editor and
   terminal included.
+- **Clipping changes layout**: Clay doesn't compress a clipping element's children
+  along the clipped axis and grows its Grow children to their content. A Grow page
+  directly in a clipping panel is as tall as its rows, so a list in it never scrolls
+  and has no bar. Size what a clipping panel holds to the panel (`modal_at`'s pages
+  are fixed; their lists are Grow inside them).
 - **Scrolling**: use `update_scroll_containers`, not `clay.UpdateScrollContainers`. The
   wheel goes to the topmost list registered with `wheel_scroll_list` (`list_scrollbar`
   does that), not to any clipping element.
@@ -543,10 +560,16 @@ path_deleted :: proc(path: string) {
   showing a dialog closes the menu, and a rename field stays open under a dialog.
 - A file or folder name typed by the user goes through `rename_path`/`create_path`,
   which refuse names the OS can't use; deleting goes through `ask_delete_file`.
-- Fonts: UI uses bundled Instrument Sans (`gfx.Font_Id.Body`, Medium; bundled faces are
-  picked by weight in `gfx/text.odin`); editor and terminal use
-  `.Editor`/`.Editor_Bold` (set by `apply_editor_font`). Column width:
-  `editor_char_width` (includes letter spacing); row height: `editor_line_height`.
+- Fonts: three configurable families. The interface uses `.Body`/`.SemiBold`/`.Bold`
+  (`ui_font`, default Instrument Sans Medium; set by `apply_ui_font`, which has Clay's
+  measurements reset next frame); editor and terminal use `.Editor`/`.Editor_Bold`
+  (set by `apply_editor_font`); rendered Markdown the `Md_*` ids
+  (`apply_markdown_font`). Bundled faces are picked by weight. Column width:
+  `editor_char_width` (includes letter spacing, whole device pixels: the editor
+  font's faces are laid out in cells, `gfx.CELL_FONTS`); row height:
+  `editor_line_height`. Text antialiasing (`gfx.Antialiasing`): subpixel (LCD)
+  below 2x scale when the system uses ClearType, else grayscale; drawing anything
+  but text outside gfx calls `gfx.flush_text` first.
 - Temp allocator for per-frame data; free owned data (tests use the tracking allocator).
 - `@(private = "file")` for single-file helpers, `@(private)` for package internals.
 

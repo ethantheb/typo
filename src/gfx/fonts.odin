@@ -11,9 +11,9 @@ import "core:time"
 import sdl "../../vendor/sdl3"
 import ttf "../../vendor/sdl3/ttf"
 
-// Font families: the bundled IBM Plex Mono (editor and terminal), Instrument
-// Sans (UI and rendered Markdown) and IBM Plex Sans (another choice for
-// Markdown), and the fonts installed on the system. Installed fonts are found by a
+// Font families: the bundled IBM Plex Mono (editor and terminal by default),
+// Instrument Sans (interface and rendered Markdown by default) and IBM Plex
+// Sans, and the fonts installed on the system. Installed fonts are found by a
 // background thread that opens every file in the system font folders. It runs
 // the first time the list is needed (to load a configured family that isn't
 // bundled, which shows the bundled font until then) and again each time the font
@@ -258,9 +258,9 @@ font_family_names :: proc(sf: ^System_Fonts) -> []string {
 }
 
 
-// The Markdown font names to choose from: the bundled one, then every
-// installed family
-markdown_family_names :: proc(sf: ^System_Fonts) -> []string {
+// The Markdown and interface font names to choose from: the bundled ones, then
+// every installed family
+all_family_names :: proc(sf: ^System_Fonts) -> []string {
 	names := make([dynamic]string, 0, len(sf.families) + 2, context.temp_allocator)
 	append(&names, BUNDLED_MD_FAMILY, BUNDLED_PLEX_SANS, BUNDLED_FAMILY)
 
@@ -349,6 +349,27 @@ markdown_family_sources :: proc(
 	sources[.SemiBold] = nearest_face(faces, 600, heavier_than = heavier).source
 	sources[.Bold] = nearest_face(faces, 700, heavier_than = heavier).source
 	sources[.Bold_Italic] = nearest_face(faces, 700, heavier_than = heavier, italic = true).source
+	return
+}
+
+
+// The faces to draw the interface with, from `family` or the bundled one: its
+// regular (Medium where there is one), semibold and bold weights
+ui_family_sources :: proc(
+	sf: ^System_Fonts,
+	family: string,
+) -> (
+	regular, semibold, bold: Font_Source,
+	found: bool,
+) {
+	faces: []Font_Face
+	faces, found = family_faces(sf, family)
+	if !found do faces = BUNDLED_MD_FACES[:]
+
+	r := nearest_face(faces, 500)
+	regular = r.source
+	semibold = nearest_face(faces, 600, heavier_than = r.weight).source
+	bold = nearest_face(faces, 700, heavier_than = r.weight).source
 	return
 }
 

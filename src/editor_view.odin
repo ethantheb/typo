@@ -40,10 +40,14 @@ editor_line_height :: proc() -> int {
 }
 
 
-// The advance of one column: the font's, plus the letter spacing
+// The advance of one column: the font's cell plus the letter spacing, rounded
+// to whole device pixels so every column starts on one
 editor_char_width :: proc() -> f32 {
 	font_w := gfx.text_char_width(&gfx.text_system, .Editor, editor_font_size())
-	return max(font_w + f32(g.settings.letter_spacing), 1)
+	w := font_w + f32(g.settings.letter_spacing)
+	if gfx.scale <= 0 do return max(w, 1)
+
+	return max(math.round(w * gfx.scale), 1) / gfx.scale
 }
 
 

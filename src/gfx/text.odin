@@ -15,9 +15,9 @@ import ttf "../../vendor/sdl3/ttf"
 // crisp on high-DPI displays, and measurements are divided back by scale
 
 
-// Clay passes these back in measure/render. The UI uses bundled Instrument
-// Sans (and Icons); the editor and terminal use the configured family, rendered
-// Markdown its own (see text_set_source)
+// Clay passes these back in measure/render. The interface, the editor and
+// terminal, and rendered Markdown each use their configured family (see
+// text_set_source); Icons is always the bundled Lucide
 Font_Id :: enum u16 {
 	Body,
 	SemiBold,
@@ -47,6 +47,18 @@ ICON_FONT_DATA := #load("../../assets/fonts/lucide.ttf")
 // Every font, every weight: snaps glyphs only vertically and places them at
 // quarter pixels along the font's own (unrounded) advances
 FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
+
+// The editor font's faces, laid out in whole-pixel cells of the regular face's
+// width, so that every glyph lands at the same subpixel phase
+CELL_FONTS :: bit_set[Font_Id]{.Editor, .Editor_Bold, .Editor_Italic}
+
+// How glyph edges are smoothed: for an LCD's color subpixels (like ClearType),
+// or in gray. Auto uses subpixels below 2x scale when the system does
+Antialiasing :: enum {
+	Auto,
+	Subpixel,
+	Grayscale,
+}
 
 // Cached ttf.Text objects not drawn for this many frames are destroyed
 TEXT_CACHE_EVICT_FRAMES :: 120
@@ -125,6 +137,7 @@ Text_System :: struct {
 	sources:        [Font_Id]Font_Source,
 	texts:          map[Text_Key]Text_Entry,
 	char_widths:    map[Font_Key]f32,
+	cell_pixels:    map[u16]f32, // the editor font's cell at each size, in device pixels
 	metrics:        map[Font_Key]Font_Metrics,
 	widths:         map[Width_Key]f32,
 	frame:          u64,
@@ -132,6 +145,11 @@ Text_System :: struct {
 	generation:     u64,
 	// Text brightness and contrast the glyph coverage is mapped for (text_set_contrast)
 	coverage_for:   [2]f32,
+	// How fonts are smoothed (text_set_antialiasing), and the system's subpixels
+	antialiasing:   Antialiasing,
+	cleartype:      bool, // the system draws subpixel text
+	subpixel_order: i32,  // 1 (RGB) or 2 (BGR)
+	lcd_blend:      bool, // the renderer has the blend modes subpixel text is drawn with
 }
 
 // The app's fonts and text objects
@@ -160,6 +178,8 @@ text_init :: proc(ts: ^Text_System) -> bool {
 	}
 
 	ts.coverage_for = -1
+	ts.cleartype, ts.subpixel_order = system_subpixel()
+	ts.lcd_blend = renderer_has_lcd_blend()
 	ts.sources = {
 		.Body           = bundled_sans(500),
 		.SemiBold       = bundled_sans(600),
@@ -216,6 +236,7 @@ text_destroy :: proc(ts: ^Text_System) {
 
 	delete(ts.texts)
 	delete(ts.char_widths)
+	delete(ts.cell_pixels)
 	delete(ts.metrics)
 	delete(ts.widths)
 	ttf.DestroyRendererTextEngine(ts.engine)
@@ -247,6 +268,7 @@ text_clear_caches :: proc(ts: ^Text_System) {
 	clear(&ts.fallbacks)
 
 	clear(&ts.char_widths)
+	clear(&ts.cell_pixels)
 	clear(&ts.metrics)
 	clear(&ts.widths)
 	ts.generation += 1
@@ -267,6 +289,49 @@ text_set_contrast :: proc(ts: ^Text_System, c: clay.Color, contrast: f32) {
 
 	ts.coverage_for = {b, contrast}
 	text_clear_caches(ts)
+}
+
+
+// Sets how glyph edges are smoothed, re-rasterizing everything when that
+// changes. Asks the system for its subpixel settings again
+text_set_antialiasing :: proc(ts: ^Text_System, aa: Antialiasing) {
+	if ts.engine == nil do return
+
+	cleartype, order := system_subpixel()
+	same := aa == ts.antialiasing && cleartype == ts.cleartype && order == ts.subpixel_order
+	if same do return
+
+	ts.antialiasing = aa
+	ts.cleartype, ts.subpixel_order = cleartype, order
+	text_clear_caches(ts)
+}
+
+
+// Whether the renderer can draw subpixel text: its two passes need a custom
+// blend mode per color channel, which the software renderer lacks
+@(private = "file")
+renderer_has_lcd_blend :: proc() -> bool {
+	texture := sdl.CreateTexture(renderer, .ARGB8888, .STATIC, 1, 1)
+	if texture == nil do return false
+	defer sdl.DestroyTexture(texture)
+
+	cover := sdl.ComposeCustomBlendMode(.ZERO, .ONE_MINUS_SRC_COLOR, .ADD, .ZERO, .ONE, .ADD)
+	return sdl.SetTextureBlendMode(texture, cover)
+}
+
+
+// The subpixel order fonts are rendered for now (ttf.SetFontLCD), 0 for gray.
+// At 2x and above gray is as sharp, as on macOS
+@(private = "file")
+lcd_order :: proc(ts: ^Text_System) -> i32 {
+	if !ts.lcd_blend do return 0
+
+	switch ts.antialiasing {
+	case .Subpixel:  return ts.subpixel_order
+	case .Grayscale: return 0
+	case .Auto:      return ts.cleartype && scale < 2 ? ts.subpixel_order : 0
+	}
+	return 0
 }
 
 
@@ -302,8 +367,20 @@ set_coverage :: proc(ts: ^Text_System, font: ^ttf.Font) {
 }
 
 
+// Opens a font for drawing: hinted for subpixel placement, smoothed as set
 @(private = "file")
-open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
+open_font :: proc(ts: ^Text_System, src: Font_Source, size: f32) -> ^ttf.Font {
+	font := open_font_file(src, size)
+	if font != nil {
+		ttf.SetFontHinting(font, FONT_HINTING)
+		_ = ttf.SetFontLCD(font, lcd_order(ts))
+	}
+	return font
+}
+
+
+@(private = "file")
+open_font_file :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	props := sdl.CreateProperties()
 	defer sdl.DestroyProperties(props)
 
@@ -320,9 +397,8 @@ open_font :: proc(src: Font_Source, size: f32) -> ^ttf.Font {
 	_ = sdl.SetNumberProperty(props, ttf.PROP_FONT_CREATE_FACE_NUMBER, src.face)
 
 	font := ttf.OpenFontWithProperties(props)
-	if font != nil {
-		ttf.SetFontHinting(font, FONT_HINTING)
-		if src.synthetic_italic do ttf.SetFontStyle(font, {.ITALIC})
+	if font != nil && src.synthetic_italic {
+		ttf.SetFontStyle(font, {.ITALIC})
 	}
 	return font
 }
@@ -338,8 +414,31 @@ text_set_source :: proc(ts: ^Text_System, id: Font_Id, src: Font_Source) {
 	if same do return
 
 	ts.generation += 1
+	close_fonts(ts, id)
 
-	// Close the fonts opened from it, with their text objects and fallbacks
+	// The other editor faces are laid out in the regular face's cells
+	if id == .Editor {
+		close_fonts(ts, .Editor_Bold)
+		close_fonts(ts, .Editor_Italic)
+		clear(&ts.cell_pixels)
+	}
+
+	clear(&ts.widths)
+	if ts.bare[id] != nil {
+		ttf.CloseFont(ts.bare[id])
+		ts.bare[id] = nil
+	}
+
+	delete(old.path)
+	old^ = src
+	old.path = strings.clone(src.path)
+}
+
+
+// Closes the fonts opened for an id, with their text objects, fallbacks and
+// what was measured with them
+@(private = "file")
+close_fonts :: proc(ts: ^Text_System, id: Font_Id) {
 	stale := make([dynamic]Font_Key, context.temp_allocator)
 	for key, font in ts.fonts {
 		if key.id != id do continue
@@ -361,21 +460,11 @@ text_set_source :: proc(ts: ^Text_System, id: Font_Id, src: Font_Source) {
 		}
 	}
 
-	// Forget what was measured with them
 	for key in stale {
 		delete_key(&ts.fonts, key)
 		delete_key(&ts.char_widths, key)
 		delete_key(&ts.metrics, key)
 	}
-	clear(&ts.widths)
-	if ts.bare[id] != nil {
-		ttf.CloseFont(ts.bare[id])
-		ts.bare[id] = nil
-	}
-
-	delete(old.path)
-	old^ = src
-	old.path = strings.clone(src.path)
 }
 
 
@@ -387,14 +476,46 @@ text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 		return font
 	}
 
-	font := open_font(ts.sources[id], f32(size) * scale)
+	font := open_font(ts, ts.sources[id], f32(size) * scale)
 	if font == nil {
 		sdl.Log("opening font %d failed: %s", i32(id), sdl.GetError())
 		return nil
 	}
 	set_coverage(ts, font)
+
+	// Monospace text in whole-pixel cells
+	if id in CELL_FONTS {
+		_ = ttf.SetFontCellAdvance(font, cell_pixels(ts, size, id == .Editor ? font : nil))
+	}
+
 	ts.fonts[key] = font
 	return font
+}
+
+
+// The editor font's cell at `size`, in device pixels: the regular face's
+// advance, rounded to whole pixels. Measured on `regular` (that face, before it
+// is laid out in cells) or the face opened for it
+@(private = "file")
+cell_pixels :: proc(ts: ^Text_System, size: u16, regular: ^ttf.Font) -> f32 {
+	if px, ok := ts.cell_pixels[size]; ok {
+		return px
+	}
+
+	font := regular != nil ? regular : text_get_font(ts, .Editor, size)
+	if font == nil do return 0
+	if px, ok := ts.cell_pixels[size]; ok {
+		return px // measured while opening the regular face
+	}
+
+	// Over many characters, so fractional advances come out exact
+	SAMPLE :: "0000000000000000000000000000000000000000000000000000000000000000"
+	w, h: i32
+	_ = ttf.GetStringSize(font, SAMPLE, len(SAMPLE), &w, &h)
+	px := max(math.round(f32(w) / len(SAMPLE)), 1)
+
+	ts.cell_pixels[size] = px
+	return px
 }
 
 
@@ -414,7 +535,7 @@ ensure_fallbacks :: proc(ts: ^Text_System, font: ^ttf.Font, s: string) {
 		list := make([dynamic]^ttf.Font, 0, len(ts.fallback_paths))
 		size := ttf.GetFontSize(font)
 		for path in ts.fallback_paths {
-			fallback := open_font({path = path}, size)
+			fallback := open_font(ts, {path = path}, size)
 			if fallback == nil do continue
 
 			set_coverage(ts, fallback)
@@ -460,7 +581,7 @@ font_has_own_glyph :: proc(ts: ^Text_System, id: Font_Id, r: rune) -> bool {
 	if r < 0x80 do return true
 
 	if ts.bare[id] == nil {
-		ts.bare[id] = open_font(ts.sources[id], 12)
+		ts.bare[id] = open_font_file(ts.sources[id], 12)
 		if ts.bare[id] == nil do return true
 	}
 	return ttf.FontHasGlyph(ts.bare[id], u32(r))
@@ -505,8 +626,9 @@ text_end_frame :: proc(ts: ^Text_System) {
 }
 
 
-// Advance width of one character of a monospace font, in logical pixels.
-// Measured over many characters so fractional advances come out exact
+// Advance width of one character of a monospace font, in logical pixels: the
+// cell for the editor font (whole device pixels), else measured over many
+// characters so fractional advances come out exact
 text_char_width :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> f32 {
 	key := Font_Key{id, size}
 	if w, ok := ts.char_widths[key]; ok {
@@ -516,10 +638,16 @@ text_char_width :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> f32 {
 	font := text_get_font(ts, id, size)
 	if font == nil do return 8
 
-	SAMPLE :: "0000000000000000000000000000000000000000000000000000000000000000"
-	w, h: i32
-	_ = ttf.GetStringSize(font, SAMPLE, len(SAMPLE), &w, &h)
-	width := f32(w) / len(SAMPLE) / scale
+	// The editor font's faces advance by whole cells
+	width: f32
+	if id in CELL_FONTS {
+		width = cell_pixels(ts, size, nil) / scale
+	} else {
+		SAMPLE :: "0000000000000000000000000000000000000000000000000000000000000000"
+		w, h: i32
+		_ = ttf.GetStringSize(font, SAMPLE, len(SAMPLE), &w, &h)
+		width = f32(w) / len(SAMPLE) / scale
+	}
 
 	ts.char_widths[key] = width
 	return width

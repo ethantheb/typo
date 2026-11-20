@@ -109,8 +109,15 @@ push_right :: proc() {
 
 // --- Buttons -----------------------------------------------------------------------
 
-// Small text button with hover feedback. Returns true when clicked
-button :: proc(id: clay.ElementId, s: string, tip := "", shortcut := "") -> bool {
+// Small text button with hover feedback. Returns true when clicked. `within`
+// is the scroll area it sits in, if any
+button :: proc(
+	id: clay.ElementId,
+	s: string,
+	tip := "",
+	shortcut := "",
+	within := clay.ElementId{},
+) -> bool {
 	if clay.UI(id)({
 		layout = {
 			padding = {left = 6, right = 6, top = 2, bottom = 2},
@@ -123,7 +130,7 @@ button :: proc(id: clay.ElementId, s: string, tip := "", shortcut := "") -> bool
 	}
 
 	if tip != "" do tooltip(id, tip, shortcut)
-	return clicked(id)
+	return clicked(id, within)
 }
 
 
@@ -376,17 +383,17 @@ modal :: proc(
 
 // A panel at `r` over a backdrop of the given color. Moving or resizing the
 // panel, or changing the backdrop color, animates (see transition). Its children
-// are laid out left to right. Pass `clip` while they may overflow it, e.g. while
-// it moves; not otherwise, since a clipping element is a Clay scroll container
-// and would take the mouse wheel from lists inside it. A `modal` backdrop takes
-// the pointer from the window behind it; otherwise the pointer passes through
-// and ui_interactive decides what may react
+// are laid out left to right, clipped to the panel as it moves. Size them to
+// `r` (fixed, not grow): Clay grows a clipping element's children to their
+// content, so a growing page would never fit the panel and its lists would
+// never scroll. A `modal` backdrop takes the pointer from the window behind it;
+// otherwise the pointer passes through and ui_interactive decides what may react
 @(deferred_none = end_modal)
 modal_at :: proc(
 	id: clay.ElementId,
 	r: gfx.Rect,
 	backdrop: clay.Color,
-	clip, modal: bool,
+	modal: bool,
 ) -> bool {
 	g.in_modal = true
 
@@ -413,7 +420,7 @@ modal_at :: proc(
 		backgroundColor = gfx.theme.panel,
 		cornerRadius = clay.CornerRadiusAll(8),
 		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
-		clip = {horizontal = clip, vertical = clip},
+		clip = {horizontal = true, vertical = true},
 		transition = transition(clay.TransitionPropertyBoundingBox),
 	})
 	return true

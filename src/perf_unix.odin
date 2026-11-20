@@ -12,6 +12,7 @@ Gpu_Counter :: struct {}
 
 attach_console :: proc() {}
 detach_console :: proc() {}
+send_window_to_back :: proc(hwnd: rawptr) {}
 
 
 process_cpu_ns :: proc() -> i64 {

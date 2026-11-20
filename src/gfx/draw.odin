@@ -40,6 +40,8 @@ begin_frame :: proc() {
 
 
 push_clip :: proc(r: sdl.Rect) {
+	flush_text()
+
 	r := r
 	if clip_depth > 0 && !sdl.GetRectIntersection(r, clip_stack[clip_depth - 1], &r) {
 		r = {} // no overlap: clip everything
@@ -54,6 +56,8 @@ push_clip :: proc(r: sdl.Rect) {
 
 
 pop_clip :: proc() {
+	flush_text()
+
 	clip_depth = max(clip_depth - 1, 0)
 
 	if clip_depth == 0 {
@@ -109,6 +113,16 @@ set_color :: proc(c: clay.Color) {
 
 // --- Shapes and text ---------------------------------------------------------------
 
+// Draws the subpixel text drawn so far: the text engine queues it to draw it
+// all in its two passes. Anything else drawn, a clip change or presenting must
+// come after this
+flush_text :: proc() {
+	if text_system.engine == nil do return
+
+	_ = ttf.FlushRendererText(text_system.engine)
+}
+
+
 draw_text :: proc(text: ^ttf.Text, x, y: f32, c: clay.Color) {
 	if text == nil do return
 
@@ -123,6 +137,7 @@ fill_rect :: proc(x, y, w, h: f32, c: clay.Color) {
 		return
 	}
 
+	flush_text()
 	set_color(c)
 	r := sdl.FRect{x, y, w, h}
 	_ = sdl.RenderFillRect(renderer, &r)
@@ -136,6 +151,8 @@ fill_rounded_rect :: proc(b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Col
 		fill_rect(b.x, b.y, b.width, b.height, c)
 		return
 	}
+
+	flush_text()
 
 	// Each corner's centre, radius and starting angle, clockwise from the top right
 	max_r := min(b.width, b.height) / 2
@@ -249,6 +266,8 @@ draw_border :: proc(
 @(private = "file")
 draw_arc :: proc(cx, cy, radius, thickness, start: f32, c: clay.Color) {
 	if thickness <= 0 do return
+
+	flush_text()
 
 	inner := max(radius - thickness, 0)
 	fc := to_fcolor(c)

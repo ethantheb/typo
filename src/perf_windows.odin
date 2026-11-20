@@ -90,6 +90,16 @@ detach_console :: proc() {
 }
 
 
+// Puts the perf suite's window behind the others, without focusing it, so it
+// runs while the user works in front of it
+send_window_to_back :: proc(hwnd: rawptr) {
+	if hwnd == nil do return
+
+	flags := u32(win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOACTIVATE)
+	_ = win.SetWindowPos(win.HWND(hwnd), win.HWND_BOTTOM, 0, 0, 0, 0, flags)
+}
+
+
 // CPU time (user + kernel) used by this process so far
 process_cpu_ns :: proc() -> i64 {
 	creation, exit, kernel, user: win.FILETIME

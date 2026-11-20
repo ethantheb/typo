@@ -94,6 +94,7 @@ ImageType :: enum c.int {
 	ALPHA,
 	COLOR,
 	SDF,
+	LCD, // typo's patch
 }
 
 GPUAtlasDrawSequence :: struct {
@@ -228,6 +229,12 @@ foreign lib {
 foreign lib {
 	// From typo's patch (patches/sdl_ttf.patch): 256 entries, or nil.
 	SetFontCoverageTable :: proc(font: ^Font, table: [^]u8) -> bool ---
+	// From typo's patch: subpixel order 0 (off), 1 (RGB) or 2 (BGR).
+	SetFontLCD :: proc(font: ^Font, order: c.int) -> bool ---
+	// From typo's patch: advances in whole cells of `advance` pixels, 0 = off.
+	SetFontCellAdvance :: proc(font: ^Font, advance: f32) -> bool ---
+	// From typo's patch: draws the LCD glyphs DrawRendererText queued.
+	FlushRendererText :: proc(engine: ^TextEngine) -> bool ---
 
 	GetFreeTypeVersion :: proc(major, minor, patch: ^c.int) ---
 	GetHarfBuzzVersion :: proc(major, minor, patch: ^c.int) ---

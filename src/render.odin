@@ -73,6 +73,7 @@ render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scal
 			if texture == nil do continue
 
 			dst := sdl.FRect{b.x, b.y, b.width, b.height}
+			gfx.flush_text()
 			_ = sdl.RenderTexture(gfx.renderer, texture, nil, &dst)
 		}
 	}

@@ -588,6 +588,7 @@ move_field_focus :: proc(dir: int) {
 		if f == w.server_focus do at = i
 	}
 	w.server_focus = fields[(at + dir + len(fields)) % len(fields)]
+	w.reveal = true
 }
 
 
@@ -651,12 +652,19 @@ server_page_handle_event :: proc(event: ^sdl.Event) -> bool {
 }
 
 
-// The page: back, the server's name and switch, its state, its fields, its
-// actions, and the keys
-server_page :: proc(width: f32) {
+// The page: back, the server's name and switch, then its state, fields and
+// actions (scrolling when the window is short), and the keys
+server_page :: proc(width, height: f32) {
 	w := &g.settings_window
 	row, index, found := find_row(w.server_page)
 	if !found do return
+
+	// The focused field into view, after moving to it by keys
+	list := clay.ID("ServerList")
+	if w.reveal {
+		w.reveal = false
+		scroll_into_view(list, clay.ID("ServerFieldRow", u32(w.server_focus)))
+	}
 
 	if clay.UI(clay.ID("ServerPage"))({
 		backgroundColor = gfx.theme.panel,
@@ -664,19 +672,27 @@ server_page :: proc(width: f32) {
 		cornerRadius = clay.CornerRadiusAll(8),
 		transition = transition({.OverlayColor}, enter = .Fade),
 		layout = {
-			sizing = {clay.SizingFixed(width), clay.SizingGrow()},
+			sizing = {clay.SizingFixed(width), clay.SizingFixed(height)},
 			layoutDirection = .TopToBottom,
 			padding = {left = 20, right = 20, top = 16, bottom = 14},
 			childGap = 12,
 		},
 	}) {
 		page_title(row, index)
-		page_state(row)
-
-		for field in page_fields(row.name) do field_row(row, field)
-
-		page_actions(row)
-		push_down()
+		if clay.UI(list)({
+			layout = {
+				sizing = {clay.SizingGrow(), clay.SizingGrow()},
+				layoutDirection = .TopToBottom,
+				padding = {right = SCROLLBAR_GUTTER},
+				childGap = 12,
+			},
+			clip = {vertical = true, childOffset = clay.GetScrollOffset()},
+		}) {
+			page_state(row)
+			for field in page_fields(row.name) do field_row(row, field, list)
+			page_actions(row, list)
+		}
+		list_scrollbar(list, &w.scrollbar_drag)
 		page_footer(row)
 	}
 }
@@ -744,15 +760,15 @@ state_mark :: proc(color: clay.Color) {
 
 
 // A field's name and its text: what the table sets, else what is built in,
-// dimmed. Click or Enter to edit
+// dimmed. Click or Enter to edit. `list` is the scroll area it sits in
 @(private = "file")
-field_row :: proc(row: Server_Row, field: langs.Server_Field) {
+field_row :: proc(row: Server_Row, field: langs.Server_Field, list: clay.ElementId) {
 	w := &g.settings_window
 	id := clay.ID("ServerField", u32(field))
 	editing := w.server_editing == field
 	focused := w.server_focus == field
 
-	if clicked(id) {
+	if clicked(id, list) {
 		if !editing do start_server_edit(field)
 	} else if editing && g.mouse_pressed && !pointer_in(id) {
 		finish_server_edit(commit = true) // clicking elsewhere keeps what was typed
@@ -812,9 +828,9 @@ field_placeholder :: proc(row: Server_Row, field: langs.Server_Field) -> string 
 
 
 // Install, Locate…, Restart and Log; then Reset (a changed built-in server) or
-// Remove (one the settings added)
+// Remove (one the settings added). `list` is the scroll area they sit in
 @(private = "file")
-page_actions :: proc(row: Server_Row) {
+page_actions :: proc(row: Server_Row, list: clay.ElementId) {
 	state := server_state(row)
 	running := false
 	logged := false
@@ -834,33 +850,38 @@ page_actions :: proc(row: Server_Row) {
 	}) {
 		if state.missing && can_install(row) {
 			tip := fmt.tprintf("Run %s in a terminal", row.server.install)
-			if button(clay.ID("ServerPageInstall"), "Install", tip) {
+			if button(clay.ID("ServerPageInstall"), "Install", tip, within = list) {
 				queue_server_op(.Install, row.name)
 			}
 		}
 		if row.server != nil {
 			tip := "Choose where its program is installed"
-			if button(clay.ID("ServerPageLocate"), "Locate…", tip) {
+			if button(clay.ID("ServerPageLocate"), "Locate…", tip, within = list) {
 				queue_server_op(.Locate, row.name)
 			}
 		}
 		if running {
-			if button(clay.ID("ServerRestart"), "Restart") do queue_server_op(.Restart, row.name)
+			if button(clay.ID("ServerRestart"), "Restart", within = list) {
+				queue_server_op(.Restart, row.name)
+			}
 		}
 		if logged {
-			if button(clay.ID("ServerLog"), "Log") do queue_server_op(.Show_Log, row.name)
+			if button(clay.ID("ServerLog"), "Log", within = list) {
+				queue_server_op(.Show_Log, row.name)
+			}
 		}
 		push_right()
 
 		_, builtin := langs.builtin_server(row.name)
 		switch {
 		case !builtin:
-			if button(clay.ID("ServerRemove"), "Remove server", "Del on its row") {
+			remove := clay.ID("ServerRemove")
+			if button(remove, "Remove server", "Del on its row", within = list) {
 				queue_server_op(.Remove, row.name)
 			}
 		case row.override != nil:
 			tip := "Undo the changes settings.toml makes to it"
-			if button(clay.ID("ServerReset"), "Reset to built-in", tip) {
+			if button(clay.ID("ServerReset"), "Reset to built-in", tip, within = list) {
 				queue_server_op(.Reset, row.name)
 			}
 		}
@@ -914,11 +935,4 @@ page_footer :: proc(row: Server_Row) {
 			}
 		}
 	}
-}
-
-
-// Takes up the free space in a column, pushing what follows down
-@(private = "file")
-push_down :: proc() {
-	if clay.UI()({layout = {sizing = {height = clay.SizingGrow()}}}) {}
 }

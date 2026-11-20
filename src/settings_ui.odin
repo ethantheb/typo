@@ -1,6 +1,7 @@
 package editor
 
 import "core:fmt"
+import "core:math"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
@@ -36,7 +37,7 @@ Settings_Window :: struct {
 	// `items` lists the rows shown last frame, in order
 	focus:           int,
 	items:           [dynamic]Setting_Item,
-	reveal:          bool, // scroll the focused row into view
+	reveal:          bool, // scroll the focused row (or server field) into view
 	refocus:         Maybe(Setting_Item), // focused once listed (rows above it may come or go)
 	collapse_to:     Maybe(bit_set[Section]), // clicked; applied before the next frame's rows
 
@@ -90,7 +91,7 @@ Picker_Option :: struct {
 @(private = "file")
 MISSING_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_FAMILY
 @(private = "file")
-MISSING_MD_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_MD_FAMILY
+MISSING_SANS_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_MD_FAMILY
 
 
 settings_window_toggle :: proc() {
@@ -420,7 +421,7 @@ bind_command :: proc(cmd: Command, chord: Chord) {
 
 // Scrolls a list so a row in it is visible, using last frame's layout. Returns
 // true if the row was already in view
-@(private = "file")
+@(private)
 scroll_into_view :: proc(list, row: clay.ElementId) -> bool {
 	scroll := clay.GetScrollContainerData(list)
 	r, row_ok := element_rect(row)
@@ -580,9 +581,14 @@ open_picker :: proc(x: Setting) {
 	if i, ok := gfx.theme_index(g.settings.theme); ok {
 		w.dark_themes = gfx.THEMES[i].dark
 	}
-	if x == .Font_Family || x == .Markdown_Font {
-		gfx.fonts_scan(&g.fonts, walk_files, again = true)
-	}
+	if is_font_setting(x) do gfx.fonts_scan(&g.fonts, walk_files, again = true)
+}
+
+
+// Whether a picker chooses a font family (listing the installed fonts)
+@(private = "file")
+is_font_setting :: proc(x: Setting) -> bool {
+	return x == .Font_Family || x == .Markdown_Font || x == .Ui_Font
 }
 
 
@@ -758,8 +764,8 @@ picker_options :: proc(x: Setting, filter: string) -> []Picker_Option {
 			append(&all, Picker_Option{name, name, ""})
 		}
 
-	case .Markdown_Font:
-		for name in gfx.markdown_family_names(&g.fonts) {
+	case .Markdown_Font, .Ui_Font:
+		for name in gfx.all_family_names(&g.fonts) {
 			append(&all, Picker_Option{name, name, ""})
 		}
 	}
@@ -838,17 +844,16 @@ settings_window_ui :: proc() {
 	backdrop := gfx.theme.backdrop
 	if w.picking do backdrop.a = 0 // leave the editor undimmed for previewing
 
-	// The panel moves and resizes to the new page, which fades in; it clips the
-	// page until it has arrived.
+	// The panel moves and resizes to the new page, which fades in. Pages are laid
+	// out at the panel's final size, which it clips them to while it moves.
 	// The list leaves the rest of the window usable: files can be opened and the
 	// editor scrolled to see the change on other text (see ui_interactive)
 	panel := clay.ID("Settings")
-	arrived := element_at(panel, r)
-	if modal_at(panel, r, backdrop, clip = !arrived, modal = !w.picking) {
+	if modal_at(panel, r, backdrop, modal = !w.picking) {
 		switch {
-		case w.picking:          picker_page(r.w)
-		case w.server_page != "": server_page(r.w)
-		case:                    settings_page(r.w)
+		case w.picking:          picker_page(r.w, r.h)
+		case w.server_page != "": server_page(r.w, r.h)
+		case:                    settings_page(r.w, r.h)
 		}
 	}
 
@@ -868,7 +873,7 @@ settings_window_docked :: proc() -> bool {
 settings_rect :: proc() -> gfx.Rect {
 	w := min(SETTINGS_WIDTH, f32(g.window_w) - 32)
 	h := max(f32(g.window_h) - 96, 200)
-	x := (f32(g.window_w) - w) / 2
+	x := math.floor((f32(g.window_w) - w) / 2) // modal_at places it on whole pixels
 	return {x, 48, w, h}
 }
 
@@ -883,7 +888,7 @@ picker_rect :: proc() -> gfx.Rect {
 
 
 @(private = "file")
-settings_page :: proc(width: f32) {
+settings_page :: proc(width, height: f32) {
 	w := &g.settings_window
 	reveal_focus()
 
@@ -900,7 +905,7 @@ settings_page :: proc(width: f32) {
 		cornerRadius = clay.CornerRadiusAll(8),
 		transition = transition({.OverlayColor}, enter = .Fade),
 		layout = {
-			sizing = {clay.SizingFixed(width), clay.SizingGrow()},
+			sizing = {clay.SizingFixed(width), clay.SizingFixed(height)},
 			layoutDirection = .TopToBottom,
 			padding = {left = 20, right = 20, top = 16, bottom = 14},
 			childGap = 14,
@@ -1363,7 +1368,7 @@ picker_button :: proc(x: Setting, value: string) {
 		if i, ok := gfx.theme_index(value); ok {
 			text = gfx.THEMES[i].name
 		}
-	case .Font_Family, .Markdown_Font:
+	case .Font_Family, .Markdown_Font, .Ui_Font:
 		missing = gfx.font_family_missing(&g.fonts, value)
 	}
 
@@ -1391,7 +1396,7 @@ picker_button :: proc(x: Setting, value: string) {
 
 	tip := "Choose"
 	if missing {
-		tip = x == .Markdown_Font ? MISSING_MD_FONT_TIP : MISSING_FONT_TIP
+		tip = x == .Font_Family ? MISSING_FONT_TIP : MISSING_SANS_FONT_TIP
 	}
 	tooltip(id, tip, "Enter")
 }
@@ -1528,7 +1533,7 @@ footer :: proc() {
 // --- Picker page -------------------------------------------------------------------
 
 @(private = "file")
-picker_page :: proc(width: f32) {
+picker_page :: proc(width, height: f32) {
 	w := &g.settings_window
 	x := w.picker
 	options := picker_options(x, string(w.filter[:]))
@@ -1549,7 +1554,7 @@ picker_page :: proc(width: f32) {
 		cornerRadius = clay.CornerRadiusAll(8),
 		transition = transition({.OverlayColor}, enter = .Fade),
 		layout = {
-			sizing = {clay.SizingFixed(width), clay.SizingGrow()},
+			sizing = {clay.SizingFixed(width), clay.SizingFixed(height)},
 			layoutDirection = .TopToBottom,
 			padding = {left = 12, right = 12, top = 12, bottom = 10},
 			childGap = 10,
@@ -1591,7 +1596,7 @@ picker_page :: proc(width: f32) {
 		}) {
 			for o, i in options do option_row(x, o, i, o.value == current, list)
 
-			scanning := (x == .Font_Family || x == .Markdown_Font) && !g.fonts.scanned
+			scanning := is_font_setting(x) && !g.fonts.scanned
 			note := ""
 			switch {
 			case scanning:          note = "Looking for installed fonts…"
@@ -1711,8 +1716,8 @@ option_row :: proc(
 		label(o.label, selected ? gfx.theme.text_bright : gfx.theme.text)
 
 		bundled_mono := x == .Font_Family && o.value == gfx.BUNDLED_FAMILY
-		bundled_md := x == .Markdown_Font && gfx.is_bundled_family(o.value)
-		if bundled_mono || bundled_md {
+		bundled_sans := (x == .Markdown_Font || x == .Ui_Font) && gfx.is_bundled_family(o.value)
+		if bundled_mono || bundled_sans {
 			push_right()
 			label("bundled", gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}

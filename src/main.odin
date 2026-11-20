@@ -62,6 +62,7 @@ App :: struct {
 	settings_window: Settings_Window,
 	in_modal:        bool, // building a popup's UI (see ui_interactive)
 	animating:       bool, // a Clay transition was unfinished at the end of the last layout
+	measure_stale:   bool, // the interface font changed: Clay's measurements are reset next frame
 	tooltip:         Tooltip_State,
 	pending:         Action,
 	open_heading:    string, // owned; where the caret goes in the file `pending` opens
@@ -121,6 +122,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	_ = sdl.SetAppMetadata("typo", "0.1", "dev.typo")
 	// Without this, the click that focuses the window is swallowed
 	_ = sdl.SetHint(sdl.HINT_MOUSE_FOCUS_CLICKTHROUGH, "1")
+	// The perf suite's window doesn't take the keys from what the user is doing
+	if args.perf do _ = sdl.SetHint(sdl.HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0")
 	if !sdl.Init({.VIDEO}) {
 		sdl.Log("SDL_Init failed: %s", sdl.GetError())
 		return .FAILURE
@@ -261,6 +264,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	// Update
 	settings_poll(&g.settings)
 	if gfx.fonts_poll(&g.fonts) {
+		apply_ui_font()
 		apply_editor_font()
 		apply_markdown_font()
 	}
@@ -281,6 +285,12 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	g.wake_frames = max(g.wake_frames - 1, 0)
 	g.sleeping = g.wake_frames == 0 && !needs_continuous_frames()
 
+	// Clay's text measurements, outside any layout, once the interface font changed
+	if g.measure_stale {
+		clay.ResetMeasureTextCache()
+		g.measure_stale = false
+	}
+
 	// Layout
 	tooltip_begin_frame()
 	commands := build_ui()
@@ -293,11 +303,13 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	_ = sdl.SetRenderDrawColor(gfx.renderer, u8(bg.r), u8(bg.g), u8(bg.b), 255)
 	_ = sdl.RenderClear(gfx.renderer)
 	render_clay_commands(&commands, gfx.scale)
+	gfx.flush_text()
 	if g.perf != nil do perf_mark(.Render)
 	_ = sdl.RenderPresent(gfx.renderer)
 	if !g.window_shown && panes_ready() {
 		_ = sdl.ShowWindow(g.window)
 		g.window_shown = true
+		if g.perf != nil do send_window_to_back(window_handle())
 	}
 	if g.perf != nil do perf_mark(.Present)
 
@@ -327,6 +339,7 @@ needs_continuous_frames :: proc() -> bool {
 	     g.settings.show_fps, // measure the real frame rate
 	     tooltip_pending(),
 	     g.animating,
+	     g.measure_stale,
 	     g.perf != nil && perf_running():
 		return true
 	}
@@ -352,12 +365,13 @@ wake_main_loop :: proc "contextless" (userdata: rawptr) {
 app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 	context = g.ctx
 
-	// The performance suite drives the app itself; real input would disturb it
-	// and wake the idle phases
+	// The performance suite drives the app itself. Anything else, such as input,
+	// the user covering its window or another app's clipboard change, would
+	// disturb it and wake the idle phases
 	if g.perf != nil {
 		#partial switch event.type {
-		case .KEY_DOWN, .KEY_UP, .TEXT_INPUT,
-		     .MOUSE_MOTION, .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP, .MOUSE_WHEEL:
+		case .QUIT, .USER, .WINDOW_DISPLAY_SCALE_CHANGED:
+		case:
 			return .CONTINUE
 		}
 	}
@@ -542,6 +556,14 @@ ICON_PNGS := [?][]u8 {
 	#load("../assets/icon/typo-192.png"),
 	#load("../assets/icon/typo-32.png"),
 	#load("../assets/icon/typo-16.png"),
+}
+
+
+// The window's native handle on Windows, else nil
+@(private = "file")
+window_handle :: proc() -> rawptr {
+	props := sdl.GetWindowProperties(g.window)
+	return sdl.GetPointerProperty(props, sdl.PROP_WINDOW_WIN32_HWND_POINTER, nil)
 }
 
 

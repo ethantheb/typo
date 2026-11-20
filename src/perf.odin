@@ -1,6 +1,7 @@
 package editor
 
 import "core:fmt"
+import "core:math"
 import "core:math/rand"
 import "core:os"
 import "core:slice"
@@ -16,6 +17,7 @@ import "syntax"
 import "term"
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
+import ttf "../vendor/sdl3/ttf"
 import "gfx"
 import "textedit"
 import "mdview"
@@ -88,6 +90,7 @@ Phase :: struct {
 PHASES := [?]Phase {
 	{name = "startup", step = phase_startup},
 	{name = "fonts", step = phase_fonts},
+	{name = "text in cells and subpixels", step = phase_text_rendering},
 	{name = "generate test files", step = phase_generate},
 	{name = "buffer (64 MB)", step = phase_buffer},
 	{name = "syntax", step = phase_syntax},
@@ -126,6 +129,7 @@ PHASES := [?]Phase {
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
+	{name = "settings scrolling at any size", step = phase_settings_scrolls},
 	{name = "settings sections collapsing", step = phase_settings_collapse, frame_limit = 8},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
@@ -407,6 +411,165 @@ phase_fonts :: proc(p: ^Perf, frame: int) -> bool {
 	_ = gfx.text_get(&gfx.text_system, font, "→ ✓ 漢字")
 	result(p, "first text needing fallback fonts", ms_since(t), "ms")
 	return true
+}
+
+
+// The editor font in whole-pixel cells, and subpixel (LCD) text drawn and read
+// back from the window, with the real fonts and renderer
+@(private = "file")
+phase_text_rendering :: proc(p: ^Perf, frame: int) -> bool {
+	ts := &gfx.text_system
+
+	// A size the bundled font's advance has a fraction at (7.8 pixels at 1x)
+	size := u16(13)
+
+	// Columns on whole device pixels, at this size and the editor's (with its
+	// letter spacing), for every face. Widths of strings that start and end
+	// alike differ by exactly the columns between
+	cell := gfx.text_char_width(ts, .Editor, size) * gfx.scale
+	column := editor_char_width() * gfx.scale
+	whole := is_whole(cell) && is_whole(column)
+	check(p, "the editor font's columns are whole pixels", whole)
+
+	regular := gfx.text_get_font(ts, .Editor, size)
+	bold := gfx.text_get_font(ts, .Editor_Bold, size)
+	italic := gfx.text_get_font(ts, .Editor_Italic, size)
+	SAMPLE :: "0Wil_x.m0"
+	cells := f32(len(SAMPLE) - 1) * cell
+	check(p, "a run's glyphs advance by whole columns", columns_width(regular, SAMPLE) == cells)
+	faces_keep := columns_width(bold, SAMPLE) == cells && columns_width(italic, SAMPLE) == cells
+	check(p, "bold and italic keep the columns", faces_keep)
+
+	// Subpixel text has colored edges, grayscale text gray ones; faded out,
+	// subpixel text leaves the background as it was, and half faded it stays
+	// between the background and its color, dimmer than unfaded
+	setting := ts.antialiasing
+	gfx.text_set_antialiasing(ts, .Subpixel)
+	lcd := read_ink(INK_TEXT, 255)
+	faded := read_ink(INK_TEXT, 0)
+	half := read_ink(INK_TEXT, 128)
+	lines := read_ink(INK_LINES, 255)
+	long_ms := long_line_ms()
+	gfx.text_set_antialiasing(ts, .Grayscale)
+	gray := read_ink(INK_TEXT, 255)
+	gfx.text_set_antialiasing(ts, setting)
+
+	check(p, "subpixel text is drawn, with colored edges", lcd.pixels > 0 && lcd.spread > 40)
+	check(p, "grayscale text is drawn in gray", gray.pixels > 0 && gray.spread <= 2)
+	check(p, "faded subpixel text draws nothing", faded.pixels == 0)
+
+	between := half.darkest >= int(INK_BG.r) && half.brightest <= int(INK_COLOR.r)
+	dimmer := half.pixels > 0 && half.brightest < lcd.brightest
+	check(p, "half faded subpixel text blends", between && dimmer)
+
+	// Box drawing glyphs reach into the next cell; where they overlap they
+	// must not add up past their color
+	no_brighter := lines.pixels > 0 && lines.brightest <= int(INK_COLOR.r)
+	check(p, "overlapping subpixel glyphs stay their color", no_brighter)
+
+	result(p, "a long line past the window's edge", long_ms, "ms", 10)
+	return true
+}
+
+
+// Milliseconds to draw one subpixel line of 20,000 characters, almost all of
+// it past the window's right edge (as a long line in a rendered code block is)
+@(private = "file")
+long_line_ms :: proc() -> f64 {
+	ts := &gfx.text_system
+	font := gfx.text_get_font(ts, .Editor, 15)
+	s := strings.repeat("abcdefghij", 2000, context.temp_allocator)
+	text := gfx.text_get(ts, font, s)
+
+	// Laid out and its glyphs rendered before timing
+	gfx.draw_text(text, 4, 4, INK_COLOR)
+	gfx.flush_text()
+
+	start := time.tick_now()
+	gfx.draw_text(text, 4, 4, INK_COLOR)
+	gfx.flush_text()
+	return time.duration_milliseconds(time.tick_since(start))
+}
+
+
+// Whether a width in pixels is whole, give or take float rounding
+@(private = "file")
+is_whole :: proc(px: f32) -> bool {
+	return abs(px - math.round(px)) < 0.001
+}
+
+
+// Width of `s` beyond that of its first character, in pixels: the advances of
+// all but the last character when s starts and ends with the same one
+@(private = "file")
+columns_width :: proc(font: ^ttf.Font, s: string) -> f32 {
+	w, h, first_w: i32
+	_ = ttf.GetStringSize(font, cstring(raw_data(s)), uint(len(s)), &w, &h)
+	_ = ttf.GetStringSize(font, cstring(raw_data(s)), 1, &first_w, &h)
+	return f32(w - first_w)
+}
+
+
+// What drawing text changed on its background
+@(private = "file")
+Ink :: struct {
+	pixels:    int, // unlike the background
+	spread:    int, // the largest difference between a pixel's red and blue
+	brightest: int, // the largest channel of any pixel
+	darkest:   int, // the smallest channel of any pixel
+}
+
+
+// Text for read_ink: letters, and a line of box drawing glyphs, light on gray
+@(private = "file")
+INK_TEXT :: "llll iiii wwww // Fonts"
+@(private = "file")
+INK_LINES :: "────────────────────"
+@(private = "file")
+INK_COLOR :: clay.Color{230, 230, 230, 255}
+@(private = "file")
+INK_BG :: clay.Color{60, 60, 60, 255}
+
+
+// Draws a line of text with the given alpha on the background and reads back
+// what it changed
+@(private = "file")
+read_ink :: proc(s: string, alpha: f32) -> (ink: Ink) {
+	ts := &gfx.text_system
+	area := sdl.Rect{0, 0, 300, 60}
+	ink.darkest = 255
+
+	// Drawn on the window, before this frame clears it
+	gfx.fill_rect(0, 0, f32(area.w), f32(area.h), INK_BG)
+	font := gfx.text_get_font(ts, .Editor, 15)
+	text := gfx.text_get(ts, font, s)
+	color := INK_COLOR
+	color.a = alpha
+	gfx.draw_text(text, 4, 4, color)
+	gfx.flush_text()
+
+	read := sdl.RenderReadPixels(gfx.renderer, &area)
+	if read == nil do return
+	defer sdl.DestroySurface(read)
+
+	rgba := sdl.ConvertSurface(read, .RGBA32)
+	if rgba == nil do return
+	defer sdl.DestroySurface(rgba)
+
+	pixels := ([^]u8)(rgba.pixels)
+	for y in 0 ..< int(rgba.h) {
+		for x in 0 ..< int(rgba.w) {
+			px := pixels[y * int(rgba.pitch) + x * 4:]
+			r, g, b := int(px[0]), int(px[1]), int(px[2])
+			if r != int(INK_BG.r) || g != int(INK_BG.g) || b != int(INK_BG.b) {
+				ink.pixels += 1
+			}
+			ink.spread = max(ink.spread, abs(r - b))
+			ink.brightest = max(ink.brightest, r, g, b)
+			ink.darkest = min(ink.darkest, r, g, b)
+		}
+	}
+	return
 }
 
 
@@ -1071,6 +1234,157 @@ phase_settings :: proc(p: ^Perf, frame: int) -> bool {
 		return true
 	}
 	return false
+}
+
+
+// A window short enough that a language server's page has to scroll
+@(private = "file")
+SHORT_WINDOW_H :: 420
+
+
+// The settings window's pages fit its panel and scroll: the list at an odd
+// window width, while the panel moves back from the theme picker, and at a new
+// window size; a language server's page in a short window
+@(private = "file")
+phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) moving_frames: int
+	@(static) moving_ok: int
+	@(static) last_panel: gfx.Rect
+	if frame == 0 {
+		_ = sdl.GetWindowSize(g.window, &p.window_size.x, &p.window_size.y)
+		resize_for_check({p.window_size.x | 1, p.window_size.y})
+		step = 1
+		p.mark_frame = frame
+		moving_frames = 0
+		moving_ok = 0
+		return false
+	}
+	waited := frame - p.mark_frame
+	panel, _ := element_rect(clay.ID("Settings"))
+	panel_moved := panel != last_panel
+	last_panel = panel
+
+	switch step {
+	case 1: // the window at its odd width: open the settings
+		if !resized_for_check(p, waited) do return false
+
+		settings_window_toggle()
+		next_step(p, &step, frame)
+
+	case 2: // open: the theme's picker
+		if (g.animating || waited < 2) && waited < 600 {
+			return false
+		}
+
+		fits, more := list_scrolls(clay.ID("SettingsList"))
+		check(p, "the settings list fits and scrolls", fits && more)
+		focus_item(Setting.Theme)
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 3: // the picker shown: back to the list
+		if (g.animating || waited < 2) && waited < 600 {
+			return false
+		}
+
+		press(sdl.K_ESCAPE)
+		next_step(p, &step, frame)
+
+	case 4: // the panel moving back, then there: make the window shorter
+		if waited < 2 do return false // the list's first layout
+		if panel_moved && waited < 600 {
+			// The panel grows into the list, laid out at its final size
+			_, more := list_scrolls(clay.ID("SettingsList"))
+			moving_frames += 1
+			if more do moving_ok += 1
+			return false
+		}
+		if g.animating && waited < 600 {
+			return false
+		}
+
+		moving := moving_frames > 0 && moving_ok == moving_frames
+		check(p, "it scrolls while the panel moves", moving)
+		resize_for_check({p.window_size.x | 1, p.window_size.y - 100})
+		next_step(p, &step, frame)
+
+	case 5: // the new size: a server's page in a short window
+		if !resized_for_check(p, waited) do return false
+		if waited < 3 do return false
+
+		fits, more := list_scrolls(clay.ID("SettingsList"))
+		check(p, "and at a new size", fits && more)
+		resize_for_check({p.window_size.x, SHORT_WINDOW_H})
+		next_step(p, &step, frame)
+
+	case 6: // short: open a server's page
+		if !resized_for_check(p, waited) do return false
+		if waited < 3 do return false
+
+		focus_item(Server_Item(server_row_index("clangd")))
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 7: // its fields scroll, the footer stays in the panel
+		if (g.animating || waited < 3) && waited < 600 {
+			return false
+		}
+
+		fits, more := list_scrolls(clay.ID("ServerList"))
+		check(p, "a server's page fits and scrolls", fits && more)
+
+		press(sdl.K_ESCAPE)
+		settings_window_toggle()
+		_ = sdl.SetWindowSize(g.window, p.window_size.x, p.window_size.y)
+		return true
+	}
+	return false
+}
+
+
+// The window size resize_for_check last asked for
+@(private = "file")
+wanted_size: [2]i32
+
+
+// Asks for a window size for a check (applied on a later frame)
+@(private = "file")
+resize_for_check :: proc(size: [2]i32) {
+	wanted_size = size
+	_ = sdl.SetWindowSize(g.window, size.x, size.y)
+}
+
+
+// Whether the window has the size last asked for; after waiting long enough,
+// fails a check saying it never got it
+@(private = "file")
+resized_for_check :: proc(p: ^Perf, waited: int) -> bool {
+	size := wanted_size
+	if g.window_w == size.x && g.window_h == size.y {
+		return true
+	}
+	if waited < 600 do return false
+
+	check(p, fmt.tprintf("the window resized to %dx%d", size.x, size.y), false)
+	return true
+}
+
+
+// Whether a list in a settings page, in last frame's layout, fits the panel,
+// and has more rows than it shows (so it has a scroll bar)
+@(private = "file")
+list_scrolls :: proc(list: clay.ElementId) -> (fits, more: bool) {
+	data := clay.GetScrollContainerData(list)
+	r, list_ok := element_rect(list)
+	panel, panel_ok := element_rect(clay.ID("Settings"))
+	if !data.found || !list_ok || !panel_ok {
+		return
+	}
+
+	fits = r.y + r.h <= panel.y + panel.h + 0.5
+	more = data.contentDimensions.height > data.scrollContainerDimensions.height
+	return
 }
 
 

@@ -145,6 +145,7 @@ draw_line :: proc(
 		img := get_image(string(L.strings[box.path[0]:box.path[1]]))
 		if img.state == .Ready {
 			dst := sdl.FRect{r.x, r.y, r.width, r.height}
+			gfx.flush_text()
 			_ = sdl.RenderTexture(gfx.renderer, img.texture, nil, &dst)
 			continue
 		}

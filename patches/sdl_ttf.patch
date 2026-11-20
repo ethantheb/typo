@@ -1,8 +1,16 @@
 diff --git a/include/SDL3_ttf/SDL_ttf.h b/include/SDL3_ttf/SDL_ttf.h
-index b723bc7..10f6093 100644
+index b723bc7..c1afe06 100644
 --- a/include/SDL3_ttf/SDL_ttf.h
 +++ b/include/SDL3_ttf/SDL_ttf.h
-@@ -1142,6 +1142,15 @@ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImage(TTF_Font *font, Uint
+@@ -1103,6 +1103,7 @@ typedef enum TTF_ImageType
+     TTF_IMAGE_ALPHA,    /**< The color channels are white */
+     TTF_IMAGE_COLOR,    /**< The color channels have image data */
+     TTF_IMAGE_SDF,      /**< The alpha channel has signed distance field information */
++    TTF_IMAGE_LCD,      /**< The color channels are each subpixel's coverage (typo's patch) */
+ } TTF_ImageType;
+ 
+ /**
+@@ -1142,6 +1143,37 @@ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImage(TTF_Font *font, Uint
   */
  extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_ImageType *image_type);
  
@@ -15,14 +23,504 @@ index b723bc7..10f6093 100644
 + */
 +extern SDL_DECLSPEC bool SDLCALL TTF_SetFontCoverageTable(TTF_Font *font, const Uint8 *table);
 +
++/**
++ * Render a font's glyphs for an LCD's subpixels (each color channel its own
++ * coverage, TTF_IMAGE_LCD), with the subpixels in the given order: 0 (off,
++ * grayscale), 1 (RGB) or 2 (BGR). Color glyphs stay color. The renderer text
++ * engine draws such glyphs in two passes with custom blend modes, onto an
++ * opaque target, queued until TTF_FlushRendererText. Set it before drawing
++ * text with the font.
++ *
++ * (Added by typo's patch.)
++ */
++extern SDL_DECLSPEC bool SDLCALL TTF_SetFontLCD(TTF_Font *font, int order);
++
++/**
++ * Lay out a font's glyphs in cells of `advance` pixels: each glyph advances by
++ * its own advance rounded to a whole number of cells (0 for marks, 2 for wide
++ * glyphs). 0 turns it off. For monospace fonts, so that every glyph lands at
++ * the same subpixel phase when `advance` is whole.
++ *
++ * (Added by typo's patch.)
++ */
++extern SDL_DECLSPEC bool SDLCALL TTF_SetFontCellAdvance(TTF_Font *font, float advance);
++
  /**
   * Query the metrics (dimensions) of a font's glyph for a UNICODE codepoint.
   *
+@@ -1861,6 +1893,15 @@ extern SDL_DECLSPEC TTF_TextEngine * SDLCALL TTF_CreateRendererTextEngineWithPro
+  */
+ extern SDL_DECLSPEC bool SDLCALL TTF_DrawRendererText(TTF_Text *text, float x, float y);
+ 
++/**
++ * Draw the LCD glyphs (see TTF_SetFontLCD) that TTF_DrawRendererText queued.
++ * Call it before drawing anything else, changing the clip rectangle or
++ * presenting, so the glyphs stay in order with the rest.
++ *
++ * (Added by typo's patch.)
++ */
++extern SDL_DECLSPEC bool SDLCALL TTF_FlushRendererText(TTF_TextEngine *engine);
++
+ /**
+  * Destroy a text engine created for drawing text on an SDL renderer.
+  *
+diff --git a/src/SDL_renderer_textengine.c b/src/SDL_renderer_textengine.c
+index d8c0c6d..b235c10 100644
+--- a/src/SDL_renderer_textengine.c
++++ b/src/SDL_renderer_textengine.c
+@@ -85,14 +85,58 @@ typedef struct TTF_RendererTextEngineFontData
+     SDL_HashTable *glyphs;
+ } TTF_RendererTextEngineFontData;
+ 
++// The most layers an LCD batch splits its glyphs into (see LCDLayerFor)
++#define LCD_MAX_LAYERS 32
++
++// The size of the tiles an LCD batch files its rects under, in pixels
++#define LCD_TILE_SIZE 32
++
++// A rect filed under a tile of the LCD batch's grid
++typedef struct LCDTileEntry
++{
++    int rect;
++    int tile;
++    int next;  // the tile's entry filed before it, -1 for none
++} LCDTileEntry;
++
++// LCD glyphs waiting to be drawn, all from one atlas texture, so that each pass draws them
++// together (see TTF_FlushRendererText). Glyphs that overlap are in different layers, each
++// layer drawn in its two passes after the one before. (Added by typo's patch.)
++typedef struct LCDBatch
++{
++    SDL_Texture *texture;
++    int num_rects;
++    int max_rects;
++    float *positions;      // 8 per rect
++    float *texcoords;      // 8 per rect
++    SDL_FColor *coverage;  // 4 per rect: the text's alpha
++    SDL_FColor *ink;       // 4 per rect: the text's color, premultiplied
++    SDL_FColor *color;     // 4 per rect: the text's color
++    int *indices;          // 6 per rect
++    int *sorted;           // 6 per rect: the indices by layer, while flushing
++    Uint8 *layers;         // 1 per rect
++    int num_layers;
++
++    // The rects by place, to find the ones a new rect overlaps
++    int target_w, target_h;  // the render target the grid covers, in pixels
++    int grid_w, grid_h;
++    int *grid;             // grid_w * grid_h: each tile's last entry, -1 for none
++    LCDTileEntry *entries;
++    int num_entries;
++    int max_entries;
++} LCDBatch;
++
+ typedef struct TTF_RendererTextEngineData
+ {
+     SDL_Renderer *renderer;
+     SDL_HashTable *fonts;
+     AtlasTexture *atlas;
+     int atlas_texture_size;
++    LCDBatch lcd;
+ } TTF_RendererTextEngineData;
+ 
++static void FlushLCDBatch(TTF_RendererTextEngineData *data);
++
+ 
+ static int SDLCALL SortMissing(void *userdata, const void *a, const void *b)
+ {
+@@ -434,6 +478,9 @@ static bool CreateMissingGlyphs(TTF_RendererTextEngineData *enginedata, TTF_Rend
+     bool result = false;
+     int atlas_texture_size = enginedata->atlas_texture_size;
+ 
++    // Queued LCD glyphs first: new glyphs can take the place of released ones
++    FlushLCDBatch(enginedata);
++
+     // Build a list of missing glyphs
+     missing = (stbrp_rect *)SDL_calloc(num_missing, sizeof(*missing));
+     if (!missing) {
+@@ -783,6 +830,17 @@ static void DestroyEngineData(TTF_RendererTextEngineData *data)
+         next = atlas->next;
+         DestroyAtlas(atlas);
+     }
++
++    SDL_free(data->lcd.positions);
++    SDL_free(data->lcd.texcoords);
++    SDL_free(data->lcd.coverage);
++    SDL_free(data->lcd.ink);
++    SDL_free(data->lcd.color);
++    SDL_free(data->lcd.indices);
++    SDL_free(data->lcd.sorted);
++    SDL_free(data->lcd.layers);
++    SDL_free(data->lcd.grid);
++    SDL_free(data->lcd.entries);
+     SDL_free(data);
+ }
+ 
+@@ -897,6 +955,320 @@ TTF_TextEngine *TTF_CreateRendererTextEngineWithProperties(SDL_PropertiesID prop
+     return engine;
+ }
+ 
++static void RenderSequence(SDL_Renderer *renderer, AtlasDrawSequence *sequence, const SDL_FColor *color)
++{
++    SDL_RenderGeometryRaw(renderer,
++                          sequence->texture,
++                          sequence->positions, 2 * sizeof(float),
++                          color, 0,
++                          sequence->texcoords, 2 * sizeof(float),
++                          sequence->num_rects * 4,
++                          sequence->indices, sequence->num_rects * 6, sizeof(*sequence->indices));
++}
++
++// Room for `more` rects in the LCD batch
++static bool GrowLCDBatch(LCDBatch *batch, int more)
++{
++    const int needed = batch->num_rects + more;
++    if (needed <= batch->max_rects) {
++        return true;
++    }
++
++    const int max_rects = SDL_max(needed, SDL_max(256, batch->max_rects * 2));
++    float *positions = (float *)SDL_realloc(batch->positions, max_rects * 8 * sizeof(float));
++    if (positions) {
++        batch->positions = positions;
++    }
++    float *texcoords = (float *)SDL_realloc(batch->texcoords, max_rects * 8 * sizeof(float));
++    if (texcoords) {
++        batch->texcoords = texcoords;
++    }
++    SDL_FColor *coverage = (SDL_FColor *)SDL_realloc(batch->coverage, max_rects * 4 * sizeof(SDL_FColor));
++    if (coverage) {
++        batch->coverage = coverage;
++    }
++    SDL_FColor *ink = (SDL_FColor *)SDL_realloc(batch->ink, max_rects * 4 * sizeof(SDL_FColor));
++    if (ink) {
++        batch->ink = ink;
++    }
++    SDL_FColor *color = (SDL_FColor *)SDL_realloc(batch->color, max_rects * 4 * sizeof(SDL_FColor));
++    if (color) {
++        batch->color = color;
++    }
++    int *indices = (int *)SDL_realloc(batch->indices, max_rects * 6 * sizeof(int));
++    if (indices) {
++        batch->indices = indices;
++    }
++    int *sorted = (int *)SDL_realloc(batch->sorted, max_rects * 6 * sizeof(int));
++    if (sorted) {
++        batch->sorted = sorted;
++    }
++    Uint8 *layers = (Uint8 *)SDL_realloc(batch->layers, max_rects * sizeof(Uint8));
++    if (layers) {
++        batch->layers = layers;
++    }
++    if (!positions || !texcoords || !coverage || !ink || !color || !indices || !sorted || !layers) {
++        return false;
++    }
++
++    batch->max_rects = max_rects;
++    return true;
++}
++
++// Sizes the LCD batch's grid to cover the render target, all tiles empty. Called while the
++// batch is empty. Rects partly outside the target are filed under its edge tiles.
++static bool ResetLCDGrid(TTF_RendererTextEngineData *data)
++{
++    LCDBatch *batch = &data->lcd;
++    int w = 0, h = 0;
++    SDL_GetCurrentRenderOutputSize(data->renderer, &w, &h);
++    batch->target_w = w;
++    batch->target_h = h;
++    const int grid_w = SDL_max((w + LCD_TILE_SIZE - 1) / LCD_TILE_SIZE, 1);
++    const int grid_h = SDL_max((h + LCD_TILE_SIZE - 1) / LCD_TILE_SIZE, 1);
++    if (batch->grid && grid_w == batch->grid_w && grid_h == batch->grid_h) {
++        return true;
++    }
++
++    int *grid = (int *)SDL_realloc(batch->grid, grid_w * grid_h * sizeof(int));
++    if (!grid) {
++        return false;
++    }
++    for (int i = 0; i < grid_w * grid_h; ++i) {
++        grid[i] = -1;
++    }
++    batch->grid = grid;
++    batch->grid_w = grid_w;
++    batch->grid_h = grid_h;
++    return true;
++}
++
++// A queued rect's box
++static void LCDRectBox(const LCDBatch *batch, int rect, float box[4])
++{
++    const float *p = batch->positions + rect * 8;
++    box[0] = p[0];  // left
++    box[1] = p[1];  // top
++    box[2] = p[4];  // right
++    box[3] = p[5];  // bottom
++}
++
++// The lowest layer of the LCD batch with no rect that overlaps `rect`, which is then filed
++// under the tiles it covers. Overlapping glyphs drawn in one pass would darken the target
++// and add their color twice where they overlap; in separate layers they compose as if
++// drawn one after the other, which for the same color is the same in either order. Where
++// glyphs of different colors overlap, a later one can be drawn first.
++static int LCDLayerFor(LCDBatch *batch, int rect)
++{
++    float box[4];
++    LCDRectBox(batch, rect, box);
++
++    // Wholly outside the target: nothing it overlaps can show (a long line's glyphs past
++    // the edge would otherwise pile up in the edge tiles)
++    const bool outside = box[2] <= 0.0f || box[3] <= 0.0f ||
++                         box[0] >= (float)batch->target_w || box[1] >= (float)batch->target_h;
++    if (outside) {
++        return 0;
++    }
++
++    const int tx0 = SDL_clamp((int)SDL_floorf(box[0] / LCD_TILE_SIZE), 0, batch->grid_w - 1);
++    const int ty0 = SDL_clamp((int)SDL_floorf(box[1] / LCD_TILE_SIZE), 0, batch->grid_h - 1);
++    const int tx1 = SDL_clamp((int)SDL_floorf(box[2] / LCD_TILE_SIZE), 0, batch->grid_w - 1);
++    const int ty1 = SDL_clamp((int)SDL_floorf(box[3] / LCD_TILE_SIZE), 0, batch->grid_h - 1);
++
++    // The layers of the rects it overlaps
++    Uint32 taken = 0;
++    for (int ty = ty0; ty <= ty1; ++ty) {
++        for (int tx = tx0; tx <= tx1; ++tx) {
++            for (int e = batch->grid[ty * batch->grid_w + tx]; e >= 0; e = batch->entries[e].next) {
++                float other[4];
++                LCDRectBox(batch, batch->entries[e].rect, other);
++                const bool overlaps = box[0] < other[2] && other[0] < box[2] &&
++                                      box[1] < other[3] && other[1] < box[3];
++                if (overlaps) {
++                    taken |= 1u << batch->layers[batch->entries[e].rect];
++                }
++            }
++        }
++    }
++
++    // The lowest free one (the last if all are taken: a pile of glyphs in one place)
++    int layer = 0;
++    while (layer < LCD_MAX_LAYERS - 1 && (taken & (1u << layer))) {
++        ++layer;
++    }
++
++    // Filed under its tiles
++    const int needed = batch->num_entries + (tx1 - tx0 + 1) * (ty1 - ty0 + 1);
++    if (needed > batch->max_entries) {
++        const int max_entries = SDL_max(needed, SDL_max(512, batch->max_entries * 2));
++        LCDTileEntry *entries = (LCDTileEntry *)SDL_realloc(batch->entries, max_entries * sizeof(LCDTileEntry));
++        if (!entries) {
++            return layer;
++        }
++        batch->entries = entries;
++        batch->max_entries = max_entries;
++    }
++    for (int ty = ty0; ty <= ty1; ++ty) {
++        for (int tx = tx0; tx <= tx1; ++tx) {
++            const int tile = ty * batch->grid_w + tx;
++            LCDTileEntry *entry = &batch->entries[batch->num_entries];
++            entry->rect = rect;
++            entry->tile = tile;
++            entry->next = batch->grid[tile];
++            batch->grid[tile] = batch->num_entries++;
++        }
++    }
++    return layer;
++}
++
++// Queues a sequence of LCD glyphs, placed (its positions filled in), in the text's color
++static void QueueLCDSequence(TTF_RendererTextEngineData *data, AtlasDrawSequence *sequence, const SDL_FColor *color)
++{
++    LCDBatch *batch = &data->lcd;
++    if (batch->texture != sequence->texture) {
++        FlushLCDBatch(data);
++        batch->texture = sequence->texture;
++    }
++    if (batch->num_rects == 0 && !ResetLCDGrid(data)) {
++        RenderSequence(data->renderer, sequence, color);
++        return;
++    }
++    if (!GrowLCDBatch(batch, sequence->num_rects)) {
++        RenderSequence(data->renderer, sequence, color);
++        return;
++    }
++
++    const int first = batch->num_rects;
++    const int count = sequence->num_rects;
++    SDL_memcpy(batch->positions + first * 8, sequence->positions, count * 8 * sizeof(float));
++    SDL_memcpy(batch->texcoords + first * 8, sequence->texcoords, count * 8 * sizeof(float));
++
++    const SDL_FColor coverage = { color->a, color->a, color->a, color->a };
++    const SDL_FColor ink = { color->r * color->a, color->g * color->a, color->b * color->a, color->a };
++    for (int i = first * 4; i < (first + count) * 4; ++i) {
++        batch->coverage[i] = coverage;
++        batch->ink[i] = ink;
++        batch->color[i] = *color;
++    }
++
++    static const Uint8 rect_index_order[] = { 0, 1, 2, 0, 2, 3 };
++    int *indices = batch->indices + first * 6;
++    for (int i = first; i < first + count; ++i) {
++        for (int k = 0; k < 6; ++k) {
++            *indices++ = i * 4 + rect_index_order[k];
++        }
++    }
++    for (int i = first; i < first + count; ++i) {
++        const int layer = LCDLayerFor(batch, i);
++        batch->layers[i] = (Uint8)layer;
++        batch->num_layers = SDL_max(batch->num_layers, layer + 1);
++    }
++    batch->num_rects += count;
++}
++
++// Draws the queued rects whose indices are `indices` (`num_indices` of them) in `colors`
++static void RenderLCDBatch(TTF_RendererTextEngineData *data, const SDL_FColor *colors, const int *indices, int num_indices)
++{
++    LCDBatch *batch = &data->lcd;
++    SDL_RenderGeometryRaw(data->renderer,
++                          batch->texture,
++                          batch->positions, 2 * sizeof(float),
++                          colors, sizeof(SDL_FColor),
++                          batch->texcoords, 2 * sizeof(float),
++                          batch->num_rects * 4,
++                          indices, num_indices, sizeof(*indices));
++}
++
++// Fills the batch's sorted indices with its rects' indices by layer; `starts` gets where
++// each layer's begin, and one past the last
++static void SortLCDBatch(LCDBatch *batch, int starts[LCD_MAX_LAYERS + 1])
++{
++    int counts[LCD_MAX_LAYERS] = { 0 };
++    for (int i = 0; i < batch->num_rects; ++i) {
++        counts[batch->layers[i]] += 6;
++    }
++
++    starts[0] = 0;
++    for (int layer = 0; layer < LCD_MAX_LAYERS; ++layer) {
++        starts[layer + 1] = starts[layer] + counts[layer];
++    }
++
++    int next[LCD_MAX_LAYERS];
++    SDL_memcpy(next, starts, sizeof(next));
++    for (int i = 0; i < batch->num_rects; ++i) {
++        SDL_memcpy(batch->sorted + next[batch->layers[i]], batch->indices + i * 6, 6 * sizeof(int));
++        next[batch->layers[i]] += 6;
++    }
++}
++
++// Empties the LCD batch, and the grid tiles its rects were filed under
++static void ClearLCDBatch(LCDBatch *batch)
++{
++    for (int e = 0; e < batch->num_entries; ++e) {
++        batch->grid[batch->entries[e].tile] = -1;
++    }
++    batch->num_entries = 0;
++    batch->num_rects = 0;
++    batch->num_layers = 0;
++    batch->texture = NULL;
++}
++
++// Draws the queued LCD glyphs, whose color channels are each subpixel's coverage, onto an
++// opaque target: the target darkened by the coverage, then the color added by it, each
++// channel on its own (target * (1 - coverage) + color * coverage). Without custom blend
++// modes they are blended by their alpha, the brightest subpixel. Each layer is drawn in
++// both passes before the next, so overlapping glyphs aren't drawn in the same pass.
++static void FlushLCDBatch(TTF_RendererTextEngineData *data)
++{
++    LCDBatch *batch = &data->lcd;
++    if (batch->num_rects == 0) {
++        ClearLCDBatch(batch);
++        return;
++    }
++
++    const SDL_BlendMode cover = SDL_ComposeCustomBlendMode(
++        SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE_MINUS_SRC_COLOR, SDL_BLENDOPERATION_ADD,
++        SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
++    const SDL_BlendMode ink = SDL_ComposeCustomBlendMode(
++        SDL_BLENDFACTOR_ONE, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD,
++        SDL_BLENDFACTOR_ZERO, SDL_BLENDFACTOR_ONE, SDL_BLENDOPERATION_ADD);
++
++    SDL_BlendMode old = SDL_BLENDMODE_BLEND;
++    SDL_GetTextureBlendMode(batch->texture, &old);
++    if (SDL_SetTextureBlendMode(batch->texture, cover)) {
++        int starts[LCD_MAX_LAYERS + 1];
++        SortLCDBatch(batch, starts);
++        for (int layer = 0; layer < batch->num_layers; ++layer) {
++            const int *indices = batch->sorted + starts[layer];
++            const int num_indices = starts[layer + 1] - starts[layer];
++            if (num_indices == 0) {
++                continue;
++            }
++
++            SDL_SetTextureBlendMode(batch->texture, cover);
++            RenderLCDBatch(data, batch->coverage, indices, num_indices);
++            SDL_SetTextureBlendMode(batch->texture, ink);
++            RenderLCDBatch(data, batch->ink, indices, num_indices);
++        }
++        SDL_SetTextureBlendMode(batch->texture, old);
++    } else {
++        RenderLCDBatch(data, batch->color, batch->indices, batch->num_rects * 6);
++    }
++
++    ClearLCDBatch(batch);
++}
++
++bool TTF_FlushRendererText(TTF_TextEngine *engine)
++{
++    if (!engine || engine->CreateText != CreateText) {
++        return SDL_InvalidParamError("engine");
++    }
++
++    FlushLCDBatch((TTF_RendererTextEngineData *)engine->userdata);
++    return true;
++}
++
+ bool TTF_DrawRendererText(TTF_Text *text, float x, float y)
+ {
+     if (!text || !text->internal || text->internal->engine->CreateText != CreateText) {
+@@ -914,7 +1286,8 @@ bool TTF_DrawRendererText(TTF_Text *text, float x, float y)
+         return true;
+     }
+ 
+-    SDL_Renderer *renderer = ((TTF_RendererTextEngineData *)text->internal->engine->userdata)->renderer;
++    TTF_RendererTextEngineData *enginedata = (TTF_RendererTextEngineData *)text->internal->engine->userdata;
++    SDL_Renderer *renderer = enginedata->renderer;
+     AtlasDrawSequence *sequence = data->draw_sequence;
+     while (sequence) {
+         float *position = sequence->positions;
+@@ -938,6 +1311,11 @@ bool TTF_DrawRendererText(TTF_Text *text, float x, float y)
+         SDL_FColor color;
+         if (sequence->image_type == TTF_IMAGE_ALPHA) {
+             SDL_copyp(&color, &text->internal->color);
++        } else if (sequence->image_type == TTF_IMAGE_LCD) {
++            // Drawn with the other LCD glyphs, by TTF_FlushRendererText
++            QueueLCDSequence(enginedata, sequence, &text->internal->color);
++            sequence = sequence->next;
++            continue;
+         } else {
+             // Don't alter the color data in the image
+             color.r = 1.0f;
+@@ -946,14 +1324,9 @@ bool TTF_DrawRendererText(TTF_Text *text, float x, float y)
+             color.a = text->internal->color.a;
+         }
+ 
+-        SDL_RenderGeometryRaw(renderer,
+-                              sequence->texture,
+-                              sequence->positions, 2 * sizeof(float),
+-                              &color, 0,
+-                              sequence->texcoords, 2 * sizeof(float),
+-                              sequence->num_rects * 4,
+-                              sequence->indices, sequence->num_rects * 6, sizeof(*sequence->indices));
+-
++        // After the LCD glyphs before it
++        FlushLCDBatch(enginedata);
++        RenderSequence(renderer, sequence, &color);
+         sequence = sequence->next;
+     }
+     return true;
 diff --git a/src/SDL_ttf.c b/src/SDL_ttf.c
-index be517a1..c0319ef 100644
+index be517a1..53bbdde 100644
 --- a/src/SDL_ttf.c
 +++ b/src/SDL_ttf.c
-@@ -344,6 +344,10 @@ struct TTF_Font {
+@@ -344,6 +344,16 @@ struct TTF_Font {
      // Hinting modes
      int ft_load_target;
      int render_subpixel;
@@ -30,10 +528,16 @@ index be517a1..c0319ef 100644
 +    // Maps glyph coverage to the alpha of glyph images (TTF_SetFontCoverageTable).
 +    Uint8 coverage_table[256];
 +    bool use_coverage_table;
++
++    // Subpixel order for LCD glyph images: 0 = off, 1 = RGB, 2 = BGR (TTF_SetFontLCD).
++    int lcd_order;
++
++    // Advances rounded to whole cells of this many 26.6 units, 0 = off (TTF_SetFontCellAdvance).
++    int cell_advance;
  #if TTF_USE_HARFBUZZ
      hb_font_t *hb_font;
      hb_language_t hb_language;
-@@ -1404,6 +1408,16 @@ static bool Render_Line(const render_mode_t render_mode, int subpixel, TTF_Font
+@@ -1404,6 +1414,45 @@ static bool Render_Line(const render_mode_t render_mode, int subpixel, TTF_Font
  #endif
  }
  
@@ -47,10 +551,57 @@ index be517a1..c0319ef 100644
 +    return FT_FLOOR(x);
 +}
 +
++// Whether a font's glyph images are rendered for LCD subpixels (TTF_SetFontLCD).
++static bool Glyph_Use_LCD(const TTF_Font *font)
++{
++    return font->lcd_order != 0 &&
++           !font->render_sdf &&
++           FT_IS_SCALABLE(font->face) &&
++           !FT_HAS_COLOR(font->face);
++}
++
++// The columns a glyph image for the text engine has beyond the glyph's box
++// (sz_left, sz_width, which already has room on the right for the subpixel
++// shift and the italic slant): LCD filtering reaches one more on each side, and
++// the italic slant moves what is below the baseline left.
++static void Glyph_Padding(const TTF_Font *font, int *left, int *right)
++{
++    *left = 0;
++    *right = 0;
++    if (font->render_sdf) {
++        return;
++    }
++    if (Glyph_Use_LCD(font)) {
++        *left += 1;
++        *right += 1;
++    }
++    if (TTF_HANDLE_STYLE_ITALIC(font) && FT_IS_SCALABLE(font->face)) {
++        *left += ((GLYPH_ITALICS * SDL_max(-font->descent, 0)) >> 16) + 1;
++    }
++}
++
  static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int xstart, int ystart, int width, int height, TTF_DrawOperation *ops, int *current_op, TTF_SubString *clusters, int *current_cluster, int cluster_offset, int line_index)
  {
      int i;
-@@ -1433,6 +1447,15 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+@@ -1412,6 +1461,10 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+     int last_offset = -1;
+     TTF_SubString *cluster = NULL;
+ 
++    // Glyphs aren't clipped to the text area (see below)
++    (void)width;
++    (void)height;
++
+     SDL_Rect bounds;
+     bounds.x = xstart;
+     bounds.y = ystart;
+@@ -1426,53 +1479,42 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+         int y = pos->y;
+         int offset = pos->offset;
+         c_glyph *glyph = pos->glyph;
+-        int above_w, above_h;
+         int glyph_x = 0;
+         int glyph_y = 0;
+         int glyph_width = glyph->sz_width;
          int glyph_rows = glyph->sz_rows;
          TTF_DrawOperation *op;
  
@@ -66,7 +617,39 @@ index be517a1..c0319ef 100644
          // Position updated after glyph rendering
          x = xstart + FT_FLOOR(x) + glyph->sz_left;
          y = ystart + FT_FLOOR(y) - glyph->sz_top;
-@@ -1467,7 +1490,7 @@ static bool Render_Line_TextEngine(TTF_Font *font, TTF_Direction direction, int
+ 
+-        if (!glyph_font->render_sdf) {
+-            // Make sure glyph is inside text area
+-            above_w = x + glyph_width - width;
+-            above_h = y + glyph_rows  - height;
+-
+-            if (x < 0) {
+-                int tmp = -x;
+-                x = 0;
+-                glyph_x += tmp;
+-                glyph_width -= tmp;
+-            }
+-            if (above_w > 0) {
+-                glyph_width -= above_w;
+-            }
+-            if (y < 0) {
+-                int tmp = -y;
+-                y = 0;
+-                glyph_y += tmp;
+-                glyph_rows -= tmp;
+-            }
+-            if (above_h > 0) {
+-                glyph_rows -= above_h;
+-            }
+-        }
++        // Not clipped to the text area: the engine stretches a glyph's whole
++        // image over its destination, so that must be the image's box, which
++        // TTF_GetGlyphImageForIndex makes the padded outline box.
++        int pad_left, pad_right;
++        Glyph_Padding(glyph_font, &pad_left, &pad_right);
+ 
+         if (glyph_width > 0 && glyph_rows > 0) {
+             op = &ops[op_index++];
              op->cmd = TTF_DRAW_COMMAND_COPY;
              op->copy.text_offset = offset;
              op->copy.glyph_font = glyph_font;
@@ -74,18 +657,64 @@ index be517a1..c0319ef 100644
 +            op->copy.glyph_index = idx | ((Uint32)quarter << 30);
              op->copy.src.x = glyph_x;
              op->copy.src.y = glyph_y;
-             op->copy.src.w = glyph_width + 2 * font->outline;
-@@ -3177,12 +3200,26 @@ SDL_Surface *TTF_GetGlyphImage(TTF_Font *font, Uint32 ch, TTF_ImageType *image_t
+-            op->copy.src.w = glyph_width + 2 * font->outline;
++            op->copy.src.w = glyph_width + pad_left + pad_right + 2 * font->outline;
+             op->copy.src.h = glyph_rows + 2 * font->outline;
+-            op->copy.dst.x = x;
++            op->copy.dst.x = x - pad_left;
+             op->copy.dst.y = y;
+             op->copy.dst.w = op->copy.src.w;
+             op->copy.dst.h = op->copy.src.h;
+@@ -3177,12 +3219,65 @@ SDL_Surface *TTF_GetGlyphImage(TTF_Font *font, Uint32 ch, TTF_ImageType *image_t
      return TTF_GetGlyphImageForIndex(glyph_font, idx, image_type);
  }
  
++// The setters below drop what was laid out and rendered with the old value, as
++// TTF_SetFontHinting does
 +bool TTF_SetFontCoverageTable(TTF_Font *font, const Uint8 *table)
 +{
 +    TTF_CHECK_FONT(font, false);
-+    font->use_coverage_table = (table != NULL);
-+    if (table) {
++    const bool use = (table != NULL);
++    const bool same = (use == font->use_coverage_table) &&
++                      (!use || SDL_memcmp(font->coverage_table, table, sizeof(font->coverage_table)) == 0);
++    if (same) {
++        return true;
++    }
++
++    font->use_coverage_table = use;
++    if (use) {
 +        SDL_memcpy(font->coverage_table, table, sizeof(font->coverage_table));
 +    }
++    Flush_Cache(font);
++    UpdateFontText(font, NULL);
++    return true;
++}
++
++bool TTF_SetFontLCD(TTF_Font *font, int order)
++{
++    TTF_CHECK_FONT(font, false);
++    order = SDL_clamp(order, 0, 2);
++    if (order == font->lcd_order) {
++        return true;
++    }
++
++    font->lcd_order = order;
++    Flush_Cache(font);
++    UpdateFontText(font, NULL);
++    return true;
++}
++
++bool TTF_SetFontCellAdvance(TTF_Font *font, float advance)
++{
++    TTF_CHECK_FONT(font, false);
++    const int cell_advance = (advance > 0.0f) ? (int)SDL_roundf(advance * 64.0f) : 0;
++    if (cell_advance == font->cell_advance) {
++        return true;
++    }
++
++    font->cell_advance = cell_advance;
++    Flush_Cache(font);
++    UpdateFontText(font, NULL);
 +    return true;
 +}
 +
@@ -102,44 +731,79 @@ index be517a1..c0319ef 100644
  
      if (image_type) {
          *image_type = TTF_IMAGE_INVALID;
-@@ -3190,7 +3227,12 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+@@ -3190,55 +3285,113 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
  
      TTF_CHECK_FONT(font, NULL);
  
 -    if (!Find_GlyphByIndex(font, glyph_index, COLOR, 0, 0, NULL, &image)) {
+-        return NULL;
++    // An LCD image where the font can have one (not for bitmap glyphs), else color or alpha,
++    // rendered shifted to the subpixel position.
 +    const bool subpixel = font->render_subpixel && !font->render_sdf;
-+    if (subpixel) {
-+        if (!Find_GlyphByIndex(font, glyph_index, COLOR, SUBPIX, quarter * 16, &glyph, &image)) {
++    const int translation = subpixel ? quarter * 16 : 0;
++    bool lcd = false;
++    if (Glyph_Use_LCD(font)) {
++        if (subpixel) {
++            lcd = Find_GlyphByIndex(font, glyph_index, LCD, SUBPIX, translation, &glyph, &image);
++        } else {
++            lcd = Find_GlyphByIndex(font, glyph_index, LCD, 0, 0, &glyph, &image);
++        }
++    }
++    if (!lcd) {
++        bool found;
++        if (subpixel) {
++            found = Find_GlyphByIndex(font, glyph_index, COLOR, SUBPIX, translation, &glyph, &image);
++        } else {
++            found = Find_GlyphByIndex(font, glyph_index, COLOR, 0, 0, &glyph, &image);
++        }
++        if (!found) {
 +            return NULL;
 +        }
-+    } else if (!Find_GlyphByIndex(font, glyph_index, COLOR, 0, 0, &glyph, &image)) {
-         return NULL;
      }
  
-@@ -3198,7 +3240,15 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+-    if (image->width == 0 || image->rows == 0) {
++    // The image's box: the glyph's outline box with room for the shift and the LCD filter,
++    // as Render_Line_TextEngine places it (the engine stretches the image over that box).
++    // SDF images keep their own.
++    int box_left, box_top, box_w, box_h;
++    if (font->render_sdf) {
++        box_left = image->left;
++        box_top = image->top;
++        box_w = image->width;
++        box_h = image->rows;
++    } else {
++        int pad_left, pad_right;
++        Glyph_Padding(font, &pad_left, &pad_right);
++        box_left = glyph->sz_left - pad_left - font->outline;
++        box_top = glyph->sz_top + font->outline;
++        box_w = glyph->sz_width + pad_left + pad_right + 2 * font->outline;
++        box_h = glyph->sz_rows + 2 * font->outline;
++    }
++    if (box_w <= 0 || box_h <= 0) {
          return SDL_CreateSurface(1, 1, SDL_PIXELFORMAT_ARGB8888);
      }
  
 -    surface = SDL_CreateSurface(image->width, image->rows, SDL_PIXELFORMAT_ARGB8888);
-+    // A subpixel image keeps the glyph's left edge and width, which leave room for the shift.
-+    int width = image->width;
-+    int dx = 0;
-+    if (subpixel) {
-+        width = SDL_max(glyph->sz_width, image->width);
-+        dx = SDL_clamp(image->left - glyph->sz_left, 0, width - image->width);
-+    }
-+
-+    surface = SDL_CreateSurface(width, image->rows, SDL_PIXELFORMAT_ARGB8888);
++    surface = SDL_CreateSurface(box_w, box_h, SDL_PIXELFORMAT_ARGB8888);
      if (!surface) {
          return NULL;
      }
-@@ -3212,17 +3262,14 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
-             *image_type = (font->render_sdf ? TTF_IMAGE_SDF : TTF_IMAGE_COLOR);
-         }
++    SDL_ClearSurface(surface, 0.0f, 0.0f, 0.0f, 0.0f);
  
+-    src = image->buffer + alignment;
+-
+-    if (image->is_color) {
+-        if (image_type) {
++    if (image_type) {
++        if (image->is_color) {
+             // We can't tell the difference between SDF data and say, color emoji
+             // Hopefully the application sets the right mode on the font.
+             *image_type = (font->render_sdf ? TTF_IMAGE_SDF : TTF_IMAGE_COLOR);
+-        }
+-
 -        if (surface->pitch == image->pitch) {
 -            SDL_memcpy(surface->pixels, src, image->rows * image->pitch);
--        } else {
+         } else {
 -            int row;
 -            Uint8 *dst = (Uint8 *)surface->pixels;
 -            size_t length = image->width * 4;
@@ -148,42 +812,85 @@ index be517a1..c0319ef 100644
 -                src += image->pitch;
 -                dst += surface->pitch;
 -            }
-+        SDL_ClearSurface(surface, 0.0f, 0.0f, 0.0f, 0.0f);
-+        int row;
-+        Uint8 *dst = (Uint8 *)surface->pixels + dx * 4;
-+        size_t length = image->width * 4;
-+        for (row = 0; row < image->rows; ++row) {
-+            SDL_memcpy(dst, src, length);
-+            src += image->pitch;
-+            dst += surface->pitch;
++            *image_type = (lcd ? TTF_IMAGE_LCD : TTF_IMAGE_ALPHA);
          }
-     } else {
-         if (image_type) {
-@@ -3230,15 +3277,17 @@ SDL_Surface *TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_I
+-    } else {
+-        if (image_type) {
+-            *image_type = TTF_IMAGE_ALPHA;
++    }
++    if (image->width == 0 || image->rows == 0 || !image->buffer) {
++        return surface;
++    }
++
++    // Copy the image into its box, cropped to it. An LCD image has 4 bytes (b, g, r, 0) per
++    // pixel, its width counts 3 per pixel.
++    const int image_w = lcd ? image->width / 3 : image->width;
++    const int dx = image->left - box_left;
++    const int dy = box_top - image->top;
++    const bool bgr = (font->lcd_order == 2);
++    const Uint8 *table = font->use_coverage_table ? font->coverage_table : NULL;
++
++    for (int row = 0; row < box_h; ++row) {
++        const int image_row = row - dy;
++        if (image_row < 0 || image_row >= image->rows) {
++            continue;
          }
  
-         int row, col;
+-        int row, col;
 -        Uint32 *dst = (Uint32 *)surface->pixels;
 -        int skip = (surface->pitch - surface->w * 4) / 4;
-         for (row = 0; row < image->rows; ++row) {
+-        for (row = 0; row < image->rows; ++row) {
 -            for (col = 0; col < image->width; ++col) {
 -                Uint32 v = src[col];
 -                *dst++ = (0x00FFFFFF | v << 24);
-+            Uint32 *dst = (Uint32 *)((Uint8 *)surface->pixels + row * surface->pitch);
-+            for (col = 0; col < width; ++col) {
-+                int k = col - dx;
-+                Uint32 v = (k >= 0 && k < image->width) ? src[k] : 0;
-+                if (font->use_coverage_table) {
-+                    v = font->coverage_table[v];
++        src = image->buffer + alignment + image_row * image->pitch;
++        Uint32 *dst = (Uint32 *)((Uint8 *)surface->pixels + row * surface->pitch);
++        for (int col = 0; col < box_w; ++col) {
++            const int k = col - dx;
++            if (k < 0 || k >= image_w) {
++                continue;
++            }
++
++            if (image->is_color) {
++                SDL_memcpy(&dst[col], src + k * 4, 4);
++            } else if (lcd) {
++                const Uint8 *px = src + k * 4;
++                Uint32 r = bgr ? px[0] : px[2];
++                Uint32 g = px[1];
++                Uint32 b = bgr ? px[2] : px[0];
++                if (table) {
++                    r = table[r];
++                    g = table[g];
++                    b = table[b];
++                }
++                Uint32 a = SDL_max(r, SDL_max(g, b));
++                dst[col] = (a << 24) | (r << 16) | (g << 8) | b;
++            } else {
++                Uint32 v = src[k];
++                if (table) {
++                    v = table[v];
 +                }
 +                dst[col] = (0x00FFFFFF | v << 24);
              }
-             src += image->pitch;
+-            src += image->pitch;
 -            dst += skip;
          }
      }
      return surface;
-@@ -3732,7 +3781,7 @@ static bool TTF_Size_Internal(TTF_Font *font, const char *text, size_t length, T
+@@ -3599,6 +3752,12 @@ static bool CollectGlyphs(TTF_Font *font, const char *text, size_t length, TTF_D
+             pos->y_offset = 0;
+         }
+ 
++        // Whole cells (TTF_SetFontCellAdvance): 0 for marks, 2 for wide glyphs
++        if (font->cell_advance > 0 && pos->x_advance > 0) {
++            int cells = (pos->x_advance + font->cell_advance / 2) / font->cell_advance;
++            pos->x_advance = SDL_max(cells, 1) * font->cell_advance;
++        }
++
+         // Compute positions
+         pos->x = x + pos->x_offset;
+         pos->y = y + F26Dot6(pos->font->ascent) - pos->y_offset;
+@@ -3732,7 +3891,7 @@ static bool TTF_Size_Internal(TTF_Font *font, const char *text, size_t length, T
                  c_glyph *glyph = pos->glyph;
  
                  // Compute provisional global bounding box
@@ -192,7 +899,7 @@ index be517a1..c0319ef 100644
                  pos_y = FT_FLOOR(pos->y) - glyph->sz_top + spread_adjustment;
  
                  minx = SDL_min(minx, pos_x);
-@@ -3771,7 +3820,7 @@ static bool TTF_Size_Internal(TTF_Font *font, const char *text, size_t length, T
+@@ -3771,7 +3930,7 @@ static bool TTF_Size_Internal(TTF_Font *font, const char *text, size_t length, T
                  c_glyph *glyph = pos->glyph;
  
                  // Compute provisional global bounding box
@@ -201,7 +908,7 @@ index be517a1..c0319ef 100644
                  pos_y = FT_FLOOR(pos->y) - glyph->sz_top + spread_adjustment;
  
                  minx = SDL_min(minx, pos_x);
-@@ -5756,6 +5805,7 @@ void TTF_SetFontHinting(TTF_Font *font, TTF_HintingFlags hinting)
+@@ -5756,6 +5915,7 @@ void TTF_SetFontHinting(TTF_Font *font, TTF_HintingFlags hinting)
      }
  
      font->ft_load_target = ft_load_target;
@@ -210,14 +917,17 @@ index be517a1..c0319ef 100644
  #if TTF_USE_HARFBUZZ
      // update flag for HB
 diff --git a/src/SDL_ttf.sym b/src/SDL_ttf.sym
-index 564eaf3..d49a3db 100644
+index 564eaf3..b6953cf 100644
 --- a/src/SDL_ttf.sym
 +++ b/src/SDL_ttf.sym
-@@ -43,6 +43,7 @@ SDL3_ttf_0.0.0 {
+@@ -43,6 +43,10 @@ SDL3_ttf_0.0.0 {
      TTF_GetFreeTypeVersion;
      TTF_GetGlyphImage;
      TTF_GetGlyphImageForIndex;
 +    TTF_SetFontCoverageTable;
++    TTF_SetFontLCD;
++    TTF_SetFontCellAdvance;
++    TTF_FlushRendererText;
      TTF_GetGlyphKerning;
      TTF_GetGlyphMetrics;
      TTF_GetGlyphScript;

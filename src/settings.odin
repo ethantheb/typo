@@ -27,6 +27,7 @@ Settings :: struct {
 	restore_session:      bool,
 	collapsed_sections:   string, // settings window sections shown collapsed: keys, ", "-separated
 	theme:                string,
+	ui_font:              string,
 	font_family:          string,
 	font_size:            int,
 	font_weight:          int,
@@ -34,6 +35,7 @@ Settings :: struct {
 	letter_spacing:       f64, // logical pixels
 	smooth_scroll:        bool,
 	text_contrast:        f64,
+	text_antialiasing:    string, // "auto", "subpixel" or "grayscale"
 	terminal_shell:       string, // "" = platform default
 	bundled_conpty:       bool,   // Windows only
 	renderer:             string, // SDL render backend; applies on restart
@@ -68,8 +70,10 @@ Setting :: enum {
 	Restore_Session,
 	Collapsed_Sections,
 	Theme,
+	Ui_Font,
 	Smooth_Scroll,
 	Text_Contrast,
+	Text_Antialiasing,
 	Font_Family,
 	Font_Size,
 	Font_Weight,
@@ -126,6 +130,7 @@ Setting_Info :: struct {
 
 RENDERERS      := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
 MARKDOWN_VIEWS := [?]string{"rendered", "text"}
+ANTIALIASING   := [?]string{"auto", "subpixel", "grayscale"}
 
 SETTINGS := [Setting]Setting_Info {
 	.Theme = {
@@ -136,6 +141,18 @@ SETTINGS := [Setting]Setting_Info {
 		keywords    = "dark light mode colors color scheme",
 		default     = gfx.DEFAULT_THEME,
 		choices     = gfx.THEME_NAMES[:],
+		picker      = true,
+	},
+	.Ui_Font = {
+		section     = .Appearance,
+		key         = "ui_font",
+		name        = "Interface font",
+		description = "Font for the file tree, pane titles, the status bar, menus and " +
+		              "dialogs: one of the bundled " + gfx.BUNDLED_MD_FAMILY + ", " +
+		              gfx.BUNDLED_PLEX_SANS + " or " + gfx.BUNDLED_FAMILY +
+		              ", or an installed font.",
+		keywords    = "font family typeface ui interface sidebar menu",
+		default     = gfx.BUNDLED_MD_FAMILY,
 		picker      = true,
 	},
 	.Restore_Session = {
@@ -173,12 +190,24 @@ SETTINGS := [Setting]Setting_Info {
 		max         = 4,
 		step        = 0.25,
 	},
+	.Text_Antialiasing = {
+		section     = .Appearance,
+		key         = "text_antialiasing",
+		name        = "Text antialiasing",
+		description = "\"subpixel\" smooths letters with the red, green and blue stripes " +
+		              "of LCD screens, like ClearType: sharper below 200% scaling. " +
+		              "\"grayscale\" suits OLED and rotated screens. \"auto\" uses " +
+		              "subpixel below 200% when the system does.",
+		keywords    = "cleartype lcd subpixel grayscale smoothing sharp blurry font",
+		default     = "auto",
+		choices     = ANTIALIASING[:],
+	},
 	.Font_Family = {
 		section     = .Font,
 		key         = "family",
 		name        = "Font",
-		description = "Editor and terminal font: the bundled IBM Plex Mono or an " +
-		              "installed monospace font.",
+		description = "Editor and terminal font: the bundled " + gfx.BUNDLED_FAMILY +
+		              " or an installed monospace font.",
 		keywords    = "font family typeface monospace",
 		default     = gfx.BUNDLED_FAMILY,
 		picker      = true,
@@ -220,7 +249,8 @@ SETTINGS := [Setting]Setting_Info {
 		section     = .Font,
 		key         = "letter_spacing",
 		name        = "Letter spacing",
-		description = "Extra space between characters, in pixels.",
+		description = "Extra space between characters, in pixels. Columns stay on " +
+		              "whole pixels of the screen, so small steps can round away.",
 		keywords    = "font spacing tracking width",
 		default     = f64(0),
 		min         = -2,
@@ -276,8 +306,9 @@ SETTINGS := [Setting]Setting_Info {
 		section     = .Markdown,
 		key         = "font",
 		name        = "Markdown font",
-		description = "Font for rendered Markdown text: the bundled IBM Plex Sans or an " +
-		              "installed font. Code uses the editor font.",
+		description = "Font for rendered Markdown text: the bundled " + gfx.BUNDLED_MD_FAMILY +
+		              " or " + gfx.BUNDLED_PLEX_SANS + ", or an installed font. Code uses " +
+		              "the editor font.",
 		keywords    = "markdown font family typeface prose",
 		default     = gfx.BUNDLED_MD_FAMILY,
 		picker      = true,
@@ -355,6 +386,7 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Restore_Session:      return &s.restore_session
 	case .Collapsed_Sections:   return &s.collapsed_sections
 	case .Theme:                return &s.theme
+	case .Ui_Font:              return &s.ui_font
 	case .Font_Family:          return &s.font_family
 	case .Font_Size:            return &s.font_size
 	case .Font_Weight:          return &s.font_weight
@@ -362,6 +394,7 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Letter_Spacing:       return &s.letter_spacing
 	case .Smooth_Scroll:        return &s.smooth_scroll
 	case .Text_Contrast:        return &s.text_contrast
+	case .Text_Antialiasing:    return &s.text_antialiasing
 	case .Terminal_Shell:       return &s.terminal_shell
 	case .Bundled_Conpty:       return &s.bundled_conpty
 	case .Renderer:             return &s.renderer
@@ -838,14 +871,47 @@ apply_settings :: proc() {
 		gfx.text_set_contrast(&gfx.text_system, gfx.theme.text, f32(g.settings.text_contrast))
 	}
 
+	// A new antialiasing reopens every font: Clay measures again next frame
+	before := gfx.text_system.generation
+	gfx.text_set_antialiasing(&gfx.text_system, antialiasing_setting())
+	if gfx.text_system.generation != before do g.measure_stale = true
+
 	for p in g.panes.open {
 		t, is_terminal := p.content.(^Terminal)
 		if is_terminal do terminal_apply_theme(t)
 	}
 
+	apply_ui_font()
 	apply_editor_font()
 	apply_markdown_font()
 	langs.settings_changed()
+}
+
+
+@(private = "file")
+antialiasing_setting :: proc() -> gfx.Antialiasing {
+	switch g.settings.text_antialiasing {
+	case "subpixel":  return .Subpixel
+	case "grayscale": return .Grayscale
+	}
+	return .Auto
+}
+
+
+// Points the interface (everything Clay lays out as text) at the configured
+// family, like apply_editor_font. Clay keeps what it measured with the old
+// faces; that is reset at the start of the next frame, outside any layout
+apply_ui_font :: proc() {
+	if gfx.text_system.engine == nil do return
+
+	regular, semibold, bold, found := gfx.ui_family_sources(&g.fonts, g.settings.ui_font)
+	if !found do gfx.fonts_scan(&g.fonts, walk_files)
+
+	before := gfx.text_system.generation
+	gfx.text_set_source(&gfx.text_system, .Body, regular)
+	gfx.text_set_source(&gfx.text_system, .SemiBold, semibold)
+	gfx.text_set_source(&gfx.text_system, .Bold, bold)
+	if gfx.text_system.generation != before do g.measure_stale = true
 }
 
 
