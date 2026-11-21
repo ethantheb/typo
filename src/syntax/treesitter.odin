@@ -2,6 +2,7 @@ package syntax
 
 import "base:runtime"
 import "core:fmt"
+import "core:sync"
 import "core:text/regex"
 
 import "../buffer"
@@ -45,8 +46,12 @@ Predicate :: struct {
 ODIN_HIGHLIGHTS :: #load("../../vendor/tree-sitter-odin/queries/highlights.scm", string)
 TOML_HIGHLIGHTS :: #load("../../vendor/tree-sitter-toml/queries/highlights.scm", string)
 
+// Files open (ts_open) on the loader threads too: the cache is filled under a lock
 @(private = "file")
 queries: [Language]^Lang_Query
+
+@(private = "file")
+queries_mutex: sync.Mutex
 
 
 @(private = "file")
@@ -61,15 +66,14 @@ ts_language :: proc(lang: Language) -> (^TSLanguage, string) {
 }
 
 
+// Opens the parser and parses the buffer. May run on any thread; the state is
+// then used on one thread at a time
 ts_open :: proc(s: ^TS_State, b: ^buffer.Buffer, lang: Language) -> bool {
 	language, source := ts_language(lang)
 	if language == nil do return false
 
 	// The language's query, loaded once
-	if queries[lang] == nil {
-		queries[lang] = load_query(language, source) or_return
-	}
-	s.query = queries[lang]
+	s.query = language_query(lang, language, source) or_return
 
 	// The parser, and the first parse
 	s.parser = ts_parser_new()
@@ -170,6 +174,25 @@ read_chunk :: proc "c" (
 
 
 // --- Query loading -----------------------------------------------------------------
+
+// The language's highlights query, compiled the first time it is asked for
+@(private = "file")
+language_query :: proc(
+	lang: Language,
+	language: ^TSLanguage,
+	source: string,
+) -> (
+	q: ^Lang_Query,
+	ok: bool,
+) {
+	sync.guard(&queries_mutex)
+
+	if queries[lang] == nil {
+		queries[lang] = load_query(language, source) or_return
+	}
+	return queries[lang], true
+}
+
 
 @(private = "file")
 load_query :: proc(language: ^TSLanguage, source: string) -> (q: ^Lang_Query, ok: bool) {

@@ -263,3 +263,55 @@ test_save_records_what_it_wrote :: proc(t: ^testing.T) {
 	testing.expect_value(t, len(data), 0)
 	testing.expect_value(t, e.disk.hash, file_hash(data))
 }
+
+
+// A file registered with the version a loader read, changed before it was
+// registered (its notification long handled), is still reported: the watcher
+// looks at each file it starts watching
+@(test)
+test_change_before_registering_is_seen :: proc(t: ^testing.T) {
+	sync.guard(&app_state_lock)
+
+	tmp := os.temp_directory(context.temp_allocator) or_else "."
+	dir := fmt.tprintf("%s%ctypo-watch-open-%d", tmp, os.Path_Separator, os.get_pid())
+	_ = os.make_directory_all(dir)
+	defer os.remove_all(dir)
+	path := fmt.tprintf("%s%cfile.txt", dir, os.Path_Separator)
+
+	watch_init()
+	defer watch_destroy()
+	watch_set_root(dir)
+	time.sleep(200 * time.Millisecond)
+
+	// Read as the loader would, then changed, and the burst handed over
+	_ = os.write_entire_file(path, transmute([]u8)string("read\n"))
+	stamp, _ := file_stamp(path)
+	hash := file_hash(transmute([]u8)string("read\n"))
+	_ = os.write_entire_file(path, transmute([]u8)string("changed since\n"))
+	time.sleep(WATCH_MAX_DELAY + 500 * time.Millisecond)
+	for r in watch_take() do watch_result_destroy(r)
+
+	// Registered now, with the version read
+	generation := watch_file_open(path, hash, stamp, true)
+	defer unwatch_file(path)
+
+	changed: Maybe(File_Changed)
+	for _ in 0 ..< 300 {
+		time.sleep(10 * time.Millisecond)
+		for r in watch_take() {
+			c, is_change := r.(File_Changed)
+			if is_change && c.generation == generation && changed == nil {
+				changed = c
+				delete(c.path)
+				continue
+			}
+			watch_result_destroy(r)
+		}
+		if changed != nil do break
+	}
+
+	c, seen := changed.?
+	testing.expect(t, seen, "the change is reported")
+	testing.expect_value(t, string(c.version.data), "changed since\n")
+	delete(c.version.data)
+}

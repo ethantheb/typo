@@ -135,6 +135,9 @@ rename_path :: proc(path, name: string) -> (problem: string) {
 		g.md_modes[renamed] = mode
 	}
 
+	// And the recent files
+	recent_renamed(&g.recent, path, to)
+
 	workspace_refresh(&g.workspace)
 	finder_invalidate()
 	return ""
@@ -185,8 +188,10 @@ create_path :: proc(dir, name: string, folder: bool) -> (problem: string) {
 
 
 // After deleting a file or folder: its open files close (it was confirmed, so
-// unsaved changes go too) and the tree and the finder forget it
+// unsaved changes go too) and the tree, the finder and the recent files forget it
 path_deleted :: proc(path: string) {
+	recent_forget(&g.recent, path)
+
 	// Close the files that were inside it
 	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
 		if i >= len(g.panes.open) do continue

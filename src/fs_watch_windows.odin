@@ -221,7 +221,9 @@ read_file_shared :: proc(path: string, allocator := context.allocator) -> ([]u8,
 	if !win32.GetFileSizeEx(h, &size) do return nil, .Failed
 
 	// It may shrink while read; what is there is read
-	data := make([]u8, int(size), allocator)
+	data, alloc_err := make([]u8, int(size), allocator)
+	if alloc_err != nil do return nil, .Failed
+
 	n := 0
 	for n < len(data) {
 		chunk := win32.DWORD(min(len(data) - n, 1 << 30))

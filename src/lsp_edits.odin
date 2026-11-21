@@ -214,6 +214,8 @@ check_edit :: proc(edit: ^lsp.Workspace_Edit) -> string {
 		case fe.open:
 			changed := e == nil || e.status != .Text || e.buf.version != fe.version || fe.stale
 			if changed do return fmt.tprintf("%s changed since the edit was worked out", name)
+		case e != nil && e.status == .Loading:
+			return fmt.tprintf("%s is still opening", name)
 		case e != nil:
 			if e.status != .Text || editor_is_modified(e) {
 				return fmt.tprintf("%s has unsaved changes", name)

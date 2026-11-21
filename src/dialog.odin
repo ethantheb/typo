@@ -3,6 +3,7 @@ package editor
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
@@ -45,6 +46,9 @@ Reloading :: struct {
 Overwriting :: struct {
 	path: string, // owned; a file being saved over a version typo hasn't read
 }
+Opening_Large :: struct {
+	id: u64, // the load of a file larger than the ask_above_mb setting
+}
 
 Dialog_Purpose :: union {
 	Unsaved_Step,
@@ -55,6 +59,7 @@ Dialog_Purpose :: union {
 	Applying_Edit,
 	Reloading,
 	Overwriting,
+	Opening_Large,
 }
 
 Dialog :: struct {
@@ -172,6 +177,9 @@ dialog_apply :: proc(choice: int) {
 
 	case Overwriting:
 		overwrite_answer(p.path, confirmed)
+
+	case Opening_Large:
+		large_file_answer(p.id, open = confirmed)
 
 	case Unsaved_Step:
 		unsaved_answer((^Pane)(p), choice)
@@ -311,7 +319,9 @@ dialog_button :: proc(id: clay.ElementId, b: Dialog_Button, focused: bool) -> bo
 
 // Closing a file, opening a folder or quitting first asks about each file with
 // unsaved changes, one dialog at a time; then does what was asked, unless
-// cancelled
+// cancelled. Before each question, and before doing it, the flow waits for
+// every write under way to land (the writer thread saves): a file a write
+// saved isn't asked about, and a failed write stops the flow
 
 Closing_Pane :: distinct ^Pane
 Quit :: struct {}
@@ -323,8 +333,9 @@ After_Unsaved :: union {
 }
 
 Unsaved_Flow :: struct {
-	asking: [dynamic]^Pane, // files with unsaved changes still to ask about
-	then:   After_Unsaved,
+	asking:  [dynamic]^Pane, // files with unsaved changes still to ask about
+	then:    After_Unsaved,
+	waiting: bool, // for writes under way to land (unsaved_frame)
 }
 
 
@@ -357,14 +368,58 @@ unsaved_reset :: proc() {
 		delete(string(path))
 	}
 	u.then = nil
+	u.waiting = false
 	clear(&u.asking)
 }
 
 
-// Asks about the next file, or, with none left, does what was asked
+// Per frame: goes on once the writes the flow waits for have landed
+unsaved_frame :: proc() {
+	if g.unsaved.waiting && !saves_pending() {
+		unsaved_next()
+	}
+}
+
+
+// A write failed while the flow runs: it stops, and says so. False if no flow
+// runs
+unsaved_save_failed :: proc(e: ^Editor, problem: string) -> bool {
+	if g.unsaved.then == nil do return false
+
+	unsaved_reset()
+	message := fmt.tprintf(
+		"%s could not be saved (%s), so nothing was closed.",
+		relative_to_root(e.path),
+		problem,
+	)
+	show_notice("Couldn't save", message)
+	return true
+}
+
+
+// A pane closed while the flow runs: it isn't asked about, or closed, anymore
+unsaved_forget :: proc(p: ^Pane) {
+	u := &g.unsaved
+	if i, found := slice.linear_search(u.asking[:], p); found {
+		ordered_remove(&u.asking, i)
+	}
+	if closing, ok := u.then.(Closing_Pane); ok && (^Pane)(closing) == p {
+		u.then = nil
+	}
+}
+
+
+// Asks about the next file, or, with none left, does what was asked. Waits
+// for writes under way first; files saved meanwhile aren't asked about
 @(private = "file")
 unsaved_next :: proc() {
 	u := &g.unsaved
+	u.waiting = saves_pending()
+	if u.waiting do return
+
+	for len(u.asking) > 0 && !pane_modified(u.asking[0]) {
+		ordered_remove(&u.asking, 0)
+	}
 
 	if len(u.asking) > 0 {
 		e := u.asking[0].content.(^Editor)
@@ -380,6 +435,9 @@ unsaved_next :: proc() {
 		)
 		return
 	}
+
+	// Nothing left to do: its pane closed meanwhile
+	if u.then == nil do return
 
 	switch t in u.then {
 	case Closing_Pane:
@@ -406,7 +464,7 @@ unsaved_answer :: proc(p: ^Pane, choice: int) {
 	u := &g.unsaved
 
 	switch choice {
-	case 0: // Save
+	case 0: // Save; asked again if edited before the write landed
 		e := p.content.(^Editor)
 		if !editor_save(e) {
 			name := strings.clone(relative_to_root(e.path), context.temp_allocator)
@@ -415,7 +473,6 @@ unsaved_answer :: proc(p: ^Pane, choice: int) {
 			show_notice("Couldn't save", message)
 			return
 		}
-		ordered_remove(&u.asking, 0)
 		unsaved_next()
 
 	case 1: // Don't save

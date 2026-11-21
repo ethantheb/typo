@@ -180,6 +180,55 @@ test_typing_coalesces :: proc(t: ^testing.T) {
 }
 
 
+// Types one character as a typing step, at time `now`
+@(private = "file")
+type_char :: proc(b: ^Buffer, c: string, now: u64) {
+	at := length(b)
+	sel := []Selection{{at, at, -1}}
+	begin(b, .Typing, now, sel)
+	replace(b, at, 0, c)
+	sel[0] = {at + 1, at + 1, -1}
+	end(b, sel)
+}
+
+
+// Typing while a write is under way doesn't merge into the text being written:
+// once written, the buffer is still modified, and undo gets back to the saved
+// text. A write whose text can't be reached again leaves nothing saved
+@(test)
+test_typing_during_a_write :: proc(t: ^testing.T) {
+	b := make_buffer("")
+	defer buffer_destroy(&b)
+
+	// "ab" is written while "c" is typed, quick enough to coalesce otherwise
+	type_char(&b, "a", 0)
+	type_char(&b, "b", 1)
+	begin_save(&b)
+	type_char(&b, "c", 2)
+	end_save(&b, true)
+	testing.expect(t, is_modified(&b), "typed during the write")
+
+	undo(&b)
+	testing.expect_value(t, contents(&b), "ab")
+	testing.expect(t, !is_modified(&b), "back to the written text")
+
+	// A failed write saves nothing
+	redo(&b)
+	begin_save(&b)
+	end_save(&b, false)
+	testing.expect(t, is_modified(&b), "the write failed")
+
+	// Undo past the written text, then a new step: it is gone
+	begin_save(&b)
+	undo(&b)
+	type_char(&b, "x", 10)
+	end_save(&b, true)
+	testing.expect(t, is_modified(&b), "the written text is unreachable")
+	undo(&b)
+	testing.expect(t, is_modified(&b), "and stays so")
+}
+
+
 @(test)
 test_large_blocks :: proc(t: ^testing.T) {
 	// Spans many newline-index blocks

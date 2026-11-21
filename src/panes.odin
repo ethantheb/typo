@@ -286,11 +286,18 @@ pane_modified :: proc(p: ^Pane) -> bool {
 }
 
 
-// Whether every shown editor is ready to be drawn (see Editor.shown)
+// Whether every shown editor is ready to be drawn (see Editor.shown): one still
+// loading is once it shows "Loading…"
 panes_ready :: proc() -> bool {
 	for p in g.panes.open {
 		e, is_file := p.content.(^Editor)
-		if is_file && p.visible && e.status == .Text && !e.shown {
+		if !is_file || !p.visible {
+			continue
+		}
+
+		text_waiting := e.status == .Text && !e.shown
+		load_waiting := e.status == .Loading && !editor_loading_shown(e)
+		if text_waiting || load_waiting {
 			return false
 		}
 	}
@@ -351,22 +358,33 @@ panes_open_file :: proc(path: string) -> ^Pane {
 }
 
 
-// Opens a file in a new pane to the right of the one in use, leaving that one
-// open (e.g. a log beside the code), or shows the pane it is already in
-panes_open_file_beside :: proc(path: string) -> ^Pane {
+// Opens a file in a new pane, never in place of another (e.g. a log beside the
+// code), or focuses the pane it is in if shown. The new pane goes to the right
+// of `beside`, else of the editor in use, else above the rest
+panes_open_file_beside :: proc(path: string, beside: ^Pane = nil) -> ^Pane {
 	p := pane_for_file(path)
-	ps := &g.panes
-
-	beside := ps.focused
-	if beside == nil || beside == p || !pane_shown(beside) {
-		pane_show(p)
-	} else if !pane_shown(p) {
-		pane_move(p, {kind = .Split, target = beside, side = .Right})
+	if !pane_shown(p) {
+		pane_move(p, place_beside(p, beside))
 	}
 
 	pane_focus(p)
 	workspace_reveal(&g.workspace, path)
 	return p
+}
+
+
+// Where a file opened in a new pane goes (see panes_open_file_beside)
+@(private = "file")
+place_beside :: proc(p, beside: ^Pane) -> Drop {
+	ps := &g.panes
+	if ps.root == nil do return {kind = .Fill}
+
+	for q in ([?]^Pane{beside, ps.last_editor}) {
+		if q != nil && q != p && pane_shown(q) {
+			return {kind = .Split, target = q, side = .Right}
+		}
+	}
+	return {kind = .Edge, side = .Top, share = 0.65}
 }
 
 
@@ -474,7 +492,9 @@ place_for :: proc(p: ^Pane) -> Drop {
 
 
 // Moves a pane where `d` says, in the layout or out of it. A file that loses its
-// place to it closes, unless it has unsaved changes
+// place to it closes, unless it has unsaved changes; to a file still loading,
+// once that one has loaded (so a large file the user then doesn't open can give
+// the place back)
 pane_move :: proc(p: ^Pane, d: Drop) {
 	ps := &g.panes
 	if d.kind == .None do return
@@ -494,9 +514,15 @@ pane_move :: proc(p: ^Pane, d: Drop) {
 	// The file it swapped out, if that left the layout
 	q := d.target
 	swapped_out := d.kind == .Swap && q != p && is_editor(q) && !pane_shown(q)
-	if swapped_out && !pane_modified(q) {
-		pane_close(q, ask = false)
+	if !swapped_out do return
+
+	// A file loading in its place gives it back if the user cancels
+	e, is_file := p.content.(^Editor)
+	if is_file && e.status == .Loading && e.load.replaced == nil {
+		e.load.replaced = q
+		return
 	}
+	if !pane_modified(q) do pane_close(q, ask = false)
 }
 
 
@@ -513,8 +539,11 @@ pane_focus :: proc(p: ^Pane) {
 	}
 
 	ps.focused = p
-	if p != nil && is_editor(p) {
+	if p == nil do return
+
+	if e, ok := p.content.(^Editor); ok {
 		ps.last_editor = p
+		recent_touch(e.path)
 	}
 }
 
@@ -543,12 +572,22 @@ pane_close :: proc(p: ^Pane, ask := true) -> bool {
 	if g.rename.pane == p do rename_end()
 	if g.menu.pane == p do menu_close()
 	if g.find.pane == p do find_close()
+	if g.goto_line.pane == p do goto_line_close(restore = false)
 	if op, ok := g.pending.(Pane_Op); ok && op.pane == p {
 		g.pending = nil
 	}
+	loads_forget_pane(p)
+	unsaved_forget(p)
 
 	switch c in p.content {
 	case ^Editor:
+		// The file it was loading in place of goes with it
+		q := c.load.replaced
+		c.load.replaced = nil
+		if q != nil && !pane_shown(q) && !pane_modified(q) {
+			pane_close(q, ask = false)
+		}
+
 		editor_destroy(c)
 		free(c)
 	case ^Terminal:
@@ -1309,6 +1348,8 @@ pane_element :: proc(p: ^Pane) {
 			case .Text:   custom_element(body_id(p), c)
 			case .Error:  centered_message("Could not read file")
 			case .Binary: centered_message("Binary file not shown")
+			case .Loading:
+				if editor_loading_shown(c) do centered_message(loading_message(c))
 			case .None:
 			}
 		case ^Terminal:
@@ -1316,6 +1357,7 @@ pane_element :: proc(p: ^Pane) {
 		}
 
 		find_bar_ui(p)
+		goto_line_ui(p)
 	}
 }
 

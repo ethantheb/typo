@@ -120,6 +120,7 @@ PHASES := [?]Phase {
 	{name = "resizing the window (tree-sitter)", step = phase_resize, frame_limit = 8},
 	{name = "sideways scroll bar", step = phase_sideways},
 	{name = "list numbers (rendered)", step = phase_list_numbers},
+	{name = "go to definition into a file not open", step = phase_jump_closed},
 	{name = "open Markdown (rendered)", step = phase_open_markdown, frame_limit = 8},
 	{name = "scrolling Markdown (rendered)", step = phase_scroll, frame_limit = 8},
 	{name = "typing in Markdown (rendered)", step = phase_type, frame_limit = 8},
@@ -144,18 +145,29 @@ PHASES := [?]Phase {
 	{name = "spaces and tabs in Markdown (rendered)", step = phase_md_whitespace},
 	{name = "zooming 4 MB Markdown (rendered)", step = phase_zoom_markdown, frame_limit = 8},
 	{name = "file finder", step = phase_finder, frame_limit = 8},
+	{name = "open and recent files in the finder", step = phase_finder_ranks},
 	{name = "settings window", step = phase_settings, frame_limit = 8},
 	{name = "settings scrolling at any size", step = phase_settings_scrolls},
 	{name = "settings sections collapsing", step = phase_settings_collapse, frame_limit = 8},
+	{name = "several bindings for a command", step = phase_settings_bindings},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
 	{name = "files changed on disk", step = phase_disk_changes}, // perf_watch.odin
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
 	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},
-	{name = "open 64 MB file (lexer)", step = phase_open_large, frame_limit = 8},
+	{
+		name        = "open 64 MB file while frames go on (lexer)",
+		step        = phase_open_large,
+		frame_limit = 8,
+		max_limit   = 16,
+	},
 	{name = "jumping through 64 MB file", step = phase_jump_large, frame_limit = 12},
 	{name = "typing in 64 MB file", step = phase_type, frame_limit = 8, words_limit = 1},
 	{name = "find in 64 MB file", step = phase_find, frame_limit = 12},
+	{name = "saving 64 MB file while frames go on", step = phase_save_large, frame_limit = 8},
+	{name = "session restore of a file that loads slowly", step = phase_restore_slow},
+	{name = "a large file asks first; Cancel opens nothing", step = phase_large_asks},
+	{name = "closing a file while it loads", step = phase_close_loading},
 	{name = "8 MB single-line file", step = phase_long_line, frame_limit = 25},
 	{name = "terminal full-screen redraws", step = phase_terminal_redraw, frame_limit = 12},
 	{name = "block elements and box drawing fill their cells", step = phase_box_glyphs},
@@ -170,6 +182,7 @@ PHASES := [?]Phase {
 	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
 	{name = "pane title bar and mouse buttons", step = phase_pane_header},
 	{name = "typo <file> in the terminal", step = phase_ipc_open},
+	{name = "go to line", step = phase_goto_line},
 	{name = "text fields with the mouse and keys", step = phase_text_fields},
 	{name = "zooming panes", step = phase_zoom_panes},
 	{
@@ -1034,14 +1047,14 @@ phase_vt :: proc(p: ^Perf, frame: int) -> bool {
 
 // --- UI phases ---------------------------------------------------------------------
 
-// Opens a file as the only one open
+// Opens a file as the only one open, waiting for the loader
 @(private = "file")
 open_timed :: proc(p: ^Perf, name: string) {
 	close_files()
 
 	t := time.tick_now()
-	panes_open_file(path_in_dir(p, name))
-	result(p, "open", ms_since(t), "ms", name == "large.odin" ? 1500 : 250)
+	open_loaded(path_in_dir(p, name))
+	result(p, "open", ms_since(t), "ms", 250)
 }
 
 
@@ -1179,13 +1192,6 @@ whitespace_moves_caret :: proc(e: ^Editor, line: int, key: sdl.Keycode) -> bool 
 settle_markdown :: proc(e: ^Editor) {
 	textedit.take_changes(e)
 	markdown.doc_update(e.md, &e.buf, max(int), time.Hour)
-}
-
-
-@(private = "file")
-phase_open_large :: proc(p: ^Perf, frame: int) -> bool {
-	if frame == 0 do open_timed(p, "large.odin")
-	return frame == 30
 }
 
 
@@ -1353,7 +1359,7 @@ phase_sideways :: proc(p: ^Perf, frame: int) -> bool {
 		path := path_in_dir(p, "wide.odin")
 		_ = os.write_entire_file(path, transmute([]u8)strings.to_string(sb))
 		close_files()
-		panes_open_file(path)
+		open_loaded(path)
 
 	case 5:
 		max_x, _ := editor_sideways(e)
@@ -1420,7 +1426,7 @@ phase_list_numbers :: proc(p: ^Perf, frame: int) -> bool {
 		path := path_in_dir(p, "lists.md")
 		_ = os.write_entire_file(path, "Lists\n\n1. one\n7. seven\n4. four\n10. ten\n")
 		close_files()
-		panes_open_file(path)
+		open_loaded(path)
 		return false
 	}
 	if frame < 5 do return false
@@ -1497,6 +1503,115 @@ phase_finder :: proc(p: ^Perf, frame: int) -> bool {
 		return true
 	}
 	return false
+}
+
+
+// Open and recent files in the finder: with the file focused, code.odin open
+// beside it and two files used recently, the empty query lists code.odin,
+// then the two most recent first, and not the focused file. Of two files a
+// query matches equally ("data" in alpha/ and omega/), the recent one comes
+// first, whichever it is
+@(private = "file")
+phase_finder_ranks :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) code: ^Pane // opened here, closed at the end
+	f := &g.finder
+	sep := os.Path_Separator
+	alpha := path_in_dir(p, fmt.tprintf("ranked%calpha%cdata.txt", sep, sep))
+	omega := path_in_dir(p, fmt.tprintf("ranked%comega%cdata.txt", sep, sep))
+	root := g.workspace.root
+
+	if frame == 0 {
+		// The two equal files, indexed again
+		for path in ([]string{alpha, omega}) {
+			_ = os.make_directory_all(parent_dir(path))
+			_ = os.write_entire_file(path, transmute([]u8)string("data\n"))
+		}
+		finder_invalidate()
+
+		// code.odin open beside the focused file, then two files used
+		focused := g.panes.focused
+		code = nil
+		if pane_with_file(path_in_dir(p, "code.odin")) == nil {
+			code = panes_open_file_beside(path_in_dir(p, "code.odin"))
+		}
+		pane_focus(focused)
+		recent_add(&g.recent, root, path_in_dir(p, "long.js"))
+		recent_add(&g.recent, root, path_in_dir(p, "flood.txt"))
+
+		finder_toggle()
+		step, p.mark_frame = 1, frame
+		return false
+	}
+	if finder_busy() || frame < p.mark_frame + 2 {
+		return false
+	}
+
+	switch step {
+	case 1:
+		listed := make([dynamic]string, context.temp_allocator)
+		for m in f.results do append(&listed, finder_display_path(m.index))
+
+		top := len(listed) >= 3 && listed[0] == "code.odin"
+		top = top && listed[1] == "flood.txt" && listed[2] == "long.js"
+		check(p, "no query: the open file, then the recent ones", top)
+
+		current := focused_editor()
+		skipped := current != nil
+		for m in f.results {
+			if current != nil && same_path(f.files[m.index], current.path) {
+				skipped = false
+			}
+		}
+		check(p, "no query: the focused file isn't listed", skipped)
+
+		rank, ranked, _ := file_rank_of(path_in_dir(p, "code.odin"))
+		check(p, "an open file is marked open", ranked && rank.open)
+
+		// omega/ used recently
+		recent_add(&g.recent, root, omega)
+		reopen_finder("data")
+		next_step(p, &step, frame)
+
+	case 2:
+		first := len(f.results) > 0 && same_path(f.files[f.results[0].index], omega)
+		check(p, "a query ranks a recent file above an equal match", first)
+
+		// alpha/ instead
+		recent_forget(&g.recent, omega)
+		recent_add(&g.recent, root, alpha)
+		reopen_finder("data")
+		next_step(p, &step, frame)
+
+	case 3:
+		first := len(f.results) > 0 && same_path(f.files[f.results[0].index], alpha)
+		check(p, "... whichever of the two it is", first)
+
+		finder_close()
+		if code != nil do pane_close(code, ask = false)
+		return true
+	}
+	return false
+}
+
+
+// Opens the finder's files again (ranks taken anew) with a query
+@(private = "file")
+reopen_finder :: proc(query: string) {
+	finder_close()
+	finder_toggle()
+	line_edit_set(&g.finder.query, query, len(query), len(query))
+	finder_restart_search()
+}
+
+
+// The finder's rank for a file it indexed
+@(private = "file")
+file_rank_of :: proc(path: string) -> (rank: Rank, ranked: bool, current: bool) {
+	for file, i in g.finder.files {
+		if same_path(file, path) do return finder_file_rank(i)
+	}
+	return
 }
 
 
@@ -1842,6 +1957,100 @@ phase_settings_collapse :: proc(p: ^Perf, frame: int) -> bool {
 
 
 // How many rows of the settings list shown last frame are a T
+// Several bindings for Toggle sidebar, in the settings window: Enter on its
+// row records a second (Ctrl+Shift+B), shown as a chip; Ctrl+G is taken from
+// Go to line and the row says so. Ctrl+B and Ctrl+Shift+B both run it. Then
+// → → and Delete remove the second, a press on a chip's x the third; the
+// defaults come back
+@(private = "file")
+phase_settings_bindings :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) sidebar: bool
+	w := &g.settings_window
+	b := &g.settings.bindings
+	n := u32(Command.Toggle_Sidebar) * MAX_CHORDS
+
+	if frame == 0 {
+		sidebar = g.sidebar_visible
+		settings_window_toggle()
+		step, p.mark_frame = 1, frame
+		return false
+	}
+	waited := frame - p.mark_frame
+	if (g.animating && waited < 600) || waited < 2 {
+		return false
+	}
+
+	switch step {
+	case 1: // Enter on the row, then Ctrl+Shift+B
+		focus_item(Command.Toggle_Sidebar)
+		w.reveal = true
+		press(sdl.K_RETURN)
+		check(p, "Enter on a keybinding records one more", w.recording == .Toggle_Sidebar)
+		press_chord(.B, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+		next_step(p, &step, frame)
+
+	case 2: // a second chip; then Ctrl+G
+		added := bindings_label(b[.Toggle_Sidebar], " ") == "Ctrl+B Ctrl+Shift+B"
+		_, chip_shown := element_rect(clay.ID("BindingChip", n + 1))
+		check(p, "the key pressed is a second binding, as a chip", added && chip_shown)
+
+		press(sdl.K_RETURN)
+		press_chord(.G, sdl.KMOD_LCTRL)
+		next_step(p, &step, frame)
+
+	case 3: // taken from Go to line, which the row says
+		taken := bindings_count(b[.Go_To_Line]) == 0 && bindings_count(b[.Toggle_Sidebar]) == 3
+		said := w.bind_note == "Ctrl+G was taken from Go to line"
+		check(p, "a chord bound elsewhere is taken, and the row says so", taken && said)
+
+		// Both bindings run the command
+		settings_window_toggle()
+		press_chord(.B, sdl.KMOD_LCTRL)
+		first := g.sidebar_visible != sidebar
+		press_chord(.B, sdl.KMOD_LCTRL | sdl.KMOD_LSHIFT)
+		second := g.sidebar_visible == sidebar
+		check(p, "each binding runs the command", first && second)
+
+		settings_window_toggle()
+		next_step(p, &step, frame)
+
+	case 4: // → → and Delete remove the second
+		focus_item(Command.Toggle_Sidebar)
+		w.reveal = true
+		press(sdl.K_RIGHT)
+		press(sdl.K_RIGHT)
+		press(sdl.K_DELETE)
+		removed := bindings_label(b[.Toggle_Sidebar], " ") == "Ctrl+B Ctrl+G"
+		check(p, "Delete on a focused chip removes its binding", removed)
+		_, still := command_for_chord({key = sdl.K_B, ctrl = true, shift = true})
+		check(p, "a removed binding no longer runs", !still)
+
+		// The pointer on the next chip, to show its x
+		at, _ := element_center(clay.ID("BindingChip", n + 1))
+		g.mouse_pos = at
+		next_step(p, &step, frame)
+
+	case 5: // a press on the x removes it
+		click_element(clay.ID("BindingRemove", n + 1))
+		next_step(p, &step, frame)
+
+	case 6:
+		only := bindings_label(b[.Toggle_Sidebar], " ") == "Ctrl+B"
+		check(p, "a press on a chip's x removes its binding", only)
+
+		// The defaults back
+		b[.Toggle_Sidebar] = default_bindings(.Toggle_Sidebar)
+		b[.Go_To_Line] = default_bindings(.Go_To_Line)
+		settings_changed()
+		settings_window_toggle()
+		g.sidebar_visible = sidebar
+		return true
+	}
+	return false
+}
+
+
 @(private = "file")
 count_items :: proc($T: typeid) -> int {
 	n := 0
@@ -1958,7 +2167,7 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 		renamed_ok := !g.rename.active && os.exists(renamed) && !os.exists(old)
 		check(p, "typing replaces the name and Enter renames", renamed_ok)
 
-		pane := panes_open_file(renamed)
+		pane := open_loaded(renamed)
 		editor_text_input(focused_editor(), "x")
 		run_command(.Close_Pane)
 		_, asking := d.purpose.(Unsaved_Step)
@@ -2086,7 +2295,7 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 		// A maximized pane gives way to a pane that is focused
 		ps := &g.panes
 		a := ps.focused // renamed.txt
-		b := pane_for_file(moved)
+		b := pane_loaded(moved)
 		pane_move(b, {kind = .Split, target = a, side = .Right})
 		pane_focus(b)
 		pane_toggle_maximized()
@@ -2102,7 +2311,7 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 
 		// Back as it was
 		g.mouse_pos = mouse
-		if before != "" do panes_open_file(before)
+		if before != "" do open_loaded(before)
 		delete(before)
 		before = ""
 		return true
@@ -2646,7 +2855,7 @@ phase_box_glyphs :: proc(p: ^Perf, frame: int) -> bool {
 		check_terminal_box_glyphs(p, focused_terminal())
 
 		// The same rows in a file, the caret after them
-		pb.file = panes_open_file(path)
+		pb.file = open_loaded(path)
 		pane_focus(pb.file)
 		textedit.move(focused_editor(), .Doc_End, false)
 		pb.quiet_since = frame
@@ -2963,8 +3172,8 @@ phase_panes_typing :: proc(p: ^Perf, frame: int) -> bool {
 		ps.maximized = nil
 		perf_panes.terminal = ps.focused
 		close_files()
-		perf_panes.code = panes_open_file(path_in_dir(p, "code.odin"))
-		perf_panes.notes = pane_for_file(path_in_dir(p, "notes.md"))
+		perf_panes.code = open_loaded(path_in_dir(p, "code.odin"))
+		perf_panes.notes = pane_loaded(path_in_dir(p, "notes.md"))
 		pane_move(perf_panes.notes, {kind = .Split, target = perf_panes.code, side = .Right})
 		pane_focus(perf_panes.code)
 
@@ -3340,15 +3549,19 @@ press_mouse_button :: proc(button: u8, at: [2]f32) {
 
 // Runs typo itself (this program) in the terminal's shell with two files and
 // one in a folder that doesn't exist: the shell has the window's endpoint, so
-// the two open here, the second beside the first and focused, the terminal
-// still shown, and the third doesn't open
+// the two open here in new panes, the first beside the code (which stays
+// open), the second beside the first and focused, the terminal still shown,
+// and the third doesn't open. Then a file already open is sent again: its
+// pane is focused and no pane is added
 @(private = "file")
 phase_ipc_open :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) since: time.Tick
+	@(static) panes_before: int
 	sep := os.Path_Separator
 	first := path_in_dir(p, "ipc-first.md")
 	second := path_in_dir(p, fmt.tprintf("sub%cipc-second.md", sep))
 	missing := path_in_dir(p, fmt.tprintf("missing%cipc.md", sep))
+	code := perf_panes.code
 
 	if frame == 0 {
 		// The files
@@ -3374,6 +3587,14 @@ phase_ipc_open :: proc(p: ^Perf, frame: int) -> bool {
 		return false
 	}
 
+	// The file already open, sent again (the last step)
+	if p.mark_frame == -2 {
+		again := g.panes.focused == code && len(g.panes.open) == panes_before
+		check(p, "a file already open is focused, in its pane", again)
+		pane_focus(perf_panes.terminal)
+		return true
+	}
+
 	// Until both are open, then until the panes have settled
 	a, b := pane_with_file(first), pane_with_file(second)
 	opened := a != nil && b != nil
@@ -3389,18 +3610,123 @@ phase_ipc_open :: proc(p: ^Perf, frame: int) -> bool {
 	check(p, "typo <file> in the terminal opens the files in this window", opened)
 	if !opened do return true
 
+	kept := pane_shown(code) && pane_shown(a) && code.rect.x < a.rect.x
+	check(p, "the first file opens beside the code, which stays", kept)
 	beside := pane_shown(a) && pane_shown(b) && a.rect.x < b.rect.x
 	check(p, "the second file is beside the first, and focused", beside && g.panes.focused == b)
 	check(p, "the terminal stays shown", pane_shown(perf_panes.terminal))
 	check(p, "a file in a missing folder doesn't open", pane_with_file(missing) == nil)
 
-	// Back as the later phases expect: code.odin where the first file opened
-	// (in place of the code), the second file closed
+	// Back as the later phases expect: the two files closed. Then the code is
+	// sent again, as the listener would
 	pane_close(b, ask = false)
-	pane_focus(a)
-	perf_panes.code = panes_open_file(path_in_dir(p, "code.odin"))
+	pane_close(a, ask = false)
+	panes_before = len(g.panes.open)
 	pane_focus(perf_panes.terminal)
-	return true
+
+	paths := make([]string, 1)
+	paths[0] = strings.clone(code.content.(^Editor).path)
+	g.pending = Open_Files{paths = paths}
+	p.mark_frame = -2
+	return false
+}
+
+
+// Go to line on the code of phase_panes_typing: Ctrl+G opens the bar, typing
+// a line scrolls there (the line in the middle) with the caret on it, Enter
+// keeps it and Go back returns; Esc puts caret and scroll back. Then a line
+// of the notes, rendered
+@(private = "file")
+phase_goto_line :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) scroll: f64
+	@(static) was_rendered: bool
+	pp := &perf_panes
+	code := pp.code.content.(^Editor)
+	notes := pp.notes.content.(^Editor)
+
+	if frame == 0 {
+		g.panes.maximized = nil
+		pane_focus(pp.code)
+		textedit.set_single_selection(code, {0, 0, -1})
+		textedit.scroll_to(code, 0)
+		step, p.mark_frame = 1, frame
+		return false
+	}
+
+	// Each step once the last has shown, and what it opened is open
+	waited := frame - p.mark_frame
+	if g.animating || g.pending != nil || waited < 2 {
+		return false
+	}
+
+	switch step {
+	case 1:
+		press_chord(.G, sdl.KMOD_LCTRL)
+		opened := g.goto_line.open && g.goto_line.pane == pp.code
+		check(p, "Ctrl+G opens the go to line bar", opened)
+		type_text("1200")
+		next_step(p, &step, frame)
+
+	case 2: // the line previewed in the middle
+		_, bar_shown := element_rect(clay.ID("GotoBar"))
+		check(p, "the bar shows on the editor", bar_shown)
+
+		lh := f64(text_line_height(code))
+		line_middle := 1199 * lh + lh / 2
+		view_middle := code.scroll_y + f64(code.view.h) / 2
+		centered := abs(line_middle - view_middle) <= lh
+		check(p, "typing a line scrolls there, to the middle", centered)
+		check(p, "with the caret on it", caret_line_of(code) == 1199)
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 3:
+		kept := !g.goto_line.open && caret_line_of(code) == 1199
+		check(p, "Enter moves the caret there", kept)
+		run_command(.Go_Back)
+		next_step(p, &step, frame)
+
+	case 4:
+		check(p, "Go back returns to where it was", code.sels[code.primary].head == 0)
+		scroll = code.target_y
+		press_chord(.G, sdl.KMOD_LCTRL)
+		type_text("300")
+		next_step(p, &step, frame)
+
+	case 5: // previewed, then Esc
+		moved := caret_line_of(code) == 299 && code.target_y != scroll
+		press(sdl.K_ESCAPE)
+		back := code.sels[code.primary].head == 0 && code.target_y == scroll
+		check(p, "Esc puts the caret and the scroll back", moved && back && !g.goto_line.open)
+
+		// The notes, rendered
+		pane_focus(pp.notes)
+		was_rendered = md_rendered(notes)
+		if !was_rendered do run_command(.Toggle_Markdown_View)
+		next_step(p, &step, frame)
+
+	case 6:
+		press_chord(.G, sdl.KMOD_LCTRL)
+		type_text("40")
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 7:
+		on_line := md_rendered(notes) && caret_line_of(notes) == 39
+		check(p, "in rendered Markdown: the document's line", on_line)
+
+		if !was_rendered do run_command(.Toggle_Markdown_View)
+		pane_focus(pp.terminal)
+		return true
+	}
+	return false
+}
+
+
+@(private = "file")
+caret_line_of :: proc(e: ^Editor) -> int {
+	return buffer.offset_to_line(&e.buf, e.sels[e.primary].head)
 }
 
 
@@ -3599,7 +3925,7 @@ phase_zoom_markdown :: proc(p: ^Perf, frame: int) -> bool {
 
 	if frame == 0 {
 		close_files()
-		panes_open_file(path_in_dir(p, "notes.md"))
+		open_loaded(path_in_dir(p, "notes.md"))
 		e := focused_editor()
 		textedit.show_caret(e, true)
 		mid := buffer.line_start(&e.buf, buffer.line_count(&e.buf) / 2)

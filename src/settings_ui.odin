@@ -31,7 +31,14 @@ Settings_Window :: struct {
 	open:            bool,
 	opened_at:       u64, // frame it was opened on
 	search:          Line_Edit,
-	recording:       Maybe(Command), // waiting for a key press to bind
+
+	// Keybindings: each binding is a chip. A focused keybinding row's chips
+	// take the focus with ←→ (the row itself is chip -1)
+	recording:       Maybe(Command), // waiting for a key press to add as a binding
+	chip:            int,            // the focused row's focused chip, or -1
+	chip_command:    Command,        // the row `chip` is in
+	bind_note:       string,         // owned; what the last binding added did, or ""
+	bind_note_for:   Command,        // the row it shows under
 
 	// Keyboard focus: an index into `items`, or -1 for the search field.
 	// `items` lists the rows shown last frame, in order
@@ -123,6 +130,8 @@ settings_window_toggle :: proc() {
 	w.open = !w.open
 	w.opened_at = g.frame
 	w.recording = nil
+	w.chip = -1
+	set_string(&w.bind_note, "")
 	w.editing = nil
 	w.focus = -1
 	w.refocus = nil
@@ -143,6 +152,7 @@ settings_window_destroy :: proc() {
 	line_edit_destroy(&w.edit)
 	line_edit_destroy(&w.filter)
 	delete(w.original)
+	delete(w.bind_note)
 	delete(w.server_page)
 	for op in w.server_ops {
 		delete(op.name)
@@ -197,9 +207,17 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 		return true
 	}
 
+	// Backspace on a focused binding removes it
+	backspace := event.type == .KEY_DOWN && event.key.key == sdl.K_BACKSPACE
+	if backspace {
+		if cmd, i, on_chip := focused_chip(); on_chip {
+			remove_binding(cmd, i)
+			return true
+		}
+	}
+
 	// The search field has the keys while no row is focused. Typing or
 	// Backspace on a row goes back to it
-	backspace := event.type == .KEY_DOWN && event.key.key == sdl.K_BACKSPACE
 	if event.type == .TEXT_INPUT || backspace {
 		w.focus = -1
 	}
@@ -248,6 +266,8 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 			server_item_step(x, dir)
 		case Section:
 			set_collapsed(x, dir < 0)
+		case Command:
+			move_chip(x, dir)
 		}
 
 	case sdl.K_RETURN, sdl.K_KP_ENTER:
@@ -260,7 +280,11 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 		}
 
 	case sdl.K_DELETE:
-		if focused != nil do reset_item(focused)
+		if cmd, i, on_chip := focused_chip(); on_chip {
+			remove_binding(cmd, i)
+		} else if focused != nil {
+			reset_item(focused)
+		}
 
 	case:
 		// Find goes to the search field. Let the "open settings" shortcut close
@@ -391,7 +415,7 @@ activate_item :: proc(item: Setting_Item) {
 		settings_changed()
 
 	case Command:
-		g.settings_window.recording = x
+		start_recording(x)
 
 	case Server_Item, Add_Server_Item:
 		server_item_activate(item)
@@ -412,6 +436,7 @@ reset_item :: proc(item: Setting_Item) {
 	case Command:
 		g.settings.bindings[x] = default_bindings(x)
 		settings_changed()
+		set_bind_note(x, "")
 	case Server_Item:
 		server_item_reset(x)
 	case Add_Server_Item, Section:
@@ -425,34 +450,103 @@ confirm_reset_all :: proc() {
 }
 
 
-// While a keybinding waits for keys, binds the chord pressed (a key, or a mouse
-// button) to its command. Returns whether it was waiting
+// --- Keybindings -------------------------------------------------------------------
+
+// Waits for a chord to add to a command's bindings, unless it has all it can
+@(private = "file")
+start_recording :: proc(cmd: Command) {
+	w := &g.settings_window
+	if bindings_count(g.settings.bindings[cmd]) >= MAX_CHORDS {
+		set_bind_note(cmd, full_note())
+		return
+	}
+
+	set_bind_note(cmd, "")
+	w.recording = cmd
+}
+
+
+// While a keybinding waits for keys, adds the chord pressed (a key, or a mouse
+// button) to its command's bindings, taking it from the command that had it,
+// which the row then says. Returns whether it was waiting
 settings_window_record :: proc(chord: Chord) -> bool {
 	w := &g.settings_window
 	cmd, recording := w.recording.?
 	if !w.open || !recording {
 		return false
 	}
-
-	bind_command(cmd, chord)
 	w.recording = nil
+
+	result, from, taken := bindings_add(&g.settings.bindings, cmd, chord)
+	switch result {
+	case .Added:
+		settings_changed()
+		if taken {
+			note := fmt.tprintf("%s was taken from %s", format_chord(chord), COMMANDS[from].name)
+			set_bind_note(cmd, note)
+		}
+	case .Already_Bound:
+		set_bind_note(cmd, fmt.tprintf("%s is bound to this already", format_chord(chord)))
+	case .Full:
+		set_bind_note(cmd, full_note())
+	}
 	return true
 }
 
 
-// Binds a single chord to cmd, taking it away from any other command
 @(private = "file")
-bind_command :: proc(cmd: Command, chord: Chord) {
-	s := &g.settings
-	for &chords in s.bindings {
-		for &c in chords {
-			if c == chord do c = {}
-		}
-	}
+full_note :: proc() -> string {
+	return fmt.tprintf("At most %d bindings: remove one first", MAX_CHORDS)
+}
 
-	s.bindings[cmd] = {}
-	s.bindings[cmd][0] = chord
+
+@(private = "file")
+set_bind_note :: proc(cmd: Command, note: string) {
+	w := &g.settings_window
+	set_string(&w.bind_note, note)
+	w.bind_note_for = cmd
+}
+
+
+// The focused binding chip, if the focused row has one focused
+@(private = "file")
+focused_chip :: proc() -> (cmd: Command, i: int, ok: bool) {
+	w := &g.settings_window
+	row, is_command := focused_row_command()
+	if !is_command || row != w.chip_command {
+		return
+	}
+	if w.chip < 0 || w.chip >= bindings_count(g.settings.bindings[row]) {
+		return
+	}
+	return row, w.chip, true
+}
+
+
+// ←→ on a keybinding row: the focus moves between its chips and the row
+@(private = "file")
+move_chip :: proc(cmd: Command, dir: int) {
+	w := &g.settings_window
+	current := w.chip_command == cmd ? w.chip : -1
+	last := bindings_count(g.settings.bindings[cmd]) - 1
+
+	w.chip = clamp(current + dir, -1, last)
+	w.chip_command = cmd
+}
+
+
+// Removes a command's binding i; the focus goes to the chip now in its place,
+// else the one before
+@(private = "file")
+remove_binding :: proc(cmd: Command, i: int) {
+	w := &g.settings_window
+	bindings_remove(&g.settings.bindings, cmd, i)
 	settings_changed()
+	set_bind_note(cmd, "")
+
+	if w.chip_command == cmd {
+		w.chip = min(w.chip, bindings_count(g.settings.bindings[cmd]) - 1)
+	}
 }
 
 
@@ -1148,7 +1242,13 @@ settings_list :: proc() {
 							setting_control(x)
 						}
 					case Command:
-						if setting_row(x, COMMANDS[x].name, "", list) {
+						// The note copied: a click in the row may replace it
+						w := &g.settings_window
+						note := ""
+						if w.bind_note_for == x {
+							note = strings.clone(w.bind_note, context.temp_allocator)
+						}
+						if setting_row(x, COMMANDS[x].name, "", list, detail = note) {
 							keybinding_control(x, list)
 						}
 					}
@@ -1540,47 +1640,141 @@ text_setting_field :: proc(x: Setting, value: string) {
 RECORDING_PROMPT :: "Press a key or side button…  (Esc cancels)"
 
 
+// A command's bindings, each a chip with an x on hover that removes it, then
+// Add (the prompt while recording) and, when they aren't the defaults, Reset
 @(private = "file")
 keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 	w := &g.settings_window
 	recording := w.recording == cmd
+	chords := g.settings.bindings[cmd] // a copy: a click below may change them
 
 	if clay.UI()({layout = {childGap = 6, childAlignment = {y = .Center}}}) {
 		// Reset, when changed
-		if !recording && g.settings.bindings[cmd] != default_bindings(cmd) {
-			if button(clay.ID("BindingReset", u32(cmd)), "Reset", "Reset to default", "Del") {
+		if !recording && chords != default_bindings(cmd) {
+			reset_id := clay.ID("BindingReset", u32(cmd))
+			if button(reset_id, "Reset", "Reset to default", "Del", list) {
 				reset_item(cmd)
 			}
 		}
 
-		// The keys, or a prompt while recording
-		id := clay.ID("Binding", u32(cmd))
-		if clay.UI(id)({
-			layout = {
-				sizing = {width = clay.SizingFit({min = 120}), height = clay.SizingFixed(26)},
-				padding = {left = 8, right = 8},
-				childAlignment = {x = .Center, y = .Center},
-			},
-			backgroundColor = clay.Hovered() || recording ? gfx.theme.hover : gfx.theme.bg,
-			cornerRadius = clay.CornerRadiusAll(5),
-			border = {
-				color = recording ? gfx.theme.accent : gfx.theme.border,
-				width = clay.BorderOutside(1),
-			},
-		}) {
-			bound := bindings_label(g.settings.bindings[cmd], " / ")
-			switch {
-			case recording:   label(RECORDING_PROMPT, gfx.theme.accent, FONT_SIZE_SMALL)
-			case bound == "": label("Unbound", gfx.theme.text_dim, FONT_SIZE_SMALL)
-			case:             label(bound, gfx.theme.text, FONT_SIZE_SMALL)
-			}
+		// The chips
+		for chord, i in chords {
+			if chord_bound(chord) do binding_chip(cmd, i, chord, list)
 		}
 
-		if clicked(id, list) {
-			w.recording = recording ? nil : cmd
+		// Add, or the prompt
+		count := bindings_count(chords)
+		if count < MAX_CHORDS || recording {
+			add_binding_button(cmd, count, recording, list)
 		}
-		if !recording do tooltip(id, "Change keybinding", "Enter")
 	}
+}
+
+
+// A binding: the chord, and room for the x shown while the pointer is on it.
+// A press on the chip focuses it, on the x removes the binding
+@(private = "file")
+binding_chip :: proc(cmd: Command, i: int, chord: Chord, list: clay.ElementId) {
+	w := &g.settings_window
+	n := u32(cmd) * MAX_CHORDS + u32(i)
+	id := clay.ID("BindingChip", n)
+	remove := clay.ID("BindingRemove", n)
+
+	_, row_focused := focused_row_command()
+	focused := row_focused && w.chip_command == cmd && w.chip == i
+	hovered := pointer_in(id) && pointer_in(list)
+
+	if clay.UI(id)({
+		layout = {
+			sizing = {height = clay.SizingFixed(26)},
+			padding = {left = 8, right = 4},
+			childGap = 2,
+			childAlignment = {y = .Center},
+		},
+		backgroundColor = hovered ? gfx.theme.hover : gfx.theme.bg,
+		cornerRadius = clay.CornerRadiusAll(5),
+		border = {
+			color = focused ? gfx.theme.accent : gfx.theme.border,
+			width = clay.BorderOutside(1),
+		},
+	}) {
+		label(format_chord(chord), gfx.theme.text, FONT_SIZE_SMALL)
+
+		// The x, in a slot that is there either way so chips don't move
+		if clay.UI(remove)({
+			layout = {
+				sizing = {clay.SizingFixed(16), clay.SizingFixed(16)},
+				childAlignment = {x = .Center, y = .Center},
+			},
+			cornerRadius = clay.CornerRadiusAll(3),
+			backgroundColor = hovered && clay.Hovered() ? gfx.theme.selected : {},
+		}) {
+			if hovered do icon(.Close, gfx.theme.text_dim, 12)
+		}
+	}
+	if hovered do tooltip(remove, "Remove", "Del")
+
+	switch {
+	case clicked(remove, list):
+		remove_binding(cmd, i)
+	case clicked(id, list):
+		w.chip = i
+		w.chip_command = cmd
+	}
+}
+
+
+// Adds a binding: records the next chord pressed. Says what it does while
+// none is bound, the prompt while recording
+@(private = "file")
+add_binding_button :: proc(cmd: Command, count: int, recording: bool, list: clay.ElementId) {
+	w := &g.settings_window
+	id := clay.ID("BindingAdd", u32(cmd))
+
+	if clay.UI(id)({
+		layout = {
+			sizing = {height = clay.SizingFixed(26)},
+			padding = {left = 6, right = 8},
+			childGap = 4,
+			childAlignment = {y = .Center},
+		},
+		backgroundColor = clay.Hovered() || recording ? gfx.theme.hover : {},
+		cornerRadius = clay.CornerRadiusAll(5),
+		border = {
+			color = recording ? gfx.theme.accent : gfx.theme.border,
+			width = clay.BorderOutside(1),
+		},
+	}) {
+		switch {
+		case recording:
+			label(RECORDING_PROMPT, gfx.theme.accent, FONT_SIZE_SMALL)
+		case count == 0:
+			icon(.Plus, gfx.theme.text_dim, 13)
+			label("Add binding", gfx.theme.text_dim, FONT_SIZE_SMALL)
+		case:
+			icon(.Plus, gfx.theme.text_dim, 13)
+		}
+	}
+
+	if !recording do tooltip(id, "Add binding", "Enter")
+	if clicked(id, list) {
+		if recording {
+			w.recording = nil
+		} else {
+			start_recording(cmd)
+		}
+	}
+}
+
+
+// The focused row's command, if it is a keybinding row
+@(private = "file")
+focused_row_command :: proc() -> (cmd: Command, ok: bool) {
+	w := &g.settings_window
+	if w.focus < 0 || w.focus >= len(w.items) {
+		return
+	}
+	return w.items[w.focus].(Command)
 }
 
 
@@ -1602,7 +1796,10 @@ footer_hint :: proc() -> string {
 	case Add_Server_Item:
 		return "↑↓ select  Enter add a server"
 	case Command:
-		return "↑↓ select  Enter rebind  Del reset"
+		if _, _, on_chip := focused_chip(); on_chip {
+			return "←→ choose  Del remove  Enter add a binding"
+		}
+		return "↑↓ select  Enter add a binding  → choose one  Del reset"
 	case Setting:
 		info := SETTINGS[x]
 		switch _ in setting_value(&g.settings, x) {

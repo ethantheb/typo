@@ -25,6 +25,7 @@ import "langs"
 
 Settings :: struct {
 	restore_session:      bool,
+	ask_above_mb:         int, // a larger file is asked about before it is read; 0 = never
 	collapsed_sections:   string, // settings window sections shown collapsed: keys, ", "-separated
 	theme:                string,
 	ui_font:              string,
@@ -72,6 +73,7 @@ Settings :: struct {
 
 Setting :: enum {
 	Restore_Session,
+	Ask_Above_Mb,
 	Collapsed_Sections,
 	Theme,
 	Ui_Font,
@@ -174,6 +176,18 @@ SETTINGS := [Setting]Setting_Info {
 		              "files and terminals where they were.",
 		keywords    = "startup reopen workspace panes",
 		default     = true,
+	},
+	.Ask_Above_Mb = {
+		section     = .General,
+		key         = "ask_above_mb",
+		name        = "Ask before opening files larger than",
+		description = "In megabytes: a larger file opens only once you choose to, as it " +
+		              "takes at least that much memory. 0 never asks.",
+		keywords    = "large big huge file size memory open warning",
+		default     = int(256),
+		min         = 0,
+		max         = 65536,
+		step        = 64,
 	},
 	.Collapsed_Sections = {
 		section     = .General,
@@ -438,6 +452,7 @@ Setting_Value :: union {
 setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	switch x {
 	case .Restore_Session:      return &s.restore_session
+	case .Ask_Above_Mb:         return &s.ask_above_mb
 	case .Collapsed_Sections:   return &s.collapsed_sections
 	case .Theme:                return &s.theme
 	case .Ui_Font:              return &s.ui_font

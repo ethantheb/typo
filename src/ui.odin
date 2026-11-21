@@ -46,6 +46,7 @@ ui_interactive :: proc() -> bool {
 	case g.finder.open:                               return false
 	case settings_window_docked():                    return !pointer_in(clay.ID("Settings"))
 	case g.settings_window.open:                      return false
+	case goto_line_covers_pointer():                  return g.in_goto_bar
 	case find_bar_covers_pointer():                   return g.in_find_bar
 	}
 	return true

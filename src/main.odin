@@ -54,8 +54,10 @@ App :: struct {
 	menu:            Context_Menu,
 	rename:          Inline_Rename,
 	find:            Find,
+	goto_line:       Goto_Line,
 	in_popup:        bool, // building the dialog's or context menu's UI (see ui_interactive)
 	in_find_bar:     bool, // building the find bar (see ui_interactive)
+	in_goto_bar:     bool, // building the go to line bar (see ui_interactive)
 	right_pressed:   bool, // the right button went down this frame
 	quit:            bool, // set once quitting was confirmed
 	finder:          Finder,
@@ -73,6 +75,7 @@ App :: struct {
 	open_heading:    string, // owned; where the caret goes in the file `pending` opens
 	open_target:     Maybe(Open_Target), // or this: a place in it
 	jumps:           Jumps,              // Go back and Go forward
+	recent:          Recent_Files,       // recently used files, per folder
 	perf:            ^Perf,  // set by --perf
 }
 
@@ -178,6 +181,9 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	// Changes other programs make to files (fs_watch.odin)
 	watch_init()
 
+	// Reading files to open and writing files to save (file_io.odin)
+	io_init()
+
 	// The words of files, for word completions
 	words_init()
 
@@ -188,12 +194,16 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	clay.Initialize(arena, {f32(g.window_w), f32(g.window_h)}, {handler = clay_error_handler})
 	clay.SetMeasureTextFunction(measure_text, nil)
 
-	// With no arguments, the last session if there is one (session.odin)
+	// The recent files, and with no arguments the last session if there is one
+	// (session.odin)
+	saved, has_session := session_read()
+	recent_load(&g.recent, saved.recent)
 	restored :=
+		has_session &&
 		len(os.args) == 1 &&
 		g.perf == nil &&
 		g.settings.restore_session &&
-		session_restore()
+		session_restore(saved)
 	if !restored {
 		open_paths(args.paths, args.terminal)
 	}
@@ -323,6 +333,8 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	ipc_frame()
 	apply_pending_action()
 	dialog_frame()
+	file_load_frame()
+	unsaved_frame()
 	file_sync_frame()
 	context_menu_frame()
 	zoom_popup_frame()
@@ -336,6 +348,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	button_chord_frame()
 	finder_frame()
 	find_frame()
+	goto_line_frame()
 	panes_frame()
 	words_frame()
 	lsp_completion_frame()
@@ -389,6 +402,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 needs_continuous_frames :: proc() -> bool {
 	switch {
 	case g.pending != nil,
+	     loads_busy(),
 	     ipc_busy(),
 	     finder_busy(),
 	     find_busy(),
@@ -448,7 +462,10 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 
 	#partial switch event.type {
 	case .QUIT:
-		if !panes_unsaved() do return .SUCCESS
+		// Writes under way finish first
+		if !panes_unsaved() && !saves_pending() {
+			return .SUCCESS
+		}
 		resolve_unsaved(g.panes.open[:], Quit{})
 
 	case .KEY_DOWN, .TEXT_INPUT:
@@ -553,6 +570,7 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 	if settings_window_handle_event(event) do return
 	if finder_handle_event(event) do return
+	if goto_line_handle_event(event) do return
 	if find_handle_event(event) do return
 	if lsp_completion_handle_key(event) do return
 
@@ -597,17 +615,22 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	session_save()
 
+	// The writer tells the watcher what it wrote: stopped first, its writes done
+	io_destroy()
 	ipc_destroy()
 	watch_destroy()
 	finder_destroy()
 	find_destroy()
+	goto_line_destroy()
 	menu_close()
 	rename_destroy()
 	dialog_destroy()
 	panes_destroy()
+	file_load_destroy()
 	words_destroy()
 	lsp_destroy()
 	jumps_destroy()
+	recent_destroy(&g.recent)
 	settings_window_destroy()
 	settings_destroy(&g.settings)
 	gfx.fonts_destroy(&g.fonts)
@@ -712,8 +735,9 @@ Open_Beside  :: distinct string // owned, full path; in a new pane beside the on
 Open_Folder  :: distinct string // owned
 Run_Command  :: distinct Command
 
-// Files from the command line or a typo started in a terminal: the first
-// where a file goes, the others each beside the one before
+// Files from the command line or a typo started in a terminal, each in a new
+// pane: the first beside the editor in use, the others each beside the one
+// before. No open file loses its place
 Open_Files :: struct {
 	paths: []string, // owned, full paths
 	raise: bool,     // bring the window to the front
@@ -761,13 +785,11 @@ apply_pending_action :: proc() {
 		workspace_toggle(&g.workspace, int(a))
 
 	case Open_File:
+		// The heading or place, once its text is there
 		p := panes_open_file(string(a))
-		e, is_file := p.content.(^Editor)
-		if is_file && e.md != nil && g.open_heading != "" {
-			mdview.jump_to_heading(&e.md_view, g.open_heading)
-		}
-		if target, has_target := g.open_target.?; has_target && is_file {
-			apply_open_target(e, target)
+		if e, is_file := p.content.(^Editor); is_file {
+			editor_when_ready(e, {target = g.open_target, heading = g.open_heading})
+			g.open_heading = ""
 		}
 		delete(string(a))
 		delete(g.open_heading)
@@ -779,8 +801,8 @@ apply_pending_action :: proc() {
 		delete(string(a))
 
 	case Open_Files:
-		panes_open_file(a.paths[0])
-		for path in a.paths[1:] do panes_open_file_beside(path)
+		beside: ^Pane
+		for path in a.paths do beside = panes_open_file_beside(path, beside)
 		if a.raise do raise_window()
 		delete_paths(a.paths)
 

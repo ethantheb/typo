@@ -6,7 +6,6 @@ import "core:path/filepath"
 import "core:slice"
 import "core:strings"
 
-import "buffer"
 import sdl "../vendor/sdl3"
 import "mdview"
 import "textedit"
@@ -15,11 +14,13 @@ import "textedit"
 // saved to session.json beside settings.toml when typo exits. Started with no
 // arguments, typo opens it again (the restore_session setting). Files come back
 // as saved on disk, with their caret and scroll; terminals come back as new
-// shells under their names. A file that is gone leaves its place to the others
+// shells under their names. A file that is gone leaves its place to the others.
+// The recent files of each folder (recent.odin) are saved with it, also when
+// the session isn't restored
 
 
 Session :: struct {
-	root:      string,
+	root:      string, // "" when only the recent files are saved
 	sidebar:   bool,
 	expanded:  []string, // open folders in the tree
 	window:    struct {
@@ -30,6 +31,12 @@ Session :: struct {
 	layout:    []Session_Tile, // the tree's root, or none
 	focused:   int,            // index into panes, or -1
 	maximized: int,
+	recent:    []Session_Recent,
+}
+
+Session_Recent :: struct {
+	root:  string,
+	files: []string, // most recent first
 }
 
 Session_Pane :: struct {
@@ -69,23 +76,30 @@ track_window_size :: proc() {
 
 // --- Saving ------------------------------------------------------------------------
 
-// Writes the session (when restore_session is on)
+// Writes the session: the recent files, and the rest when restore_session is on
 session_save :: proc() {
-	if g.perf != nil || !g.settings.restore_session || g.workspace.root == "" {
+	if g.perf != nil || g.workspace.root == "" {
 		return
 	}
 	path := session_path()
 	if path == "" do return
+	recent_drop_missing()
 
 	context.allocator = context.temp_allocator
 	ps := &g.panes
 
 	s := Session {
-		root      = g.workspace.root,
-		sidebar   = g.sidebar_visible,
 		focused   = -1,
 		maximized = -1,
+		recent    = recent_saved(&g.recent),
 	}
+	if !g.settings.restore_session {
+		write_session(path, s)
+		return
+	}
+
+	s.root = g.workspace.root
+	s.sidebar = g.sidebar_visible
 	s.window.w, s.window.h = g.window_size.x, g.window_size.y
 	s.window.maximized = sdl.GetWindowFlags(g.window) & {.MAXIMIZED} != {}
 
@@ -124,7 +138,13 @@ session_save :: proc() {
 		s.layout = layout
 	}
 
-	data, err := json.marshal(s, {pretty = true})
+	write_session(path, s)
+}
+
+
+@(private = "file")
+write_session :: proc(path: string, s: Session) {
+	data, err := json.marshal(s, {pretty = true}, context.temp_allocator)
 	if err == nil {
 		_ = os.write_entire_file(path, data)
 	}
@@ -147,6 +167,17 @@ session_pane :: proc(p: ^Pane) -> (sp: Session_Pane, kept: bool) {
 		}
 		if len(c.sels) > 0 {
 			sp.caret = c.sels[c.primary].head
+		}
+
+		// Still loading: as restored, and in the Markdown view it opens in
+		if c.status == .Loading {
+			if view, ok := c.load.ready.restore.?; ok {
+				sp.caret, sp.scroll_y, sp.scroll_x = view.caret, view.scroll_y, view.scroll_x
+			}
+
+			mode, chosen := g.md_modes[c.path]
+			if !chosen do mode = mdview.default_mode(int(c.load.size))
+			sp.rendered = is_markdown_path(c.path) && mode == .Rendered
 		}
 
 	case ^Terminal:
@@ -176,19 +207,28 @@ save_tile :: proc(t: ^Tile, index: map[^Pane]int) -> Session_Tile {
 
 // --- Restoring ---------------------------------------------------------------------
 
-// Opens the saved session. Returns false if there is none to open
-session_restore :: proc() -> bool {
+// Reads the saved session, in the temp allocator. Returns false if there is none
+session_read :: proc() -> (s: Session, ok: bool) {
+	s = {focused = -1, maximized = -1} // if the file leaves them out
+
 	path := session_path()
-	if path == "" do return false
+	if path == "" do return
 
 	data, read_err := os.read_entire_file(path, context.temp_allocator)
-	if read_err != nil do return false
+	if read_err != nil do return
 
-	s := Session{focused = -1, maximized = -1} // if the file leaves them out
 	if json.unmarshal(data, &s, allocator = context.temp_allocator) != nil {
+		return {focused = -1, maximized = -1}, false
+	}
+	return s, true
+}
+
+
+// Opens a saved session. Returns false if it has no folder to open
+session_restore :: proc(s: Session) -> bool {
+	if s.root == "" || !os.is_dir(s.root) {
 		return false
 	}
-	if !os.is_dir(s.root) do return false
 
 	// The folder and the window
 	open_folder(s.root)
@@ -270,34 +310,18 @@ restore_panes :: proc(saved: []Session_Pane) -> []^Pane {
 		p := pane_for_file(sp.file)
 		if slice.contains(panes, p) do continue
 
-		e, is_editor := p.content.(^Editor)
-		if is_editor && e.status == .Text {
-			// The zoom first: the scroll position is in its line heights
+		// The zoom first (the scroll position is in its line heights), then the
+		// caret and scroll once the text is there
+		if e, is_editor := p.content.(^Editor); is_editor {
 			pane_init_zoom(p, zoom)
 
-			at := caret_in(&e.buf, sp.caret)
-			textedit.set_single_selection(e, {at, at, -1})
-			e.scroll_y, e.target_y = sp.scroll_y, sp.scroll_y
-			e.scroll_x, e.target_x = sp.scroll_x, sp.scroll_x
+			view := Restored_View{sp.caret, sp.scroll_y, sp.scroll_x}
+			editor_when_ready(e, {restore = view})
 		}
 		panes[i] = p
 	}
 
 	return panes
-}
-
-
-// A saved caret in a file that may have changed: not past its end, and not
-// inside a character
-@(private = "file")
-caret_in :: proc(b: ^buffer.Buffer, saved: int) -> int {
-	length := buffer.length(b)
-	at := clamp(saved, 0, length)
-
-	for at > 0 && at < length && buffer.byte_at(b, at) & 0xC0 == 0x80 {
-		at -= 1
-	}
-	return at
 }
 
 

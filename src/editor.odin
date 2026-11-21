@@ -1,9 +1,6 @@
 package editor
 
-import "core:hash/xxhash"
-import "core:os"
 import "core:path/filepath"
-import "core:slice"
 import "core:strings"
 
 import "buffer"
@@ -30,7 +27,10 @@ Editor :: struct {
 	md:       ^markdown.Doc, // block structure of a Markdown file, else nil
 	md_view:  mdview.View,   // the rendered view of a Markdown file
 	new_file: bool,          // path doesn't exist yet; the first save creates it
+	large:    bool,          // over LARGE_FILE_BYTES: not sent to language servers
 	status:   File_Status,
+	load:     Load_State,      // while Loading (file_load.odin)
+	save:     Save_State,      // a write under way
 	lsp:      langs.Doc,       // the document on its language servers
 	disk:     Disk_State,      // the file on disk, as the watcher sees it (file_sync.odin)
 	words:    Word_State,      // its words, for word completions (word_completion.odin)
@@ -45,7 +45,7 @@ Editor :: struct {
 	// Set once laid out at its real size with nothing in view still loading
 	// (editor_ready); until then the pane is drawn empty
 	shown:     bool,
-	opened_at: u64, // ticks
+	opened_at: u64, // ticks: when it began loading, then when it loaded
 
 	dragging:    bool,
 	drag_mode:   enum {
@@ -68,6 +68,7 @@ Editor :: struct {
 
 File_Status :: enum {
 	None,
+	Loading, // its file is being read (file_load.odin)
 	Text,
 	Binary,
 	Error,
@@ -106,50 +107,7 @@ editor_on_edit :: proc(v: ^textedit.View, changes: []buffer.Change) {
 }
 
 
-// --- Open / save -------------------------------------------------------------------
-
-editor_open :: proc(e: ^Editor, path: string) {
-	editor_close(e)
-	editor_attach(e)
-	e.path = strings.clone(path)
-
-	// Read the file; a path that doesn't exist opens as an empty, unsaved file
-	stamp, exists := file_stamp(path)
-	data: []u8
-	if exists {
-		err: Read_Error
-		data, err = read_file_shared(path)
-		if err != .None {
-			e.status = .Error
-			return
-		}
-
-		// Anything with a NUL byte in its first 8KB is binary
-		if slice.contains(data[:min(len(data), 8192)], 0) {
-			delete(data)
-			e.status = .Binary
-			return
-		}
-	} else {
-		e.new_file = true
-	}
-	disk_opened(e, file_hash(data), stamp, exists)
-
-	// The document, its highlighting and Markdown structure
-	buffer.buffer_init(&e.buf, data)
-	syntax.highlighter_open(&e.hl, &e.buf, path)
-	if is_markdown_path(path) {
-		e.md = new(markdown.Doc)
-		markdown.doc_open(e.md, &e.buf)
-		mdview.attach(&e.md_view, e, e.md, &TEXT_KIND, md_initial_mode(e))
-	}
-
-	e.status = .Text
-	e.opened_at = sdl.GetTicksNS()
-	append(&e.sels, Selection{0, 0, -1})
-	lsp_doc_open(e)
-}
-
+// --- Open / save (file_load.odin opens and saves) -----------------------------------
 
 // Whether a Markdown file is shown rendered
 md_rendered :: proc(e: ^Editor) -> bool {
@@ -180,8 +138,12 @@ md_toggle_view :: proc(e: ^Editor) {
 
 // After the file was renamed to e.path: highlighting and language servers
 // follow the new name, and the editor gains or drops its Markdown structure and
-// rendered view
+// rendered view. A file still loading is read again from its new path
 editor_path_changed :: proc(e: ^Editor) {
+	if e.status == .Loading {
+		editor_load_moved(e)
+		return
+	}
 	if e.status != .Text do return
 
 	disk_path_changed(e)
@@ -218,6 +180,7 @@ is_markdown_path :: proc(path: string) -> bool {
 
 
 editor_close :: proc(e: ^Editor) {
+	editor_io_close(e)
 	langs.doc_close(&e.lsp)
 	words_close(e)
 	disk_closed(e)
@@ -249,49 +212,6 @@ editor_destroy :: proc(e: ^Editor) {
 // Unsaved: edited since read or written, or the file was deleted meanwhile
 editor_is_modified :: proc(e: ^Editor) -> bool {
 	return e.status == .Text && (buffer.is_modified(&e.buf) || e.disk.missing)
-}
-
-
-// Writes to a temporary file and renames it over the original, so a failed
-// save never leaves a half-written file. The watcher is told what was written
-// (disk_saved), so it isn't taken for a change
-editor_save :: proc(e: ^Editor) -> bool {
-	if e.status != .Text do return false
-	if e.new_file || e.disk.missing {
-		_ = os.make_directory_all(os.dir(e.path))
-	}
-
-	// Write the temporary file, hashing what is written
-	tmp := strings.concatenate({e.path, ".typo.tmp"}, context.temp_allocator)
-	f, err := os.create(tmp)
-	if err != nil {
-		sdl.Log("save: cannot create %s", strings.clone_to_cstring(tmp, context.temp_allocator))
-		return false
-	}
-	hasher, _ := xxhash.XXH3_create_state(context.temp_allocator)
-	for chunk in buffer.chunks(&e.buf) {
-		if _, werr := os.write(f, chunk); werr != nil {
-			os.close(f)
-			os.remove(tmp)
-			sdl.Log("save: write failed")
-			return false
-		}
-		xxhash.XXH3_64_update(hasher, chunk)
-	}
-	os.close(f)
-
-	// Put it in place of the original
-	if os.rename(tmp, e.path) != nil {
-		os.remove(tmp)
-		sdl.Log("save: rename failed")
-		return false
-	}
-
-	buffer.mark_saved(&e.buf)
-	e.new_file = false
-	disk_saved(e, xxhash.XXH3_64_digest(hasher))
-	langs.doc_saved(&e.lsp)
-	return true
 }
 
 

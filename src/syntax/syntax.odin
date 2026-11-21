@@ -130,6 +130,9 @@ language_for_name :: proc(name: string) -> Language {
 
 // --- Highlighter -------------------------------------------------------------------
 
+// Opens the highlighter for a file, parsing it with tree-sitter when the
+// language has a grammar and the file is small enough. May run on any thread
+// (the loader opens files): the highlighter keeps no pointer to the buffer
 highlighter_open :: proc(h: ^Highlighter, b: ^buffer.Buffer, path: string) {
 	highlighter_close(h)
 	h.lang = language_for_path(path)

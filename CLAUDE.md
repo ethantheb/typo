@@ -109,10 +109,12 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   wake-ups and display scale changes are ignored), runs scripted phases (startup,
   text in cells and subpixels, read back from the window, selection shapes,
   parsing, typing, scrolling, resizing, the sideways scroll bar, rendered Markdown,
-  huge files, finder, find in files and the terminal, moving lines, settings
-  window, context menu and dialogs, files changed on disk, terminal, block elements
-  and box drawing read back from the terminal and an editor, panes, zoom,
-  `typo <file>` in the terminal, text fields, idle CPU/GPU) and exits
+  huge files opened, saved and restored while frames go on (perf_files.odin), the
+  large-file question, finder (open and recent files first), find in files and the
+  terminal, moving lines, settings window (several bindings for a command), context
+  menu and dialogs, files changed on disk, terminal, block elements and box drawing
+  read back from the terminal and an editor, panes, zoom, `typo <file>` in the
+  terminal, go to line, text fields, idle CPU/GPU) and exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
   setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed`, sending other mouse
   buttons through `mouse_button_event` and keys through `handle_key_event`; chords
@@ -174,7 +176,37 @@ other processes send) runs on other threads, which hand over finished results.
   as it was (`snapshot_read`, `spans`, `snapshot_line_start`) while the UI thread goes
   on editing, and after the buffer is destroyed. Its holder releases it
   (`snapshot_release`, on any thread). Work on a document's text off the UI thread
-  takes a snapshot: the language server's open, the reload diff, the word index.
+  takes a snapshot: the language server's open, the reload diff, the word index, a
+  save's write.
+- **Opening and saving** (file_io.odin, file_load.odin): nothing waits on the disk on
+  the UI thread. `editor_open` leaves the editor `.Loading` and queues a `Load_Job`
+  for a pool of `LOAD_THREADS` loader threads (one queue; a huge file doesn't hold up
+  small ones), which stat the file, read it (`read_file_shared`), check for binary,
+  hash it, and build the buffer (newline index) and highlighter (tree-sitter's first
+  parse; `syntax.highlighter_open` runs on any thread, queries load under a lock).
+  `file_load_frame` takes the results (each tagged with the editor's `Load_State.id`;
+  a result for a closed or reopened editor is dropped and freed, and a cancelled load
+  stops at its next step) and `load_landed` only wires them up: Markdown, the
+  watcher (`disk_opened`), language servers, then the editor's `When_Ready` (a jump's
+  target, a Markdown heading, the session's caret and scroll), applied once. Anything
+  that needs the text of a file it opens calls `editor_when_ready` (applied at once if
+  it is there): `Open_File`, the jump list, session restore. A loading pane is drawn
+  empty, then "Loading name… size" (`loading_message`) once `EDITOR_SHOW_WAIT` passed;
+  keys and commands in it are ignored (`status != .Text`), Close works. A file over
+  the `ask_above_mb` setting is only measured: a dialog (`Opening_Large`) asks once no
+  other is open; Open reads it, Cancel closes its pane and puts back the file it took
+  the place of (`Load_State.replaced`, kept open until the load lands). Files over
+  `LARGE_FILE_BYTES` (`Editor.large`) aren't sent to language servers. `editor_save`
+  takes a snapshot and `buffer.begin_save` and queues a `Write_Job` for one writer
+  thread (writes land in order): temp file + rename, hashing what it writes, and
+  telling the watcher (`watch_file_synced`) before handing the result over;
+  `save_landed` then marks that text saved (`buffer.end_save`: edits made meanwhile
+  keep the file modified; steps never merge into a state being written) or shows why
+  it failed. A save asked for during a write follows it. The unsaved-changes flow
+  waits for writes before each question and before closing or quitting
+  (`unsaved_frame`); quitting with a write under way waits for it, and `io_destroy`
+  finishes queued writes. Without the threads (unit tests that don't start them) a job
+  runs at once on the calling thread.
 - **Panes** (panes.odin): each open file (`^Editor`) or terminal (`^Terminal`) is a
   `Pane` in `g.panes.open`. Shown panes are the leaves of a split tree (`Tile`) filling
   `work_rect()`; terminals not shown wait on the shelf, listed under the file tree.
@@ -189,8 +221,11 @@ other processes send) runs on other threads, which hand over finished results.
   focusing a pane (`pane_focus`) restores a maximized pane that would cover it.
   `pane_fill` says how a pane takes the work area (beside others, maximized over
   them, or alone); the title's maximize button and the focus outline follow it, and
-  the only pane shown is never maximized. Files
-  open in place of the editor in use (`place_for`). Element ids carry `Pane.id`
+  the only pane shown is never maximized. Files from the tree or the finder open in
+  place of the editor in use (`place_for`); files from the command line, from
+  `typo <file>` in a terminal or a server's log open in a new pane, never in place
+  of another (`panes_open_file_beside`: right of the editor in use, else above the
+  rest; a file already shown is focused). Element ids carry `Pane.id`
   ("Pane", "PaneBody", "PaneTitle"); tree rows are keyed by path (`tree_row_id`), so
   a press matched against last frame's layout finds the same file after the tree
   re-sorts. Whatever holds a `^Pane` (menu, rename, drag, pending `Pane_Op`) is
@@ -221,6 +256,16 @@ other processes send) runs on other threads, which hand over finished results.
   (F3), act on the focused pane: from another pane they move the bar there. The bar
   covers what is under it (`find_bar_covers_pointer` in `ui_interactive`; it is
   built with `g.in_find_bar`), as it can reach past a narrow pane.
+- **Go to line** (goto_line.odin, Ctrl+G): a bar (`g.goto_line`) centered at the top
+  of the focused editor, over the find bar, with a `Line_Edit` whose placeholder is
+  "Line 120 of 4,032". It takes "line" or "line:column" (`goto_parse`; columns count
+  characters, out-of-range numbers clamp in `goto_offset`); typing moves the caret
+  there with `View.center` + `reveal`, Enter puts the caret back and goes through
+  `jump_to` (so Go back returns), Esc puts caret and scroll back, and a press outside
+  it, another shortcut, another pane focused or a popup over the editors closes it,
+  the caret put back. While open it takes the keys (`goto_line_handle_event`, before the find
+  bar's); it covers what is under it (`goto_line_covers_pointer`, `g.in_goto_bar`).
+  Lines are the document's, in rendered Markdown too.
 - **Text fields** (line_edit.odin): every text input (find bar, finder, settings
   search, text settings and server fields, picker filter, renaming in place, the
   symbol rename field) is a `Line_Edit` drawn by `text_field`. Its owner decides
@@ -246,7 +291,9 @@ other processes send) runs on other threads, which hand over finished results.
   them in place (`workspace_apply_listings`); added/removed/renamed entries mark the
   finder's index stale (rebuilt if it lists files, else dropped until needed). Open
   files are registered with the hash and size/write time of the text typo last read or
-  wrote (`watch_file_open`, `watch_file_synced` after a save or reload), so typo's own
+  wrote (`watch_file_open` once loaded, which has the thread look at it once in case
+  it changed while it loaded; `watch_file_synced` after a reload or, from the writer
+  thread, a save), so typo's own
   writes aren't changes; a changed one is read once it holds still (`WATCH_STABLE`),
   with full sharing (`read_file_shared`; retried while locked). Without unsaved edits
   it reloads: the thread diffs it against a snapshot of the text (`diff.lines`) and
@@ -362,9 +409,11 @@ other processes send) runs on other threads, which hand over finished results.
   new window instead. Messages are length-prefixed frames of NUL-ended fields with a
   version (`ipc/message.odin`), validated on both sides. The server's thread checks the
   paths (a folder, or a missing parent folder, is refused; a missing file opens empty)
-  and queues the rest; `ipc_frame` turns a request into `Open_Files`: the first file
-  where a file goes (`place_for`, so the terminal stays), the others each beside the
-  one before, the last focused, and the window raised.
+  and queues the rest; `ipc_frame` turns a request into `Open_Files`: each file in a
+  new pane (`panes_open_file_beside`), the first right of the editor in use (above
+  the rest when none is shown, so the terminal stays), the others each beside the one
+  before, the last focused, and the window raised. No editor loses its place; a file
+  already open is shown and focused.
 - **The finder** (finder.odin) lists a `Finder_Source`: the workspace's files
   (Ctrl+E), or a server's `Finder_Item`s (lsp_symbols.odin): a file's outline
   (Ctrl+Shift+O, the caret's symbol selected), the project's symbols (Ctrl+T, asked
@@ -375,7 +424,25 @@ other processes send) runs on other threads, which hand over finished results.
   order and references by file (the asked one first); the items take the answer's
   strings over. Every source is filtered locally with `fuzzy.score`, incrementally,
   and only the rows in view are laid out. Accepting goes through `jump_to`; a row
-  clicked in the layout is opened next frame by `finder_frame`.
+  clicked in the layout is opened next frame by `finder_frame`. Files open in typo
+  (every editor pane, shown or kept for its unsaved changes) and recent files
+  (recent.odin) come first, as in VS Code's quick open and Zed's file finder: they
+  are ranked when the finder opens (`Finder.ranked`, by `path_key_ascii`). With no
+  query: the open files, most recently used first, then the recent ones, then the
+  shortest paths; the focused file isn't listed, so Enter switches. With a query
+  they get `FINDER_BOOST` on their score. Their rows say "open" or "recent".
+- **Recent files** (recent.odin, `g.recent`): per workspace folder (at most
+  `RECENT_MAX_FOLDERS`), the files whose panes were focused, most recent first (at
+  most `RECENT_MAX_FILES`; `recent_touch` from `pane_focus`). Renaming and deleting in
+  typo update them; session.json keeps them (`Session.recent`, written on exit even
+  when the session isn't restored), dropping files the finder's complete index
+  doesn't have (`recent_drop_missing`).
+- **Keybindings in the settings** (settings_ui.odin): a command's bindings (up to
+  `MAX_CHORDS`) are chips, each with an x on hover; Add records one more (a key or a
+  side button), taking it from the command that had it (`bindings_add`), which the
+  row then says (`bind_note`); Reset puts the defaults back. Keys: Enter on the row
+  adds, ←→ move the focus between the row and its chips (`chip`, `chip_command`),
+  Delete or Backspace removes the focused chip, Delete on the row resets.
 - **Completion and signature help** (lsp_completion.odin): `lsp_typed` (from
   `editor_text_input`) marks completions due: once identifier typing rests
   `COMPLETION_DELAY` (not on a number, nor in a comment or string by the highlighter),
@@ -430,17 +497,19 @@ other processes send) runs on other threads, which hand over finished results.
 
 ### A frame (`app_iterate`, main.odin)
 
-1. Apply the pending `Action` and the watcher's results (`file_sync_frame`), update
-   focus, run `finder_frame` and `panes_frame`
+1. Apply the pending `Action`, the loader's and writer's results (`file_load_frame`;
+   `unsaved_frame` goes on once writes landed) and the watcher's (`file_sync_frame`),
+   update focus, run `finder_frame` and `panes_frame`
    (divider and pane drags, then each pane's `editor_frame`/`terminal_frame`), which
    read last frame's layout (`element_rect`, `pointer_in`) and handle the mouse.
 2. `build_ui` (layout.odin) declares the Clay tree; editors and terminals are custom
    elements drawn by `draw_editor`/`draw_terminal`.
 3. `render_clay_commands`, present, `free_all(context.temp_allocator)`.
 
-- Nothing shows half ready: a new file isn't drawn (`Editor.shown`) until it has real
-  bounds and no image in view is loading (or `EDITOR_SHOW_WAIT` passed); the window
-  starts hidden until the first ready frame.
+- Nothing shows half ready: a new file isn't drawn (`Editor.shown`) until it has
+  loaded, has real bounds and no image in view is loading (or `EDITOR_SHOW_WAIT`
+  passed; a file still loading then says so); the window starts hidden until the
+  first ready frame (`panes_ready`).
 - The loop sleeps when idle: `needs_continuous_frames` lists what keeps it awake,
   other threads call `wake_main_loop`.
 - Strings used by a frame's render commands must outlive the frame's drawing: per-frame
@@ -456,11 +525,13 @@ other processes send) runs on other threads, which hand over finished results.
 src/                 package editor: the app
   main.odin          App state (global `g`), SDL callbacks, frame loop, idle, deferred actions
   keymap.odin        Command enum, default bindings, chords (a key, or a mouse side
-                     button: "Mouse4" back, "Mouse5" forward), run_command
+                     button: "Mouse4" back, "Mouse5" forward), adding and removing
+                     bindings, run_command
   settings.odin      Settings model: SETTINGS table, TOML load/save (saver thread), file
                      watcher
   settings_ui.odin   Settings window from SETTINGS, sections collapsible (kept in
-                     collapsed_sections); theme/font picker docked at the side
+                     collapsed_sections); theme/font picker docked at the side;
+                     keybinding rows with a chip per binding
   settings_servers.odin  Language servers in the settings window: rows, a server's page,
                      Add/Remove, Install
   render.odin        Clay render commands -> gfx calls; Clay text measurement
@@ -471,7 +542,8 @@ src/                 package editor: the app
   layout.odin        Window layout: sidebar (file tree, shelf), status bar, mouse cursor
   panes.odin         Panes: shelf, split tree, drops, divider and pane dragging,
                      pane UI, focus, pane commands
-  editor.odin        Editor: open/save, Markdown attachment, keys, commands, clipboard
+  editor.odin        Editor: state, Markdown attachment, renames, keys, commands,
+                     clipboard (opening and saving are in file_load.odin)
   editor_view.odin   Editor per-frame update, mouse selection, scrolling, scroll bars,
                      drawing, all through the view's kind
   text_view.odin     TEXT_KIND: line grid, gutter, highlighting, line/column movement
@@ -493,9 +565,12 @@ src/                 package editor: the app
                      search) or a server's symbols and places; rows in view only
   find*.odin         Find in a pane (Ctrl+F): the bar, searching editors (plain, whole
                      word, case, regex), libghostty search in terminals
+  goto_line.odin     Go to line (Ctrl+G): the bar, reading "line:column", previewing
   workspace.odin     Lazy file tree, folder dialog
-  session.odin       The session (folder, window, panes and layout) saved on exit to
-                     session.json and reopened when started with no arguments
+  session.odin       The session (folder, window, panes and layout, recent files)
+                     saved on exit to session.json and reopened when started with no
+                     arguments
+  recent.odin        Recently used files per workspace folder, for the finder
   ipc_open.odin      `typo <file>` from typo's terminals: the listener, its queue, the
                      shells' TYPO_IPC, and the command line's side (forward_to_window)
   fs_walk*.odin      Directory listing (the tree's order: read_tree_folder), recursive
@@ -504,6 +579,10 @@ src/                 package editor: the app
                      and diffing changed open files; file_stamp, read_file_shared
   file_sync.odin     The watcher's results applied: tree, finder, reloads, the
                      "changed on disk" dialogs, saving over a newer version
+  file_io.odin       Loader threads and the writer thread: jobs, queues, results
+                     (reading and building a document, writing a snapshot)
+  file_load.odin     Opening and saving in the app: the Loading state, results
+                     wired up, When_Ready, the large-file question, save results
   lsp.odin           Language servers in the app: langs.env, responses by feature, F8,
                      installs, go to definition, the jump list
   lsp_symbols.odin   Symbols and references in the finder: asking, answers as items
@@ -524,7 +603,11 @@ src/                 package editor: the app
   *_test.odin        App tests (editor_test, md_view_test: a Markdown file in the editor,
                      panes_test: the split tree, find_test: searching an editor,
                      line_edit_test: keys in a text field, fs_watch_test: bursts,
-                     the tree following listings, reloads)
+                     the tree following listings, reloads, recent_test: the recent
+                     files and the session, goto_line_test: places and keys in the
+                     bar, keymap_test: adding, taking and removing bindings,
+                     file_load_test: loads and writes on their threads, the unsaved
+                     flow waiting)
 src/gfx/             Drawing: draw.odin (primitives on gfx.renderer, clips, overlays,
                      selection shapes), scrollbar.odin (scroll bar geometry, dragging
                      and look along either axis),
@@ -741,8 +824,11 @@ path_deleted :: proc(path: string) {
 - A file or folder name typed by the user goes through `rename_path`/`create_path`,
   which refuse names the OS can't use; deleting goes through `ask_delete_file`.
 - Reading a file the user works on goes through `read_file_shared` (never blocks other
-  programs); writing one an editor shows goes through `editor_save`, which tells the
-  watcher what it wrote.
+  programs), off the UI thread; opening one in an editor goes through `editor_open`,
+  and whatever needs its text then through `editor_when_ready`; writing one an editor
+  shows goes through `editor_save` (the writer thread, which tells the watcher what it
+  wrote). Perf phases and tests that use a file's text at once open it with
+  `open_loaded`/`editor_wait_loaded`, and wait for saves with `wait_for_saves`.
 - Fonts: three configurable families. The interface uses `.Body`/`.SemiBold`/`.Bold`
   (`ui_font`, default Instrument Sans Medium; set by `apply_ui_font`, which has Clay's
   measurements reset next frame); editor and terminal use `.Editor`/`.Editor_Bold`
@@ -793,8 +879,8 @@ The architecture should allow these without rewrites:
   - Completion closes when any caret leaves the word (multi-caret); re-filtering a
     long list isn't inside `langs.timed`; a crash isn't noticed while a child of the
     server still holds its stdout.
-  - Still on the UI thread: reading settings.toml when it changes on disk, reading a
-    file when it opens and writing it on save.
+  - Still on the UI thread: reading settings.toml when it changes on disk, and a
+    file's stat before saving (`changed_since_read`).
   - On Windows `python` may be the Microsoft Store's alias, which only offers to
     install Python: `python -m pip` is offered then (when neither pip nor py is found).
   - A program installed where PATH only reaches in new processes isn't found until

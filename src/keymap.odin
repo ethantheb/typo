@@ -1,5 +1,6 @@
 package editor
 
+import "core:slice"
 import "core:strings"
 
 import sdl "../vendor/sdl3"
@@ -41,6 +42,7 @@ Command :: enum {
 	Find_References,
 	Go_To_File_Symbol,
 	Go_To_Symbol,
+	Go_To_Line,
 	Trigger_Completion,
 	Show_Signature_Help,
 	Go_Back,
@@ -92,6 +94,7 @@ COMMANDS := [Command]Command_Info {
 	.Find_References      = {"find_references", "Find references", {"Shift+F12"}},
 	.Go_To_File_Symbol    = {"go_to_file_symbol", "Go to symbol in file", {"Ctrl+Shift+O"}},
 	.Go_To_Symbol         = {"go_to_symbol", "Go to symbol in project", {"Ctrl+T"}},
+	.Go_To_Line           = {"go_to_line", "Go to line", {"Ctrl+G"}},
 	.Trigger_Completion   = {"trigger_completion", "Trigger completion", {"Ctrl+Space"}},
 	.Show_Signature_Help  = {"show_signature_help", "Show signature help", {"Ctrl+Shift+Space"}},
 	.Go_Back              = {"go_back", "Go back", {"Alt+Left", "Mouse4"}},
@@ -184,6 +187,9 @@ run_command :: proc(cmd: Command) -> bool {
 	case .Go_Forward:
 		return jump_forward()
 
+	case .Go_To_Line:
+		return goto_line_open()
+
 	case .Find, .Find_Next, .Find_Previous, .Find_Match_Case, .Find_Whole_Word, .Find_Regex:
 		return find_run_command(cmd)
 
@@ -206,7 +212,13 @@ command_for_key :: proc(key: sdl.KeyboardEvent) -> (cmd: Command, ok: bool) {
 
 // The command bound to a chord (a key or a mouse button), if any
 command_for_chord :: proc(pressed: Chord) -> (cmd: Command, ok: bool) {
-	for chords, c in g.settings.bindings {
+	return bindings_command(&g.settings.bindings, pressed)
+}
+
+
+// The command a chord runs in a set of bindings, if any
+bindings_command :: proc(b: ^Bindings, pressed: Chord) -> (cmd: Command, ok: bool) {
+	for chords, c in b {
 		for chord in chords {
 			if chord_bound(chord) && chord == pressed {
 				return c, true
@@ -341,8 +353,84 @@ is_modifier_key :: proc(k: sdl.Keycode) -> bool {
 }
 
 
+// What adding a binding did
+Binding_Added :: enum {
+	Added,
+	Already_Bound, // cmd has the chord already
+	Full,          // cmd has MAX_CHORDS chords
+}
+
+
+// Adds a chord to cmd's bindings, taking it from the command that had it
+// (`taken_from`, when `taken`)
+bindings_add :: proc(
+	b: ^Bindings,
+	cmd: Command,
+	chord: Chord,
+) -> (
+	result: Binding_Added,
+	taken_from: Command,
+	taken: bool,
+) {
+	slot := -1
+	for c, i in b[cmd] {
+		if c == chord do return .Already_Bound, {}, false
+		if !chord_bound(c) && slot < 0 {
+			slot = i
+		}
+	}
+	if slot < 0 do return .Full, {}, false
+
+	// Taken from the command that has it
+	for &chords, other in b {
+		for i := MAX_CHORDS - 1; i >= 0; i -= 1 {
+			if chord_bound(chords[i]) && chords[i] == chord {
+				bindings_remove(b, other, i)
+				taken_from, taken = other, true
+			}
+		}
+	}
+
+	b[cmd][slot] = chord
+	return .Added, taken_from, taken
+}
+
+
+// Removes the chord in slot i of cmd's bindings; the ones after it move up, so
+// bound chords stay first
+bindings_remove :: proc(b: ^Bindings, cmd: Command, i: int) {
+	if i < 0 || i >= MAX_CHORDS {
+		return
+	}
+
+	chords := &b[cmd]
+	copy(chords[i:], chords[i + 1:])
+	chords[MAX_CHORDS - 1] = {}
+}
+
+
+// How many chords a command has
+bindings_count :: proc(chords: [MAX_CHORDS]Chord) -> (n: int) {
+	for c in chords {
+		if chord_bound(c) do n += 1
+	}
+	return
+}
+
+
+// A command's default chords, each once: on some layouts two of them are the
+// same key ("Ctrl++" is Ctrl+= where + is Shift+=)
 default_bindings :: proc(cmd: Command) -> (chords: [MAX_CHORDS]Chord) {
-	for text, i in COMMANDS[cmd].defaults do chords[i], _ = parse_chord(text)
+	n := 0
+	for text in COMMANDS[cmd].defaults {
+		c, ok := parse_chord(text)
+		if !ok || slice.contains(chords[:n], c) {
+			continue
+		}
+
+		chords[n] = c
+		n += 1
+	}
 	return
 }
 

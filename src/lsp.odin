@@ -119,7 +119,15 @@ lsp_frame :: proc() {
 // After a file opened (or was renamed): attaches it to its language's servers
 lsp_doc_open :: proc(e: ^Editor) {
 	e.lsp.view = &e.tv
-	if e.status == .Text do langs.doc_open(&e.lsp)
+	if editor_on_servers(e) do langs.doc_open(&e.lsp)
+}
+
+
+// Whether the editor's document goes to language servers: text, and not a
+// large file
+@(private = "file")
+editor_on_servers :: proc(e: ^Editor) -> bool {
+	return e.status == .Text && !e.large
 }
 
 
@@ -147,7 +155,7 @@ open_documents :: proc() -> []^langs.Doc {
 	docs := make([dynamic]^langs.Doc, context.temp_allocator)
 	for p in g.panes.open {
 		e, is_editor := p.content.(^Editor)
-		if !is_editor || e.status != .Text {
+		if !is_editor || !editor_on_servers(e) {
 			continue
 		}
 
@@ -404,7 +412,8 @@ definition_response :: proc(r: langs.Request, resp: lsp.Response) {
 // Where the caret goes for a place: its offset if it is in `e`, an open file
 // whose text hasn't changed since, else the server's position
 place_target :: proc(place: lsp.Place, encoding: lsp.Encoding, e: ^Editor) -> Open_Target {
-	if e != nil && place.offset >= 0 && e.buf.version == place.version {
+	has_text := e != nil && e.status == .Text
+	if has_text && place.offset >= 0 && e.buf.version == place.version {
 		return place.offset
 	}
 	return Lsp_Target{place.position, encoding}

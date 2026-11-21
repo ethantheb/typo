@@ -54,7 +54,7 @@ phase_disk_changes :: proc(p: ^Perf, frame: int) -> bool {
 		close_files()
 		workspace_refresh(&g.workspace)
 		workspace_expand(&g.workspace, {dir})
-		panes_open_file(open)
+		open_loaded(open)
 		e := focused_editor()
 		caret = buffer.line_start(&e.buf, 20) + 3
 		textedit.set_single_selection(e, {caret, caret, -1})
@@ -125,6 +125,7 @@ phase_disk_changes :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "\"Keep my version\" keeps the edits", kept)
 
 		run_command(.Save)
+		wait_for_saves()
 		data, _ := os.read_entire_file(open, context.temp_allocator)
 		check(p, "then saving doesn't ask", !d.open && string(data) == editor_text(e))
 
@@ -190,7 +191,7 @@ phase_disk_changes :: proc(p: ^Perf, frame: int) -> bool {
 
 		// Later phases use the file open before
 		if before != "" {
-			panes_open_file(before)
+			open_loaded(before)
 			delete(before)
 			before = ""
 		}

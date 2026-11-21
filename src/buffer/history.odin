@@ -51,7 +51,9 @@ History :: struct {
 	applied:    int,  // groups[:applied] are in effect
 	open:       bool, // between begin and end
 	coalesced:  bool, // the open step continues the previous group
-	save_point: int,  // value of `applied` when last saved; -1 if unreachable
+	save_point:  int,  // value of `applied` when last saved; -1 if unreachable
+	writing:     bool, // a write of the text is under way (begin_save)
+	write_point: int,  // value of `applied` when it began; -1 if unreachable since
 }
 
 // Groups of the same kind closer together than this merge into one undo step
@@ -77,6 +79,34 @@ mark_saved :: proc(b: ^Buffer) {
 }
 
 
+// A write of the text as it is now begins (taken from a snapshot). Steps after
+// it never merge into it, so end_save can mark this text as saved even if the
+// buffer was edited meanwhile
+begin_save :: proc(b: ^Buffer) {
+	h := &b.history
+	h.writing = true
+	h.write_point = h.applied
+}
+
+
+// The write begun with begin_save ended: when it succeeded, the text it wrote
+// is the saved state (still modified if edited since)
+end_save :: proc(b: ^Buffer, ok: bool) {
+	h := &b.history
+	if !h.writing do return
+
+	if ok do h.save_point = h.write_point
+	h.writing = false
+}
+
+
+// Whether `applied` is a state a step must not change: saved, or being written
+@(private = "file")
+is_kept_state :: proc(h: ^History) -> bool {
+	return h.applied == h.save_point || h.writing && h.applied == h.write_point
+}
+
+
 // --- Steps -------------------------------------------------------------------------
 
 // Starts recording an undo step. Consecutive steps of the same kind (e.g.
@@ -87,13 +117,14 @@ begin :: proc(b: ^Buffer, kind: Edit_Kind, now: u64, sels: []Selection) {
 	assert(!h.open)
 	h.open = true
 
-	// Never coalesce into the saved state, so undo can always get back to it
+	// Never coalesce into the saved state (or one being written), so undo can
+	// always get back to it
 	h.coalesced = false
 	can_coalesce :=
 		kind != .Other &&
 		h.applied == len(h.groups) &&
 		h.applied > 0 &&
-		h.applied != h.save_point
+		!is_kept_state(h)
 	if can_coalesce {
 		last := &h.groups[h.applied - 1]
 		if last.kind == kind &&
@@ -113,6 +144,9 @@ begin :: proc(b: ^Buffer, kind: Edit_Kind, now: u64, sels: []Selection) {
 		resize(&h.selections, g.sels_start)
 		resize(&h.groups, h.applied)
 		if h.save_point > h.applied do h.save_point = -1
+		if h.writing && h.write_point > h.applied {
+			h.write_point = -1
+		}
 	}
 
 	g := Group {
@@ -129,11 +163,12 @@ begin :: proc(b: ^Buffer, kind: Edit_Kind, now: u64, sels: []Selection) {
 
 
 // Reopens the most recent step, so edits up to `end` join it. Returns false
-// (opening nothing) if there is none or it was undone
+// (opening nothing) if there is none, it was undone, or its result is saved or
+// being written
 amend :: proc(b: ^Buffer) -> bool {
 	h := &b.history
 	assert(!h.open)
-	if h.applied == 0 || h.applied < len(h.groups) {
+	if h.applied == 0 || h.applied < len(h.groups) || is_kept_state(h) {
 		return false
 	}
 

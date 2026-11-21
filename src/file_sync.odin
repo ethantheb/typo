@@ -84,12 +84,16 @@ disk_opened :: proc(e: ^Editor, hash: u64, stamp: File_Stamp, exists: bool) {
 }
 
 
-// After the editor wrote its file, with the hash of what it wrote
-disk_saved :: proc(e: ^Editor, hash: u64) {
-	stamp, _ := file_stamp(e.path)
+// After the writer wrote the editor's file: the hash of what it wrote, the
+// file's stamp then, and the watcher's generation it was told the write in
+disk_saved :: proc(e: ^Editor, hash: u64, stamp: File_Stamp, generation: u32) {
 	drop_pending(e)
 	e.disk.reload = 0
-	disk_synced(e, hash, stamp)
+	e.disk.hash = hash
+	e.disk.stamp = stamp
+	e.disk.missing = false
+	e.disk.generation = generation
+	e.new_file = false
 }
 
 

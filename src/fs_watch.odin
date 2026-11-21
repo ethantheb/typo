@@ -179,6 +179,7 @@ watch: struct {
 	root_gen: int,                     // counts root changes
 	dirs:     map[string]string,       // the tree's loaded folders: key -> path (owned)
 	files:    map[string]Watched_File, // open files, by key (owned)
+	opened:   [dynamic]string,         // keys (owned) of files registered since the thread looked
 	jobs:     [dynamic]Reload_Job,
 
 	// Handed to the UI thread, under the mutex
@@ -224,6 +225,8 @@ watch_destroy :: proc() {
 		delete(f.path)
 	}
 	delete(watch.files)
+	for key in watch.opened do delete(key)
+	delete(watch.opened)
 	for job in watch.jobs do reload_job_destroy(job)
 	delete(watch.jobs)
 	for r in watch.results do watch_result_destroy(r)
@@ -263,26 +266,33 @@ watch_set_dirs :: proc(dirs: []string) {
 
 
 // Starts watching a file an editor opened: `hash` and `stamp` are of the text
-// it read (`exists` false for a new file). Returns the file's generation
+// it read (`exists` false for a new file). Returns the file's generation. The
+// thread looks at it once, as it may have changed since it was read
 watch_file_open :: proc(path: string, hash: u64, stamp: File_Stamp, exists: bool) -> u32 {
 	if !watch.running do return 0
 
-	sync.guard(&watch.mutex)
-	key := path_key(path)
-	f, found := &watch.files[key]
-	if found {
-		delete(key)
-	} else {
-		watch.files[key] = {path = strings.clone(path)}
-		f = &watch.files[key]
+	generation: u32
+	if sync.guard(&watch.mutex) {
+		key := path_key(path)
+		f, found := &watch.files[key]
+		if found {
+			delete(key)
+		} else {
+			watch.files[key] = {path = strings.clone(path)}
+			f = &watch.files[key]
+		}
+
+		f.users += 1
+		f.hash, f.stamp = hash, stamp
+		f.seen = {}
+		f.missing = !exists
+		f.generation += 1
+		generation = f.generation
+		append(&watch.opened, path_key(path))
 	}
 
-	f.users += 1
-	f.hash, f.stamp = hash, stamp
-	f.seen = {}
-	f.missing = !exists
-	f.generation += 1
-	return f.generation
+	platform_wake(&watch.platform)
+	return generation
 }
 
 
@@ -439,6 +449,31 @@ path_key :: proc(path: string, allocator := context.allocator) -> string {
 }
 
 
+// A path key as path_key makes it, but with only ASCII letters folded, written
+// to `buf` (the temp allocator if it doesn't fit): for lookups in hot loops.
+// Keys compared with it are all made with it
+path_key_ascii :: proc(path: string, buf: []u8) -> string {
+	when ODIN_OS != .Windows do return path
+
+	key: []u8
+	if len(path) <= len(buf) {
+		key = buf[:len(path)]
+	} else {
+		key = make([]u8, len(path), context.temp_allocator)
+	}
+
+	for i in 0 ..< len(path) {
+		c := path[i]
+		switch c {
+		case 'A' ..= 'Z': key[i] = c + ('a' - 'A')
+		case '/':         key[i] = '\\'
+		case:             key[i] = c
+		}
+	}
+	return string(key)
+}
+
+
 // The folder a path is in; a drive root keeps its separator ("C:\")
 parent_dir :: proc(path: string) -> string {
 	i := len(path) - 1
@@ -575,6 +610,7 @@ watch_thread_proc :: proc() {
 
 		// What the UI thread asked for
 		jobs: []Reload_Job
+		opened: []string
 		root_changed := false
 		if sync.guard(&watch.mutex) {
 			if watch.stop do return
@@ -587,6 +623,8 @@ watch_thread_proc :: proc() {
 			}
 			jobs = slice.clone(watch.jobs[:], context.temp_allocator)
 			clear(&watch.jobs)
+			opened = slice.clone(watch.opened[:], context.temp_allocator)
+			clear(&watch.opened)
 		}
 
 		if root_changed {
@@ -595,6 +633,7 @@ watch_thread_proc :: proc() {
 			t.watching = t.root != "" && platform_open(&watch.platform, t.root)
 		}
 		for job in jobs do run_job(job)
+		look_at_opened(&t, opened)
 
 		// Wait for notifications, or the next thing due
 		clear(&t.events)
@@ -699,6 +738,41 @@ poll_files :: proc(t: ^Watch_Thread, now: time.Tick) {
 		}
 	}
 
+	look_at(t, candidates[:], now)
+}
+
+
+// Looks at files just registered (taking their keys): a change made while one
+// was read, before the watcher knew it, may have had no notification since
+@(private = "file")
+look_at_opened :: proc(t: ^Watch_Thread, keys: []string) {
+	if len(keys) == 0 do return
+
+	candidates := make([dynamic]Poll_Candidate, context.temp_allocator)
+	if sync.guard(&watch.mutex) {
+		for key in keys {
+			f, found := watch.files[key]
+			if !found do continue
+
+			c := Poll_Candidate {
+				key     = strings.clone(key, context.temp_allocator),
+				path    = strings.clone(f.path, context.temp_allocator),
+				known   = f.stamp,
+				seen    = f.seen,
+				missing = f.missing,
+			}
+			append(&candidates, c)
+		}
+	}
+	for key in keys do delete(key)
+
+	look_at(t, candidates[:], time.tick_now())
+}
+
+
+// Schedules a check of each file that came, went, or isn't the version known
+@(private = "file")
+look_at :: proc(t: ^Watch_Thread, candidates: []Poll_Candidate, now: time.Tick) {
 	for c in candidates {
 		stamp, exists := file_stamp(c.path)
 		came_or_went := exists == c.missing

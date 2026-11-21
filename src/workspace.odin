@@ -41,7 +41,7 @@ folder_name :: proc(path: string) -> string {
 // `path` relative to the workspace root, or unchanged if outside it
 relative_to_root :: proc(path: string) -> string {
 	root := g.workspace.root
-	if len(path) <= len(root) || !strings.has_prefix(path, root) {
+	if root == "" || len(path) <= len(root) || !strings.has_prefix(path, root) {
 		return path
 	}
 
