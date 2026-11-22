@@ -1671,8 +1671,16 @@ keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 }
 
 
-// A binding: the chord, and room for the x shown while the pointer is on it.
-// A press on the chip focuses it, on the x removes the binding
+// The height of a binding chip and the add button, and the slot for a chip's x
+@(private = "file")
+BINDING_CHIP_HEIGHT :: 26
+@(private = "file")
+BINDING_X_SLOT :: 16
+
+
+// A binding: the chord, centered between the x shown while the pointer is on
+// it and a slot as wide on the other side. A press on the chip focuses it, on
+// the x removes the binding
 @(private = "file")
 binding_chip :: proc(cmd: Command, i: int, chord: Chord, list: clay.ElementId) {
 	w := &g.settings_window
@@ -1686,8 +1694,8 @@ binding_chip :: proc(cmd: Command, i: int, chord: Chord, list: clay.ElementId) {
 
 	if clay.UI(id)({
 		layout = {
-			sizing = {height = clay.SizingFixed(26)},
-			padding = {left = 8, right = 4},
+			sizing = {height = clay.SizingFixed(BINDING_CHIP_HEIGHT)},
+			padding = {left = 4, right = 4},
 			childGap = 2,
 			childAlignment = {y = .Center},
 		},
@@ -1698,12 +1706,15 @@ binding_chip :: proc(cmd: Command, i: int, chord: Chord, list: clay.ElementId) {
 			width = clay.BorderOutside(1),
 		},
 	}) {
+		// The chord between two slots of the same width, so it is centered
+		x_slot := clay.SizingFixed(BINDING_X_SLOT)
+		if clay.UI(clay.ID("BindingBalance", n))({layout = {sizing = {x_slot, x_slot}}}) {}
 		label(format_chord(chord), gfx.theme.text, FONT_SIZE_SMALL)
 
 		// The x, in a slot that is there either way so chips don't move
 		if clay.UI(remove)({
 			layout = {
-				sizing = {clay.SizingFixed(16), clay.SizingFixed(16)},
+				sizing = {x_slot, x_slot},
 				childAlignment = {x = .Center, y = .Center},
 			},
 			cornerRadius = clay.CornerRadiusAll(3),
@@ -1731,12 +1742,18 @@ add_binding_button :: proc(cmd: Command, count: int, recording: bool, list: clay
 	w := &g.settings_window
 	id := clay.ID("BindingAdd", u32(cmd))
 
+	// Just the + is a square, centered; with words, padded alike on both sides
+	icon_only := !recording && count > 0
+	height := clay.SizingFixed(BINDING_CHIP_HEIGHT)
+	width := icon_only ? height : clay.SizingFit()
+	padding: u16 = icon_only ? 0 : 8
+
 	if clay.UI(id)({
 		layout = {
-			sizing = {height = clay.SizingFixed(26)},
-			padding = {left = 6, right = 8},
+			sizing = {width, height},
+			padding = {left = padding, right = padding},
 			childGap = 4,
-			childAlignment = {y = .Center},
+			childAlignment = {x = .Center, y = .Center},
 		},
 		backgroundColor = clay.Hovered() || recording ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(5),

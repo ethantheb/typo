@@ -44,13 +44,26 @@ MD_FONTS := [Md_Face]Font_Id {
 
 ICON_FONT_DATA := #load("../../assets/fonts/lucide.ttf")
 
-// Every font, every weight: snaps glyphs only vertically and places them at
-// quarter pixels along the font's own (unrounded) advances
-FONT_HINTING :: ttf.Hinting.LIGHT_SUBPIXEL
-
 // The editor font's faces, laid out in whole-pixel cells of the regular face's
 // width, so that every glyph lands at the same subpixel phase
 CELL_FONTS :: bit_set[Font_Id]{.Editor, .Editor_Bold, .Editor_Italic}
+
+// How glyphs are fitted to pixels. Every font is placed at quarter pixels along
+// its own (unrounded) advances. The editor font's faces are also hinted, snapped
+// only vertically, which keeps code's horizontal strokes crisp. Other fonts
+// keep their designed shapes unhinted: FreeType's hinter guesses their edges
+// (most have no hints of their own) and can close the gap between a bold i's
+// dot and its stem
+Glyph_Fit :: enum {
+	Hinted,   // light hinting
+	Unhinted,
+}
+
+
+// How a font id's glyphs are fitted to pixels
+glyph_fit :: proc(id: Font_Id) -> Glyph_Fit {
+	return id in CELL_FONTS ? .Hinted : .Unhinted
+}
 
 // How glyph edges are smoothed: for an LCD's color subpixels (like ClearType),
 // or in gray. Auto uses subpixels below 2x scale when the system does
@@ -367,15 +380,27 @@ set_coverage :: proc(ts: ^Text_System, font: ^ttf.Font) {
 }
 
 
-// Opens a font for drawing: hinted for subpixel placement, smoothed as set
+// Opens a font for drawing: fitted to pixels as `fit` says, smoothed as set
 @(private = "file")
-open_font :: proc(ts: ^Text_System, src: Font_Source, size: f32) -> ^ttf.Font {
+open_font :: proc(ts: ^Text_System, src: Font_Source, size: f32, fit: Glyph_Fit) -> ^ttf.Font {
 	font := open_font_file(src, size)
-	if font != nil {
-		ttf.SetFontHinting(font, FONT_HINTING)
-		_ = ttf.SetFontLCD(font, lcd_order(ts))
+	if font == nil do return nil
+
+	// Quarter-pixel positions either way (set after the hinting, which resets them)
+	switch fit {
+	case .Hinted:   ttf.SetFontHinting(font, .LIGHT_SUBPIXEL)
+	case .Unhinted: ttf.SetFontHinting(font, .NONE)
 	}
+	_ = ttf.SetFontSubpixelPositioning(font, true)
+	_ = ttf.SetFontLCD(font, lcd_order(ts))
 	return font
+}
+
+
+// How an open font's glyphs are fitted, for the fallback fonts that back it up
+@(private = "file")
+font_fit :: proc(font: ^ttf.Font) -> Glyph_Fit {
+	return ttf.GetFontHinting(font) == .NONE ? .Unhinted : .Hinted
 }
 
 
@@ -476,7 +501,7 @@ text_get_font :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> ^ttf.Font {
 		return font
 	}
 
-	font := open_font(ts, ts.sources[id], f32(size) * scale)
+	font := open_font(ts, ts.sources[id], f32(size) * scale, glyph_fit(id))
 	if font == nil {
 		sdl.Log("opening font %d failed: %s", i32(id), sdl.GetError())
 		return nil
@@ -534,8 +559,9 @@ ensure_fallbacks :: proc(ts: ^Text_System, font: ^ttf.Font, s: string) {
 
 		list := make([dynamic]^ttf.Font, 0, len(ts.fallback_paths))
 		size := ttf.GetFontSize(font)
+		fit := font_fit(font)
 		for path in ts.fallback_paths {
-			fallback := open_font(ts, {path = path}, size)
+			fallback := open_font(ts, {path = path}, size, fit)
 			if fallback == nil do continue
 
 			set_coverage(ts, fallback)

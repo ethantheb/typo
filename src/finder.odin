@@ -80,8 +80,9 @@ Finder :: struct {
 	reveal:    bool,       // scroll the selected row into view, once laid out
 	clicked:   Maybe(int), // a row clicked in the list (in `files` or `items`), opened next frame
 
-	// What is listed: files, or a server's items
-	source:    Finder_Source,
+	// What is listed (`source`: files, or a server's items), and the rows matched
+	using search: Search,
+
 	items:     [dynamic]Finder_Item,
 	what:      string, // what the items are, for the query field ("references")
 	status:    string, // owned; e.g. "Asking ols…", or why nothing is listed
@@ -94,14 +95,18 @@ Finder :: struct {
 	stale:     bool,            // files changed on disk since indexing began
 	files:     [dynamic]string, // full paths, in discovery order
 	root_len:  int,             // prefix length to strip for display
+}
 
-	// Open and recent files, listed first (see finder_file_rank), by path_key_ascii
-	ranked:    map[string]Rank, // keys owned
-	current:   string,          // owned key of the focused file, or ""
+// A fuzzy search of a source's rows, scored a slice per frame (search_step):
+// the finder's, and the sidebar's search field (always the files)
+Search :: struct {
+	source:  Finder_Source,
+	results: [dynamic]Match,  // best matches so far, best first
+	scanned: int,             // rows[:scanned] have been scored
 
-	// Search state for the current query
-	results:   [dynamic]Match, // best matches so far, best first
-	scanned:   int,            // rows[:scanned] have been scored
+	// Open and recent files, listed first (see search_file_rank), by path_key_ascii
+	ranked:  map[string]Rank, // keys owned
+	current: string,          // owned key of the focused file, or ""
 }
 
 // An open or recent file's place at the top of the list
@@ -151,7 +156,7 @@ finder_open :: proc(source: Finder_Source, what := "") {
 	set_string(&f.status, "")
 	if source == .Files {
 		if f.shared == nil do start_indexer()
-		rank_files()
+		search_rank_files(&f.search)
 	}
 	finder_restart_search()
 }
@@ -187,22 +192,22 @@ finder_close :: proc() {
 	f.open = false
 	f.clicked = nil
 	clear_items()
-	clear_ranks()
+	clear_ranks(&f.search)
 	set_string(&f.status, "")
 }
 
 
-// Drops the index (stopping the indexer); called when the workspace root changes
+// Drops the index (stopping the indexer); called when the workspace root changes.
+// The searches of the files start again
 finder_invalidate :: proc() {
 	f := &g.finder
 	stop_indexer()
 
 	for path in f.files do delete(path)
 	clear(&f.files)
-	if f.source == .Files {
-		clear(&f.results)
-		f.scanned = 0
-	}
+
+	if f.source == .Files do finder_restart_search()
+	sidebar_search_restart()
 }
 
 
@@ -222,12 +227,10 @@ finder_files_changed :: proc() {
 finder_destroy :: proc() {
 	finder_invalidate()
 	clear_items()
-	clear_ranks()
-	delete(g.finder.ranked)
+	search_destroy(&g.finder.search)
 	delete(g.finder.items)
 	delete(g.finder.status)
 	delete(g.finder.files)
-	delete(g.finder.results)
 	line_edit_destroy(&g.finder.query)
 	fuzzy.destroy()
 }
@@ -252,9 +255,9 @@ finder_frame :: proc() {
 	// index until it is needed
 	if f.stale && !f.indexing {
 		finder_invalidate()
-		if f.open && f.source == .Files {
+		finder_lists_files := f.open && f.source == .Files
+		if finder_lists_files || sidebar_search_active() {
 			start_indexer()
-			finder_restart_search()
 		}
 	}
 
@@ -271,7 +274,7 @@ finder_frame :: proc() {
 	}
 
 	if f.source != .Files do lsp_finder_frame()
-	continue_search()
+	search_step(&f.search, line_edit_string(&f.query))
 }
 
 
@@ -283,9 +286,9 @@ finder_busy :: proc() -> bool {
 	if f.reveal do return true
 
 	if f.source == .Files {
-		return f.indexing || f.scanned < len(f.files)
+		return f.indexing || search_busy(&f.search)
 	}
-	return f.scanned < len(f.items) || lsp_finder_busy()
+	return search_busy(&f.search) || lsp_finder_busy()
 }
 
 
@@ -345,68 +348,64 @@ finder_unindexed :: proc(paths: []string) -> (missing: []bool, known: bool) {
 
 // Ranks the open files, then the recent ones, each most recently used first;
 // the focused file is left out
-@(private = "file")
-rank_files :: proc() {
-	f := &g.finder
-	clear_ranks()
+@(private)
+search_rank_files :: proc(s: ^Search) {
+	clear_ranks(s)
 
 	if e := focused_editor(); e != nil {
 		buf: [PATH_KEY_SIZE]u8
-		f.current = strings.clone(path_key_ascii(e.path, buf[:]))
+		s.current = strings.clone(path_key_ascii(e.path, buf[:]))
 	}
 
 	// Open files: the recently used first, then the others as they opened
 	recent := recent_files()
 	for path in recent {
-		if pane_with_file(path) != nil do add_rank(path, open = true)
+		if pane_with_file(path) != nil do add_rank(s, path, open = true)
 	}
 	for p in g.panes.open {
 		if e, ok := p.content.(^Editor); ok {
-			add_rank(e.path, open = true)
+			add_rank(s, e.path, open = true)
 		}
 	}
 
-	for path in recent do add_rank(path, open = false)
+	for path in recent do add_rank(s, path, open = false)
 }
 
 
 @(private = "file")
-add_rank :: proc(path: string, open: bool) {
-	f := &g.finder
+add_rank :: proc(s: ^Search, path: string, open: bool) {
 	buf: [PATH_KEY_SIZE]u8
 	key := path_key_ascii(path, buf[:])
-	if key == f.current || key in f.ranked {
+	if key == s.current || key in s.ranked {
 		return
 	}
 
-	f.ranked[strings.clone(key)] = {order = len(f.ranked), open = open}
+	s.ranked[strings.clone(key)] = {order = len(s.ranked), open = open}
 }
 
 
 @(private = "file")
-clear_ranks :: proc() {
-	f := &g.finder
-	for key in f.ranked do delete(key)
-	clear(&f.ranked)
+clear_ranks :: proc(s: ^Search) {
+	for key in s.ranked do delete(key)
+	clear(&s.ranked)
 
-	delete(f.current)
-	f.current = ""
+	delete(s.current)
+	s.current = ""
 }
 
 
 // An indexed file's rank, if it is open or recent; and whether it is the
 // focused file
 @(private)
-finder_file_rank :: proc(i: int) -> (rank: Rank, ranked, current: bool) {
-	f := &g.finder
-	if len(f.ranked) == 0 && f.current == "" {
+search_file_rank :: proc(s: ^Search, i: int) -> (rank: Rank, ranked, current: bool) {
+	if len(s.ranked) == 0 && s.current == "" {
 		return
 	}
 
 	buf: [PATH_KEY_SIZE]u8
-	key := path_key_ascii(f.files[i], buf[:])
-	rank, ranked = f.ranked[key]
-	return rank, ranked, key == f.current
+	key := path_key_ascii(g.finder.files[i], buf[:])
+	rank, ranked = s.ranked[key]
+	return rank, ranked, key == s.current
 }
 
 
@@ -508,49 +507,68 @@ visit_file :: proc(path: string, user: rawptr) -> bool {
 // Resets the search for a new query; finder_frame does the actual work (once
 // per frame, however many keystrokes arrived)
 finder_restart_search :: proc() {
-	f := &g.finder
-	clear(&f.results)
-	f.scanned = 0
-	f.selected = 0
+	search_restart(&g.finder.search)
+	g.finder.selected = 0
+}
+
+
+// Forgets a search's results, to score the rows again
+@(private)
+search_restart :: proc(s: ^Search) {
+	clear(&s.results)
+	s.scanned = 0
+}
+
+
+@(private)
+search_destroy :: proc(s: ^Search) {
+	clear_ranks(s)
+	delete(s.ranked)
+	delete(s.results)
+	s^ = {}
+}
+
+
+// Whether rows are left to score
+@(private)
+search_busy :: proc(s: ^Search) -> bool {
+	return s.scanned < row_count(s)
 }
 
 
 // How many rows the source has
 @(private = "file")
-row_count :: proc() -> int {
-	f := &g.finder
-	return f.source == .Files ? len(f.files) : len(f.items)
+row_count :: proc(s: ^Search) -> int {
+	return s.source == .Files ? len(g.finder.files) : len(g.finder.items)
 }
 
 
 // Scores more rows against the query, within SEARCH_BUDGET
-@(private = "file")
-continue_search :: proc() {
-	f := &g.finder
-	query := line_edit_string(&f.query)
-	count := row_count()
+@(private)
+search_step :: proc(s: ^Search, query: string) {
+	count := row_count(s)
 
 	// No query: a server's items in order
-	if len(query) == 0 && f.source != .Files {
-		for f.scanned < count {
-			append(&f.results, Match{f.scanned, 0})
-			f.scanned += 1
+	if len(query) == 0 && s.source != .Files {
+		for s.scanned < count {
+			append(&s.results, Match{s.scanned, 0})
+			s.scanned += 1
 		}
 		return
 	}
 
 	start := time.tick_now()
-	for f.scanned < count {
+	for s.scanned < count {
 		// Check the clock every 32 rows (long paths can take ~20 µs each in
 		// debug builds)
-		end := min(f.scanned + 32, count)
-		for i in f.scanned ..< end {
-			if score, ok := score_row(query, i); ok {
-				insert_result(f, Match{i, score})
+		end := min(s.scanned + 32, count)
+		for i in s.scanned ..< end {
+			if score, ok := score_row(s, query, i); ok {
+				insert_result(s, Match{i, score})
 			}
 		}
 
-		f.scanned = end
+		s.scanned = end
 		if time.tick_since(start) > SEARCH_BUDGET do break
 	}
 }
@@ -559,13 +577,12 @@ continue_search :: proc() {
 // How well a row matches: a file's path (ranked up if open or recent); an
 // item's label, or for a place, the file it is in
 @(private = "file")
-score_row :: proc(query: string, i: int) -> (score: f32, ok: bool) {
-	f := &g.finder
-	if f.source == .Files do return score_file(query, i)
+score_row :: proc(s: ^Search, query: string, i: int) -> (score: f32, ok: bool) {
+	if s.source == .Files do return score_file(s, query, i)
 
-	item := f.items[i]
+	item := g.finder.items[i]
 	score, ok = fuzzy.score(query, item.label)
-	if f.source != .Locations do return
+	if s.source != .Locations do return
 
 	path_score, in_path := fuzzy.score(query, item_path(item))
 	if in_path && (!ok || path_score > score) {
@@ -579,18 +596,18 @@ score_row :: proc(query: string, i: int) -> (score: f32, ok: bool) {
 // above every other file (all 0) and the focused file isn't listed; with one,
 // they get FINDER_BOOST
 @(private = "file")
-score_file :: proc(query: string, i: int) -> (score: f32, ok: bool) {
+score_file :: proc(s: ^Search, query: string, i: int) -> (score: f32, ok: bool) {
 	if len(query) == 0 {
-		rank, ranked, current := finder_file_rank(i)
+		rank, ranked, current := search_file_rank(s, i)
 		if current do return 0, false
-		if ranked do return f32(len(g.finder.ranked) - rank.order), true
+		if ranked do return f32(len(s.ranked) - rank.order), true
 		return 0, true
 	}
 
 	score, ok = fuzzy.score(query, finder_display_path(i))
 	if !ok do return
 
-	if _, ranked, _ := finder_file_rank(i); ranked {
+	if _, ranked, _ := search_file_rank(s, i); ranked {
 		score += FINDER_BOOST
 	}
 	return
@@ -599,35 +616,35 @@ score_file :: proc(query: string, i: int) -> (score: f32, ok: bool) {
 
 // Keeps results sorted best-first and capped
 @(private = "file")
-insert_result :: proc(f: ^Finder, m: Match) {
-	n := len(f.results)
-	limit := f.source == .Files ? FINDER_MAX_RESULTS : FINDER_MAX_MATCHES
-	if n == limit && !better_match(m, f.results[n - 1]) {
+insert_result :: proc(s: ^Search, m: Match) {
+	n := len(s.results)
+	limit := s.source == .Files ? FINDER_MAX_RESULTS : FINDER_MAX_MATCHES
+	if n == limit && !better_match(s, m, s.results[n - 1]) {
 		return
 	}
 
 	pos := n
-	for pos > 0 && better_match(m, f.results[pos - 1]) {
+	for pos > 0 && better_match(s, m, s.results[pos - 1]) {
 		pos -= 1
 	}
 
 	if n < limit {
-		inject_at(&f.results, pos, m)
+		inject_at(&s.results, pos, m)
 	} else {
-		copy(f.results[pos + 1:], f.results[pos:n - 1])
-		f.results[pos] = m
+		copy(s.results[pos + 1:], s.results[pos:n - 1])
+		s.results[pos] = m
 	}
 }
 
 
 // A higher score; on the same score, a shorter path, or the item listed first
 @(private = "file")
-better_match :: proc(a, b: Match) -> bool {
-	f := &g.finder
+better_match :: proc(s: ^Search, a, b: Match) -> bool {
 	if a.score != b.score do return a.score > b.score
 
-	if f.source == .Files {
-		return len(f.files[a.index]) < len(f.files[b.index])
+	if s.source == .Files {
+		files := g.finder.files
+		return len(files[a.index]) < len(files[b.index])
 	}
 	return a.index < b.index
 }
@@ -694,7 +711,7 @@ finder_accept :: proc(index: int) {
 @(private = "file")
 open_row :: proc(row: int) {
 	f := &g.finder
-	if row >= 0 && row < row_count() {
+	if row >= 0 && row < row_count(&f.search) {
 		if f.source == .Files {
 			g.pending = Open_File(strings.clone(f.files[row]))
 		} else if item := f.items[row]; item.path != "" {
@@ -817,7 +834,7 @@ finder_results :: proc() {
 			chosen: bool
 			if f.source == .Files {
 				path := finder_display_path(m.index)
-				rank, ranked, _ := finder_file_rank(m.index)
+				rank, ranked, _ := search_file_rank(&f.search, m.index)
 				mark := ""
 				if ranked {
 					mark = rank.open ? "open" : "recent"
@@ -847,7 +864,7 @@ rows_spacer :: proc(rows: int) {
 @(private = "file")
 empty_message :: proc() -> string {
 	f := &g.finder
-	searching := f.scanned < row_count()
+	searching := search_busy(&f.search)
 
 	if f.source == .Files {
 		switch {
@@ -997,6 +1014,7 @@ highlighted_text :: proc(
 	matched: []bool,
 	color: clay.Color,
 	font := gfx.Font_Id.Body,
+	size: u16 = FONT_SIZE_UI,
 ) {
 	bold := font == .Editor ? gfx.Font_Id.Editor_Bold : gfx.Font_Id.Bold
 	i := lo
@@ -1008,7 +1026,7 @@ highlighted_text :: proc(
 			j += 1
 		}
 
-		label(s[i:j], hl ? gfx.theme.accent : color, FONT_SIZE_UI, hl ? bold : font)
+		label(s[i:j], hl ? gfx.theme.accent : color, size, hl ? bold : font)
 		i = j
 	}
 }

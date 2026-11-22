@@ -1,5 +1,5 @@
 diff --git a/include/SDL3_ttf/SDL_ttf.h b/include/SDL3_ttf/SDL_ttf.h
-index b723bc7..c1afe06 100644
+index b723bc7..bf1be52 100644
 --- a/include/SDL3_ttf/SDL_ttf.h
 +++ b/include/SDL3_ttf/SDL_ttf.h
 @@ -1103,6 +1103,7 @@ typedef enum TTF_ImageType
@@ -10,7 +10,7 @@ index b723bc7..c1afe06 100644
  } TTF_ImageType;
  
  /**
-@@ -1142,6 +1143,37 @@ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImage(TTF_Font *font, Uint
+@@ -1142,6 +1143,47 @@ extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImage(TTF_Font *font, Uint
   */
  extern SDL_DECLSPEC SDL_Surface * SDLCALL TTF_GetGlyphImageForIndex(TTF_Font *font, Uint32 glyph_index, TTF_ImageType *image_type);
  
@@ -45,10 +45,20 @@ index b723bc7..c1afe06 100644
 + */
 +extern SDL_DECLSPEC bool SDLCALL TTF_SetFontCellAdvance(TTF_Font *font, float advance);
 +
++/**
++ * Place a font's glyphs at quarter-pixel positions (rendered shifted to
++ * them), whatever its hinting. TTF_SetFontHinting turns this on for
++ * TTF_HINTING_LIGHT_SUBPIXEL and off otherwise; call this after it, e.g. for
++ * unhinted text at quarter-pixel positions.
++ *
++ * (Added by typo's patch.)
++ */
++extern SDL_DECLSPEC bool SDLCALL TTF_SetFontSubpixelPositioning(TTF_Font *font, bool enabled);
++
  /**
   * Query the metrics (dimensions) of a font's glyph for a UNICODE codepoint.
   *
-@@ -1861,6 +1893,15 @@ extern SDL_DECLSPEC TTF_TextEngine * SDLCALL TTF_CreateRendererTextEngineWithPro
+@@ -1861,6 +1903,15 @@ extern SDL_DECLSPEC TTF_TextEngine * SDLCALL TTF_CreateRendererTextEngineWithPro
   */
  extern SDL_DECLSPEC bool SDLCALL TTF_DrawRendererText(TTF_Text *text, float x, float y);
  
@@ -517,7 +527,7 @@ index d8c0c6d..b235c10 100644
      }
      return true;
 diff --git a/src/SDL_ttf.c b/src/SDL_ttf.c
-index be517a1..53bbdde 100644
+index be517a1..294f5a3 100644
 --- a/src/SDL_ttf.c
 +++ b/src/SDL_ttf.c
 @@ -344,6 +344,16 @@ struct TTF_Font {
@@ -916,17 +926,39 @@ index be517a1..53bbdde 100644
  
  #if TTF_USE_HARFBUZZ
      // update flag for HB
+@@ -5766,6 +5926,20 @@ void TTF_SetFontHinting(TTF_Font *font, TTF_HintingFlags hinting)
+     UpdateFontText(font, NULL);
+ }
+ 
++bool TTF_SetFontSubpixelPositioning(TTF_Font *font, bool enabled)
++{
++    TTF_CHECK_FONT(font, false);
++    const int render_subpixel = enabled ? 1 : 0;
++    if (render_subpixel == font->render_subpixel) {
++        return true;
++    }
++
++    font->render_subpixel = render_subpixel;
++    Flush_Cache(font);
++    UpdateFontText(font, NULL);
++    return true;
++}
++
+ TTF_HintingFlags TTF_GetFontHinting(const TTF_Font *font)
+ {
+     TTF_CHECK_FONT(font, TTF_HINTING_INVALID);
 diff --git a/src/SDL_ttf.sym b/src/SDL_ttf.sym
-index 564eaf3..b6953cf 100644
+index 564eaf3..16bd023 100644
 --- a/src/SDL_ttf.sym
 +++ b/src/SDL_ttf.sym
-@@ -43,6 +43,10 @@ SDL3_ttf_0.0.0 {
+@@ -43,6 +43,11 @@ SDL3_ttf_0.0.0 {
      TTF_GetFreeTypeVersion;
      TTF_GetGlyphImage;
      TTF_GetGlyphImageForIndex;
 +    TTF_SetFontCoverageTable;
 +    TTF_SetFontLCD;
 +    TTF_SetFontCellAdvance;
++    TTF_SetFontSubpixelPositioning;
 +    TTF_FlushRendererText;
      TTF_GetGlyphKerning;
      TTF_GetGlyphMetrics;

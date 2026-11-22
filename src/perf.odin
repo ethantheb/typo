@@ -66,6 +66,11 @@ Perf :: struct {
 	// Terminal output phase
 	flood_parsed:     u64,
 	flood_last:       time.Tick,
+
+	// What a frame showed, read back once drawn (read_frame)
+	read_wanted:      bool,
+	read_area:        sdl.Rect, // device pixels
+	read_back:        [][4]u8,  // owned; the area as last read, row by row
 }
 
 Frame_Part :: enum {
@@ -151,6 +156,7 @@ PHASES := [?]Phase {
 	{name = "settings sections collapsing", step = phase_settings_collapse, frame_limit = 8},
 	{name = "several bindings for a command", step = phase_settings_bindings},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
+	{name = "sidebar behind the panes, its search", step = phase_sidebar, frame_limit = 8},
 	{name = "files changed on disk", step = phase_disk_changes}, // perf_watch.odin
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
@@ -258,6 +264,7 @@ perf_end :: proc() {
 	delete(p.words_times)
 	for f in p.failures do delete(f)
 	delete(p.failures)
+	delete(p.read_back)
 	free(p)
 	g.perf = nil
 
@@ -274,6 +281,11 @@ perf_running :: proc() -> bool {
 perf_mark :: proc(part: Frame_Part) {
 	p := g.perf
 	p.marks[part] = time.tick_now()
+
+	// The frame is drawn and not yet presented
+	if part == .Render && p.read_wanted {
+		read_frame(p)
+	}
 
 	if part == .Present && p.first_present_ns == 0 {
 		p.first_present_ns = process_age_ns()
@@ -511,8 +523,46 @@ phase_text_rendering :: proc(p: ^Perf, frame: int) -> bool {
 	no_brighter := lines.pixels > 0 && lines.brightest <= int(INK_COLOR.r)
 	check(p, "overlapping subpixel glyphs stay their color", no_brighter)
 
+	// Unhinted proportional text keeps a bold i's dot apart from its stem
+	md_bold := gfx.text_get_font(ts, .Md_Bold, 17)
+	check(p, "a bold i's dot stays apart from its stem", glyph_dot_apart(md_bold, 'i'))
+
 	result(p, "a long line past the window's edge", long_ms, "ms", 10)
 	return true
+}
+
+
+// Whether a glyph's image has a row under half the ink's strength between ink
+// above it and ink below (an i's dot and its stem)
+@(private = "file")
+glyph_dot_apart :: proc(font: ^ttf.Font, r: rune) -> bool {
+	if font == nil do return false
+
+	image := ttf.GetGlyphImage(font, u32(r), nil)
+	if image == nil do return false
+	defer sdl.DestroySurface(image)
+
+	rgba := sdl.ConvertSurface(image, .RGBA32)
+	if rgba == nil do return false
+	defer sdl.DestroySurface(rgba)
+
+	// Each row's strongest alpha, top to bottom: ink, a gap, then ink again
+	pixels := ([^]u8)(rgba.pixels)
+	inked := false
+	gap := false
+	for y in 0 ..< int(rgba.h) {
+		alpha := 0
+		for x in 0 ..< int(rgba.w) {
+			alpha = max(alpha, int(pixels[y * int(rgba.pitch) + x * 4 + 3]))
+		}
+
+		switch {
+		case alpha > 160 && gap:   return true
+		case alpha > 160:          inked = true
+		case alpha < 128 && inked: gap = true
+		}
+	}
+	return false
 }
 
 
@@ -604,6 +654,28 @@ read_ink :: proc(s: string, alpha: f32) -> (ink: Ink) {
 		ink.darkest = min(ink.darkest, r, g, b)
 	}
 	return
+}
+
+
+// Asks for an area of this frame (logical pixels) once it is drawn, in
+// p.read_back by the next frame's step
+@(private = "file")
+want_frame :: proc(p: ^Perf, r: gfx.Rect) {
+	s := gfx.scale
+	p.read_area = {i32(r.x * s), i32(r.y * s), i32(r.w * s), i32(r.h * s)}
+	p.read_wanted = true
+}
+
+
+// Reads back the area a step asked for, after the frame was drawn
+@(private = "file")
+read_frame :: proc(p: ^Perf) {
+	p.read_wanted = false
+	delete(p.read_back)
+	p.read_back = nil
+
+	pixels, ok := read_window(p.read_area)
+	if ok do p.read_back = slice.clone(pixels)
 }
 
 
@@ -1609,7 +1681,7 @@ reopen_finder :: proc(query: string) {
 @(private = "file")
 file_rank_of :: proc(path: string) -> (rank: Rank, ranked: bool, current: bool) {
 	for file, i in g.finder.files {
-		if same_path(file, path) do return finder_file_rank(i)
+		if same_path(file, path) do return search_file_rank(&g.finder.search, i)
 	}
 	return
 }
@@ -1995,6 +2067,10 @@ phase_settings_bindings :: proc(p: ^Perf, frame: int) -> bool {
 		_, chip_shown := element_rect(clay.ID("BindingChip", n + 1))
 		check(p, "the key pressed is a second binding, as a chip", added && chip_shown)
 
+		// The + and each chord are centered in their boxes
+		check(p, "the add button's + is centered", add_button_square(.Toggle_Sidebar))
+		check(p, "a chip's chord is centered", chip_centered(n + 1))
+
 		press(sdl.K_RETURN)
 		press_chord(.G, sdl.KMOD_LCTRL)
 		next_step(p, &step, frame)
@@ -2048,6 +2124,32 @@ phase_settings_bindings :: proc(p: ^Perf, frame: int) -> bool {
 		return true
 	}
 	return false
+}
+
+
+// Whether a command's add button, showing just its +, is a square (the + is
+// centered in it, by Clay's alignment)
+@(private = "file")
+add_button_square :: proc(cmd: Command) -> bool {
+	r, ok := element_rect(clay.ID("BindingAdd", u32(cmd)))
+	return ok && abs(r.w - r.h) < 0.5
+}
+
+
+// Whether chip n's chord sits between two slots of the same width, as far
+// from either edge of the chip
+@(private = "file")
+chip_centered :: proc(n: u32) -> bool {
+	chip, chip_ok := element_rect(clay.ID("BindingChip", n))
+	left, left_ok := element_rect(clay.ID("BindingBalance", n))
+	right, right_ok := element_rect(clay.ID("BindingRemove", n))
+	if !chip_ok || !left_ok || !right_ok {
+		return false
+	}
+
+	left_gap := left.x - chip.x
+	right_gap := chip.x + chip.w - (right.x + right.w)
+	return abs(left.w - right.w) < 0.5 && abs(left_gap - right_gap) < 0.5
 }
 
 
@@ -2123,7 +2225,9 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 
 	d := &g.dialog
 	switch step {
-	case 0: // right-click the file's row
+	case 0: // right-click the file's row, once the sidebar is uncovered
+		if g.animating do return false
+
 		for index in g.workspace.visible {
 			if g.workspace.nodes[index].path != old do continue
 
@@ -2317,6 +2421,303 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 		return true
 	}
 	return false
+}
+
+
+// The sidebar behind the panes and its search field. Two panes, one above the
+// other, part across the search field. Shown: the panes start a gap right of it
+// and its rows react. Hidden: it stays laid out under the panes, a rename in
+// it is dropped, a press where a row was doesn't reach it, and nothing of it
+// shows between the panes (read back from the window). Sliding back: rows the
+// panes still cover don't react.
+// A press on the field gives it the keys, typed keys list the files matching
+// in place of the tree, a press on one opens it, and Escape brings the tree
+// back. Each step waits for the panes to settle
+@(private = "file")
+phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) row_at: [2]f32  // a folder's row, while shown
+	@(static) before: string  // the file open before, reopened at the end
+	@(static) mouse: [2]f32
+	sep := os.Path_Separator
+	folder := path_in_dir(p, "sidebar_dir")
+	target := path_in_dir(p, fmt.tprintf("sidebar_dir%cdeep%csidebar_target.txt", sep, sep))
+	below := path_in_dir(p, "sidebar_below.txt")
+
+	if frame == 0 {
+		step, mouse = 0, g.mouse_pos
+		if e := focused_editor(); e != nil {
+			before = strings.clone(e.path)
+		}
+
+		// A file in a folder, in the tree and the index; another to split with
+		_ = os.make_directory_all(parent_dir(target))
+		_ = os.write_entire_file(target, transmute([]u8)string("target\n"))
+		_ = os.write_entire_file(below, transmute([]u8)string("below\n"))
+		workspace_refresh(&g.workspace)
+		finder_invalidate()
+
+		g.sidebar_visible = true
+		split_across_search(below)
+		p.mark_frame = frame
+		return false
+	}
+	// Step 4 looks while the panes slide back
+	sliding := step == 4
+	if (g.animating && !sliding) || frame < p.mark_frame + 2 {
+		return false
+	}
+
+	s := &g.sidebar_search
+	sidebar, laid_out := element_rect(clay.ID("Sidebar"))
+	area, _ := element_rect(clay.ID("WorkArea"))
+	left := panes_left()
+	switch step {
+	case 0: // shown: the panes beside it, and its rows react
+		edge := sidebar.x + sidebar.w + PANE_GAP
+		beside := sidebar.x == 0 && left == edge && area.x == edge
+		check(p, "shown: the panes start a gap right of the sidebar", beside)
+
+		row_at, _ = element_center(tree_row_id(folder))
+		g.mouse_pos = row_at
+		index, on_row := tree_row_under_pointer()
+		reachable := on_row && g.workspace.nodes[index].path == folder
+		check(p, "shown: its rows react", reachable)
+
+		// A rename in the tree, which hiding it drops
+		rename_start_file(folder, .Tree)
+		want_frame(p, sidebar)
+		next_step(p, &step, frame)
+
+	case 1: // shown: drawn where the panes part, so the hidden check means something
+		lower: gfx.Rect
+		if pane := pane_with_file(below); pane != nil {
+			lower, _ = element_rect(pane_id(pane))
+		}
+		band := gfx.Rect{sidebar.x, lower.y - PANE_GAP, sidebar.w, PANE_GAP}
+		check(p, "shown: the sidebar is drawn where the panes part", sidebar_ink(p, band) > 0)
+		check(p, "shown: a rename in the tree stays", g.rename.active)
+
+		g.sidebar_visible = false
+		next_step(p, &step, frame)
+
+	case 2: // hidden: still laid out, covered, and a press there doesn't reach it
+		width: f32 = PANE_GAP + SIDEBAR_WIDTH
+		covered := laid_out && sidebar.x == 0 && sidebar.w == width && left == PANE_GAP
+		check(p, "hidden: laid out under the panes", covered)
+
+		g.mouse_pos = row_at
+		_, on_row := tree_row_under_pointer()
+		check(p, "hidden: its rows don't react", !on_row)
+		check(p, "hiding it drops a rename in the tree", !g.rename.active)
+
+		want_frame(p, sidebar)
+		g.mouse_pressed, g.mouse_down, g.mouse_clicks = true, true, 1
+		next_step(p, &step, frame)
+
+	case 3: // the press neither toggled the folder nor picked up a row
+		g.mouse_down = false
+		folder_row := folder_index(folder)
+		untouched := g.pending == nil && folder_row >= 0 && !g.workspace.nodes[folder_row].expanded
+		untouched = untouched && g.panes.drag.pane == nil
+		check(p, "hidden: a press misses the tree", untouched)
+
+		hidden := len(p.read_back) > 0 && sidebar_ink(p, sidebar) == 0
+		check(p, "hidden: nothing of it shows between the panes", hidden)
+
+		g.sidebar_visible = true
+		next_step(p, &step, frame)
+
+	case 4: // showing: the rows the panes still cover don't react yet
+		g.mouse_pos = row_at
+		_, on_row := tree_row_under_pointer()
+		covered := g.sidebar_visible && area.x < row_at.x
+		check(p, "showing: covered rows don't react", covered && !on_row)
+		next_step(p, &step, frame)
+
+	case 5: // press the search field
+		at, _ := element_center(clay.ID("SidebarSearch"))
+		g.mouse_pos, g.mouse_pressed, g.mouse_down, g.mouse_clicks = at, true, true, 1
+		next_step(p, &step, frame)
+
+	case 6: // type a query
+		g.mouse_down = false
+		check(p, "a press on the field gives it keys", s.typing)
+
+		type_text("sidebar_target")
+		next_step(p, &step, frame)
+
+	case 7: // the files match in place of the tree; press the one found
+		if sidebar_search_busy() do return false
+
+		_, listed := element_rect(clay.ID("SidebarResults"))
+		results := s.search.results
+		found := listed && len(results) > 0 && same_path(g.finder.files[results[0].index], target)
+		check(p, "typing lists the matching files", found)
+
+		at, _ := element_center(search_row_id(target))
+		g.mouse_pos, g.mouse_pressed, g.mouse_down, g.mouse_clicks = at, true, true, 1
+		next_step(p, &step, frame)
+
+	case 8:
+		g.mouse_down = false
+		next_step(p, &step, frame)
+
+	case 9: // opened and focused; the search closed; then Enter on a query
+		e := focused_editor()
+		opened := e != nil && same_path(e.path, target)
+		check(p, "a press on a result opens it", opened)
+		check(p, "and closes the search", !sidebar_search_active() && !s.typing)
+
+		if pane := pane_with_file(target); pane != nil {
+			pane_close(pane, ask = false)
+		}
+		s.typing = true
+		type_text("sidebar_target")
+		next_step(p, &step, frame)
+
+	case 10: // Enter opens the first match
+		if sidebar_search_busy() do return false
+
+		press(sdl.K_RETURN)
+		next_step(p, &step, frame)
+
+	case 11: // opened, and the search closed; then Escape on a query
+		e := focused_editor()
+		opened := e != nil && same_path(e.path, target)
+		check(p, "Enter opens the first match", opened)
+		check(p, "and closes the search", !sidebar_search_active() && !s.typing)
+
+		// The tree selects the focused file's row, and none while a terminal is focused
+		file_selected := opened && same_path(tree_selected_file(), target)
+		pane_focus(perf_panes.terminal)
+		none_selected := tree_selected_file() == ""
+		pane_focus(pane_with_file(target))
+		check(p, "the tree selects the focused file", file_selected)
+		check(p, "and nothing while a terminal is focused", none_selected)
+
+		s.typing = true
+		type_text("sidebar")
+		press(sdl.K_ESCAPE)
+		next_step(p, &step, frame)
+
+	case 12:
+		_, tree := element_rect(clay.ID("SidebarFiles"))
+		back := tree && !sidebar_search_active() && !s.typing
+		check(p, "Escape brings the tree back", back)
+
+		// The empty field shows Find file's key, which gives the field the keys
+		_, hint := element_rect(clay.ID("SidebarSearchHint"))
+		check(p, "the empty field shows Find file's key", hint)
+		run_command(.Find_File)
+		check(p, "Find file gives the field the keys", s.typing && !g.finder.open)
+		s.typing = false
+
+		// With the sidebar hidden, Find file opens the finder
+		g.sidebar_visible = false
+		run_command(.Find_File)
+		check(p, "hidden, Find file opens the finder", g.finder.open)
+		finder_close()
+		g.sidebar_visible = true
+
+		// Back as it was
+		for path in ([]string{target, below}) {
+			if pane := pane_with_file(path); pane != nil {
+				pane_close(pane, ask = false)
+			}
+		}
+		g.mouse_pos = mouse
+		if before != "" do open_loaded(before)
+		delete(before)
+		before = ""
+		return true
+	}
+	return false
+}
+
+
+// Opens a file in a pane under the focused one, the two parting across the
+// sidebar's search field (as last laid out), so its edge shows between them
+@(private = "file")
+split_across_search :: proc(path: string) {
+	above := g.panes.focused
+	pane := pane_loaded(path)
+	if above == nil || above == pane {
+		return
+	}
+
+	work := work_rect()
+	field, _ := element_rect(clay.ID("SidebarSearch"))
+	gap_top := field.y + field.h / 2 - PANE_GAP / 2
+	share := 1 - (gap_top - work.y) / (work.h - PANE_GAP)
+	pane_move(pane, {kind = .Split, target = above, side = .Bottom, share = share})
+}
+
+
+// The left edge of the panes shown, as last laid out
+@(private = "file")
+panes_left :: proc() -> f32 {
+	left := f32(g.window_w)
+	for pane in g.panes.open {
+		if !pane.visible do continue
+
+		r, ok := element_rect(pane_id(pane))
+		if ok do left = min(left, r.x)
+	}
+	return left
+}
+
+
+// The pixels read back (want_frame) within `area` that aren't the window's
+// color, outside the panes shown and their edges
+@(private = "file")
+sidebar_ink :: proc(p: ^Perf, area: gfx.Rect) -> int {
+	read := p.read_area
+	if len(p.read_back) != int(read.w * read.h) do return 0
+
+	// The panes as last laid out, a pixel larger for their antialiased edges
+	panes := make([dynamic]gfx.Rect, context.temp_allocator)
+	for pane in g.panes.open {
+		r, ok := element_rect(pane_id(pane))
+		if pane.visible && ok {
+			append(&panes, gfx.Rect{r.x - 1, r.y - 1, r.w + 2, r.h + 2})
+		}
+	}
+
+	// The pixels between them that differ from the window
+	bg := gfx.theme.panel
+	ink := 0
+	for px, i in p.read_back {
+		x := f32(int(read.x) + i % int(read.w)) / gfx.scale
+		y := f32(int(read.y) + i / int(read.w)) / gfx.scale
+		if !gfx.rect_contains(area, {x, y}) do continue
+		if covered_by(panes[:], {x, y}) do continue
+
+		differs := abs(int(px[0]) - int(bg.r)) > 8 ||
+		           abs(int(px[1]) - int(bg.g)) > 8 ||
+		           abs(int(px[2]) - int(bg.b)) > 8
+		if differs do ink += 1
+	}
+	return ink
+}
+
+
+@(private = "file")
+covered_by :: proc(rects: []gfx.Rect, at: [2]f32) -> bool {
+	for r in rects {
+		if gfx.rect_contains(r, at) do return true
+	}
+	return false
+}
+
+
+// The tree's node for a path, or -1
+@(private = "file")
+folder_index :: proc(path: string) -> int {
+	for n, i in g.workspace.nodes {
+		if same_path(n.path, path) do return i
+	}
+	return -1
 }
 
 

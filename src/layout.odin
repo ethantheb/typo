@@ -1,9 +1,6 @@
 package editor
 
 import "core:fmt"
-import "core:hash"
-import "core:slice"
-import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "buffer"
@@ -11,14 +8,13 @@ import sdl "../vendor/sdl3"
 import "gfx"
 import "textedit"
 
-// The window layout: the sidebar and the panes (panes.odin) float over "Main"
-// at rects computed from the window size, with the status bar under them; and
-// the mouse cursor shape
+// The window layout: the sidebar (sidebar.odin) at the left of "Main" and the
+// panes (panes.odin) floating beside it, or over it while it is hidden, at rects
+// computed from the window size, with the status bar under them; and the mouse
+// cursor shape
 
 
-FONT_SIZE_SIDEBAR :: 13
-STATUSBAR_HEIGHT  :: 24
-SIDEBAR_WIDTH     :: 240
+STATUSBAR_HEIGHT :: 24
 
 
 build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
@@ -49,178 +45,6 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 
 	g.animating = false // set again by any transition still running (see transition)
 	return clay.EndLayout(g.dt)
-}
-
-
-// --- Sidebar -----------------------------------------------------------------------
-
-// A pane at the left: the file tree, and the shelf under it. Hiding it slides it
-// out of the window; it is declared until it gets there
-@(private = "file")
-sidebar :: proc() {
-	id := clay.ID("Sidebar")
-	work := work_rect()
-	r := gfx.Rect{PANE_GAP, PANE_GAP, SIDEBAR_WIDTH, work.h}
-
-	// Hidden: out of the window, and gone once it got there
-	if !g.sidebar_visible {
-		r.x = -SIDEBAR_WIDTH - PANE_GAP
-		if g.sidebar_gone || element_at(id, r) {
-			g.sidebar_gone = true
-			return
-		}
-	}
-	g.sidebar_gone = false
-
-	if clay.UI(id)({
-		layout = {
-			sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)},
-			layoutDirection = .TopToBottom,
-			padding = {bottom = 4},
-		},
-		backgroundColor = gfx.theme.bg,
-		cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
-		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
-		floating = {attachTo = .Parent, offset = {r.x, r.y}, zIndex = 2},
-		transition = transition(clay.TransitionPropertyBoundingBox, .From_Left),
-	}) {
-		sidebar_header()
-
-		files_id := clay.ID("SidebarFiles")
-		wheel_scroll_list(files_id)
-		active := active_editor()
-
-		// Open files with unsaved changes, marked in the tree
-		modified := make([dynamic]string, context.temp_allocator)
-		for p in g.panes.open {
-			e, is_file := p.content.(^Editor)
-			if is_file && editor_is_modified(e) {
-				append(&modified, e.path)
-			}
-		}
-
-		// The tree
-		if clay.UI(files_id)({
-			layout = {
-				sizing = {clay.SizingGrow(), clay.SizingGrow()},
-				layoutDirection = .TopToBottom,
-				padding = {bottom = 4},
-			},
-			clip = {horizontal = true, vertical = true, childOffset = clay.GetScrollOffset()},
-		}) {
-			if creating_in(g.workspace.root) do new_entry_row(0)
-
-			for index in g.workspace.visible {
-				node := g.workspace.nodes[index]
-				selected := active != nil && node.path == active.path
-				changed := !node.is_dir && slice.contains(modified[:], node.path)
-
-				// Files open on release, or drag into a pane (see drag_mouse)
-				pressed := tree_row(index, node, selected, changed, files_id)
-				if pressed && node.is_dir && !renaming(.Tree, node.path) {
-					g.pending = Toggle_Node(index)
-				}
-
-				if node.is_dir && creating_in(node.path) {
-					new_entry_row(node.depth + 1)
-				}
-			}
-		}
-
-		shelf(r.h * 0.45)
-	}
-}
-
-
-// The folder's name and the open folder button, laid out like a pane's header,
-// level with the panes' titles
-@(private = "file")
-sidebar_header :: proc() {
-	if clay.UI()({
-		layout = {
-			sizing = {clay.SizingGrow(), clay.SizingFixed(PANE_HEADER_HEIGHT)},
-			padding = {left = 12, right = 4},
-			childGap = 2,
-			childAlignment = {y = .Center},
-		},
-	}) {
-		name_id := clay.ID("FolderName")
-		if clay.UI(name_id)({}) {
-			name := strings.to_upper(folder_name(g.workspace.root), context.temp_allocator)
-			label(name, gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
-		}
-		tooltip(name_id, g.workspace.root)
-
-		push_right()
-		if icon_button(clay.ID("OpenButton"), .Folder_Open, 22, 14, "Open folder") {
-			show_open_folder_dialog()
-		}
-	}
-}
-
-
-// A tree row's element id. It follows the path, not the row's place, so a
-// press matched against last frame's layout finds the same file after the tree
-// changed (a rename re-sorts it)
-tree_row_id :: proc(path: string) -> clay.ElementId {
-	return clay.ID("TreeRow", hash.fnv32a(transmute([]u8)path))
-}
-
-
-// The node of the tree row under the pointer, if any
-tree_row_under_pointer :: proc() -> (index: int, ok: bool) {
-	if !g.sidebar_visible || !pointer_in(clay.ID("SidebarFiles")) {
-		return
-	}
-
-	for i in g.workspace.visible {
-		if pointer_in(tree_row_id(g.workspace.nodes[i].path)) do return i, true
-	}
-	return
-}
-
-
-// One explorer row: indent, chevron for directories, name, and a dot for an
-// open file with unsaved changes. Returns true when pressed
-@(private = "file")
-tree_row :: proc(
-	index: int,
-	node: Node,
-	selected, modified: bool,
-	list: clay.ElementId,
-) -> bool {
-	id := tree_row_id(node.path)
-
-	if list_row(id, selected, 22, u16(2 + node.depth * 12)) {
-		if node.is_dir {
-			icon(node.expanded ? .Chevron_Down : .Chevron_Right, gfx.theme.text_dim)
-		} else {
-			spacer_x(16)
-		}
-
-		if renaming(.Tree, node.path) {
-			rename_field(FONT_SIZE_SIDEBAR)
-		} else {
-			label(node.name, selected ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
-			if modified do label(" •", gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
-		}
-	}
-
-	return clicked(id, list)
-}
-
-
-// The row a new file or folder is named in, at the top of its folder
-@(private = "file")
-new_entry_row :: proc(depth: int) {
-	if list_row(clay.ID("NewEntryRow"), false, 22, u16(2 + depth * 12)) {
-		if g.rename.create == .Folder {
-			icon(.Chevron_Right, gfx.theme.text_dim)
-		} else {
-			spacer_x(16)
-		}
-		rename_field(FONT_SIZE_SIDEBAR)
-	}
 }
 
 

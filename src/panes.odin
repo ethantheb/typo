@@ -9,7 +9,8 @@ import clay "../vendor/clay-odin"
 import "gfx"
 
 // Panes: the open files and terminals (g.panes.open). The ones shown are the
-// leaves of a split tree (Tile) that fills the work area beside the sidebar;
+// leaves of a split tree (Tile) that fills the work area, beside the sidebar
+// when it shows (it is behind them: sidebar.odin);
 // terminals that aren't shown wait on the shelf, the list under the file tree.
 // A file comes from the tree, and closes when another takes its place unless it
 // has unsaved changes. Each pane is a floating Clay element at the rect its leaf
@@ -85,6 +86,14 @@ Leaving :: struct {
 	rect: gfx.Rect, // where it ends
 }
 
+// Where a press that may become a drag began
+Drag_Source :: enum {
+	Title,
+	Shelf,  // a click shows the pane
+	Tree,   // a click opens the file
+	Search, // a sidebar search result: a click opens the file and closes the search
+}
+
 Panes :: struct {
 	open:        [dynamic]^Pane, // every open pane, in opening order
 	root:        ^Tile,          // nil when nothing is shown
@@ -97,11 +106,7 @@ Panes :: struct {
 		pane:    ^Pane,  // &incoming for a file not open yet
 		file:    string, // owned; that file
 		from:    [2]f32, // where the press was
-		source:  enum {
-			Title,
-			Shelf, // a click shows the pane
-			Tree,  // a click opens the file
-		},
+		source:  Drag_Source,
 		active:  bool, // moved past DRAG_THRESHOLD
 		drop:    Drop,
 		preview: gfx.Rect,
@@ -202,20 +207,6 @@ focused_terminal :: proc() -> ^Terminal {
 
 	t, _ := p.content.(^Terminal)
 	return t
-}
-
-
-// The focused editor, else the one focused last if still shown
-active_editor :: proc() -> ^Editor {
-	if e := focused_editor(); e != nil {
-		return e
-	}
-
-	p := g.panes.last_editor
-	if p != nil && pane_shown(p) {
-		return p.content.(^Editor)
-	}
-	return nil
 }
 
 
@@ -918,7 +909,8 @@ drop_rect :: proc(p: ^Pane, d: Drop) -> gfx.Rect {
 }
 
 
-// The area panes fill: the window above the status bar, beside the sidebar
+// The area panes fill: the window above the status bar, right of the sidebar
+// when it shows (the panes cover it otherwise)
 work_rect :: proc() -> gfx.Rect {
 	x: f32 = PANE_GAP
 	if g.sidebar_visible do x += SIDEBAR_WIDTH + PANE_GAP
@@ -1078,12 +1070,13 @@ drag_mouse :: proc(interactive: bool) {
 		case d.source == .Shelf:
 			pane_show(d.pane)
 
-		case d.source == .Tree:
+		case d.source == .Tree || d.source == .Search:
 			if d.pane == &incoming {
 				panes_open_file(d.file)
 			} else {
 				pane_show(d.pane)
 			}
+			if d.source == .Search do sidebar_search_close()
 		}
 		drag_clear()
 		return
@@ -1129,7 +1122,7 @@ drag_press :: proc() {
 			return
 		}
 
-		on_shelf := g.sidebar_visible &&
+		on_shelf := pointer_on_sidebar() &&
 		            pointer_in(clay.ID("ShelfRow", p.id)) &&
 		            pointer_in(clay.ID("ShelfList")) &&
 		            !pointer_in(clay.ID("ShelfClose", p.id))
@@ -1139,22 +1132,20 @@ drag_press :: proc() {
 		}
 	}
 
-	// A file in the tree
-	index, on_row := tree_row_under_pointer()
-	if !on_row || g.workspace.nodes[index].is_dir {
-		return
-	}
+	// A file in the tree, or in the sidebar's search results
+	path, on_file := sidebar_file_under_pointer()
+	if !on_file do return
 
-	path := g.workspace.nodes[index].path
+	source := sidebar_search_active() ? Drag_Source.Search : Drag_Source.Tree
 	if p := pane_with_file(path); p != nil {
-		d^ = {pane = p, from = g.mouse_pos, source = .Tree}
+		d^ = {pane = p, from = g.mouse_pos, source = source}
 	} else {
 		incoming = {}
 		d^ = {
 			pane   = &incoming,
 			file   = strings.clone(path),
 			from   = g.mouse_pos,
-			source = .Tree,
+			source = source,
 		}
 	}
 }
@@ -1174,7 +1165,7 @@ drop_at :: proc(p: ^Pane, pos: [2]f32) -> Drop {
 	ps := &g.panes
 
 	// On the sidebar: back to the shelf, for a shown terminal
-	if g.sidebar_visible && pointer_in(clay.ID("Sidebar")) {
+	if pointer_on_sidebar() {
 		if is_terminal(p) && pane_shown(p) {
 			return {kind = .Shelf}
 		}
@@ -1256,7 +1247,7 @@ panes_ui :: proc() {
 	}
 	for l in ps.leaving do leaving_pane(l)
 
-	if ps.root == nil do empty_work(work)
+	work_area(work)
 
 	for p in ps.open {
 		p.visible = false
@@ -1297,15 +1288,6 @@ pane_ease :: proc "c" (args: clay.TransitionCallbackArguments) -> bool {
 	done := clay.EaseOut(args)
 	if !done do g.animating = true
 	return done
-}
-
-
-// The overlay a pane rests at: the window color, clear. Faded in from opaque
-@(private = "file")
-window_overlay :: proc(alpha: f32 = 0) -> clay.Color {
-	c := gfx.theme.panel
-	c.a = alpha
-	return c
 }
 
 
@@ -1461,24 +1443,20 @@ centered_message :: proc(s: string) {
 }
 
 
-// What the work area says while no pane is shown
+// The work area under the panes, easing with them: where it is, the sidebar is
+// covered (pointer_on_sidebar)
 @(private = "file")
-empty_work :: proc(r: gfx.Rect) {
-	if clay.UI(clay.ID("EmptyWork"))({
-		layout = {
-			sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)},
-			childAlignment = {x = .Center, y = .Center},
-		},
+work_area :: proc(r: gfx.Rect) {
+	if clay.UI(clay.ID("WorkArea"))({
+		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
 		floating = {
 			attachTo = .Parent,
 			offset = {r.x, r.y},
 			zIndex = 1,
 			pointerCaptureMode = .Passthrough,
 		},
-	}) {
-		chord := first_chord_label(.Find_File)
-		label(fmt.tprintf("Select a file in the explorer, or press %s", chord), gfx.theme.text_dim)
-	}
+		transition = pane_transition(nil),
+	}) {}
 }
 
 

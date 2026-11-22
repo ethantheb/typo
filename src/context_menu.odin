@@ -154,7 +154,7 @@ context_menu_frame :: proc() {
 		}
 
 		on_shelf := pointer_in(clay.ID("ShelfRow", p.id)) && pointer_in(clay.ID("ShelfList"))
-		if g.sidebar_visible && on_shelf {
+		if pointer_on_sidebar() && on_shelf {
 			menu_open(TERMINAL_ITEMS[:], "", p, .Shelf)
 			return
 		}
@@ -177,7 +177,7 @@ context_menu_frame :: proc() {
 		node := g.workspace.nodes[index]
 		items := node.is_dir ? FOLDER_ITEMS[:] : FILE_ITEMS[:]
 		menu_open(items, node.path, nil, .Tree)
-	} else if g.sidebar_visible && pointer_in(clay.ID("SidebarFiles")) {
+	} else if pointer_on_sidebar() && pointer_in(clay.ID("SidebarFiles")) {
 		menu_open(FOLDER_ITEMS[:2], g.workspace.root, nil, .Tree)
 	}
 }

@@ -78,7 +78,10 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   rebuilds the library when its patch changes):
   - `patches/sdl_ttf.patch`: glyphs at quarter-pixel positions, with text measured
     the way it is drawn (`Glyph_Pixel_X`); `TTF_SetFontHinting` actually enabling
-    subpixel rendering (upstream never stored it); `TTF_SetFontCoverageTable`, which
+    subpixel rendering (upstream never stored it), and `TTF_SetFontSubpixelPositioning`
+    turning quarter-pixel positions on whatever the hinting (`gfx.glyph_fit`: the
+    editor font's faces are light-hinted, other fonts unhinted, since FreeType's
+    hinter can close a bold i's dot onto its stem); `TTF_SetFontCoverageTable`, which
     `gfx/text.odin` uses for per-font gamma and contrast; glyph images exactly the
     size of the box the engine stretches them over (the glyph's box, padded for the
     LCD filter and the italic slant, `Glyph_Padding`); `TTF_SetFontCellAdvance`
@@ -112,14 +115,18 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   huge files opened, saved and restored while frames go on (perf_files.odin), the
   large-file question, finder (open and recent files first), find in files and the
   terminal, moving lines, settings window (several bindings for a command), context
-  menu and dialogs, files changed on disk, terminal, block elements and box drawing
+  menu and dialogs, the sidebar behind the panes (what shows between them read
+  back from a real frame) and its search, files changed on disk, terminal, block
+  elements and box drawing
   read back from the terminal and an editor, panes, zoom, `typo <file>` in the
   terminal, go to line, text fields, idle CPU/GPU) and exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
   setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed`, sending other mouse
   buttons through `mouse_button_event` and keys through `handle_key_event`; chords
   match on the scancode, so a shortcut is run with `run_command`, or sent with its
-  scancode (`press_chord`) when the key path is what is tested. Figures are affected
+  scancode (`press_chord`) when the key path is what is tested. A step reads back
+  what a frame showed with `want_frame` (read once drawn, before it is presented,
+  into `Perf.read_back` for the next step). Figures are affected
   by other load; rerun once before investigating a result just over. A feature with a
   per-frame or per-keystroke cost gets a phase or result; a UI behavior gets a check.
 - `TYPO_SETTINGS` points typo at another settings.toml (the perf suite uses a temp one);
@@ -230,6 +237,43 @@ other processes send) runs on other threads, which hand over finished results.
   a press matched against last frame's layout finds the same file after the tree
   re-sorts. Whatever holds a `^Pane` (menu, rename, drag, pending `Pane_Op`) is
   cleared in `pane_close`.
+- **Sidebar** (sidebar.odin): the window's background at its left edge, flat on
+  the window's color (no panel or border), always laid out (a flow child of "Main",
+  its own width). The panes sit beside it on the window's color, the only raised
+  elements. Toggle sidebar only moves `work_rect`'s left edge: the panes ease over
+  the sidebar or away from it, and the sidebar fades into the window as they cover
+  it and back as they leave (`sidebar_fade`: an overlay of the window's color,
+  transitioned with the panes' duration and easing; its floating parts, the search
+  field's clear button and key hint, take it too, as Clay's overlays don't reach
+  floating children), so nothing of it shows between the panes while hidden. Hiding
+  it drops a rename in the tree or shelf. "WorkArea" (`work_area` in panes.odin:
+  floating at the work area under the panes, easing as they do, passthrough) marks
+  what covers the sidebar: its
+  own checks go through `pointer_on_sidebar` (shown, and left of "WorkArea" as last
+  laid out, so rows the panes still cover while sliding back don't react):
+  `ui_interactive` refuses while building it (`g.in_sidebar`) elsewhere, as do tree
+  and shelf hit tests, drops and the context menu. Top to bottom: the folder's
+  name, the search field, the tree (or the search's files) and the shelf. The tree
+  marks open files with unsaved changes and every folder they are in, collapsed or
+  not, with a dot (`unsaved_marks`: each modified file's ancestors below the root,
+  by `path_key_ascii`, per frame from the open editors).
+- **Sidebar search** (sidebar.odin, `g.sidebar_search`): a `Line_Edit` above the
+  tree, showing Find file's key at its right while empty. Find file (Ctrl+E,
+  `find_file`) gives it the keys with its query selected while the sidebar shows,
+  else opens the finder; a press on it gives it the keys (`typing`), a press
+  anywhere else, hiding the sidebar, Enter or another shortcut (which then runs)
+  gives them back. While
+  it holds text its files show in place of the tree: the finder's index and scoring
+  (`Search`, finder.odin) with its own results, stepped in `sidebar_frame` within
+  `SEARCH_BUDGET` (paused while the finder is open), open and recent files boosted.
+  Up/Down select, Enter opens through `Open_File` (as a tree click: in place of the
+  editor in use, the tree revealing it); a press on a row opens it or drags it into a
+  pane like a tree row (`sidebar_file_under_pointer` in `drag_press`, source
+  `.Search`). Opening a result (Enter or a click, not a drag), Escape or the x
+  empties the field and brings the tree back (`sidebar_search_close`; its scroll
+  kept: another list). With the sidebar hidden, Find file opens the finder popup,
+  which also lists open and recent files with no query and has symbols and places
+  as sources.
 - **Zoom** (zoom.odin): each pane's text has its own size, a step from 100% in
   `textedit.ZOOM_LEVELS` (50%..300%): `textedit.View.zoom` for an editor (both kinds),
   `Terminal.zoom`. The interface doesn't zoom. Zoom in/out/reset act on the focused
@@ -422,12 +466,14 @@ other processes send) runs on other threads, which hand over finished results.
   lines. The client's thread decodes the answer (`[]lsp.Symbol`, `[]lsp.Place` with
   `preview`, files that aren't open read there), sorts an outline into the file's
   order and references by file (the asked one first); the items take the answer's
-  strings over. Every source is filtered locally with `fuzzy.score`, incrementally,
-  and only the rows in view are laid out. Accepting goes through `jump_to`; a row
+  strings over. Every source is filtered locally with `fuzzy.score`, incrementally
+  (a `Search`: `search_step` scores rows within `SEARCH_BUDGET`, keeping the best;
+  the sidebar's search field has another over the same index), and only the rows in
+  view are laid out. Accepting goes through `jump_to`; a row
   clicked in the layout is opened next frame by `finder_frame`. Files open in typo
   (every editor pane, shown or kept for its unsaved changes) and recent files
   (recent.odin) come first, as in VS Code's quick open and Zed's file finder: they
-  are ranked when the finder opens (`Finder.ranked`, by `path_key_ascii`). With no
+  are ranked when the finder opens (`Search.ranked`, by `path_key_ascii`). With no
   query: the open files, most recently used first, then the recent ones, then the
   shortest paths; the focused file isn't listed, so Enter switches. With a query
   they get `FINDER_BOOST` on their score. Their rows say "open" or "recent".
@@ -539,7 +585,9 @@ src/                 package editor: the app
                      hit tests (clicked, pointer_in), transition, element_at
   scrollbar.odin     Scroll bars (either axis, on gfx/scrollbar.odin), list_scrollbar,
                      wheel routing
-  layout.odin        Window layout: sidebar (file tree, shelf), status bar, mouse cursor
+  layout.odin        Window layout: "Main" (sidebar, panes), status bar, mouse cursor
+  sidebar.odin       The sidebar behind the panes (folder name, search field, file
+                     tree with unsaved dots, shelf), fading as they cover it
   panes.odin         Panes: shelf, split tree, drops, divider and pane dragging,
                      pane UI, focus, pane commands
   editor.odin        Editor: state, Markdown attachment, renames, keys, commands,
@@ -562,7 +610,8 @@ src/                 package editor: the app
                      that can't go there is not deleted, and the user is asked to
                      delete it permanently. Names Windows can't use are refused.
   finder.odin        The finder: files (Ctrl+E: background indexer, incremental
-                     search) or a server's symbols and places; rows in view only
+                     search, shared with the sidebar's field) or a server's symbols
+                     and places; rows in view only
   find*.odin         Find in a pane (Ctrl+F): the bar, searching editors (plain, whole
                      word, case, regex), libghostty search in terminals
   goto_line.odin     Go to line (Ctrl+G): the bar, reading "line:column", previewing
@@ -607,7 +656,8 @@ src/                 package editor: the app
                      files and the session, goto_line_test: places and keys in the
                      bar, keymap_test: adding, taking and removing bindings,
                      file_load_test: loads and writes on their threads, the unsaved
-                     flow waiting)
+                     flow waiting, sidebar_test: folders marked for unsaved files,
+                     keys in the search field)
 src/gfx/             Drawing: draw.odin (primitives on gfx.renderer, clips, overlays,
                      selection shapes), scrollbar.odin (scroll bar geometry, dragging
                      and look along either axis),
@@ -685,7 +735,8 @@ Use Clay before writing UI machinery; read `ref/clay_docs.md` and
   animate closing, keep declaring the element at its closed size until `element_at`
   reports it there, then drop it.
 - **Fades**: `overlayColor`, applied by the renderer to everything inside, editor and
-  terminal included.
+  terminal included, but not to floating children (Clay emits them as their own
+  roots): give those the same overlay and transition.
 - **Clipping changes layout**: Clay doesn't compress a clipping element's children
   along the clipped axis and grows its Grow children to their content. A Grow page
   directly in a clipping panel is as tall as its rows, so a list in it never scrolls
@@ -694,7 +745,8 @@ Use Clay before writing UI machinery; read `ref/clay_docs.md` and
 - **Scrolling**: use `update_scroll_containers`, not `clay.UpdateScrollContainers`. The
   wheel goes to the topmost list registered with `wheel_scroll_list` (`list_scrollbar`
   does that), not to any clipping element.
-- **Stacking** (floating zIndex): panes 2-3, popups (`modal`, finder, settings) 100,
+- **Stacking** (floating zIndex): the sidebar in the base layout, "WorkArea" and
+  leaving panes 1, panes 2-3, popups (`modal`, finder, settings) 100,
   scroll bar thumbs 110, hover popup 115, completion list, signature and rename field
   116, context menu, language server and zoom popups 120, dialog 150, tooltips 300.
 

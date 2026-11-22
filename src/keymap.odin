@@ -157,7 +157,7 @@ Bindings :: [Command][MAX_CHORDS]Chord
 // Runs a command. Returns false if it doesn't apply (e.g. Save with no file open)
 run_command :: proc(cmd: Command) -> bool {
 	#partial switch cmd {
-	case .Find_File:       finder_toggle()
+	case .Find_File:       find_file()
 	case .Go_To_Symbol:    lsp_find_workspace_symbols()
 	case .Toggle_Sidebar:  g.sidebar_visible = !g.sidebar_visible
 	case .Toggle_Terminal: terminal_toggle()

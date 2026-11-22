@@ -34,7 +34,8 @@ pointer_in :: proc(id: clay.ElementId) -> bool {
 // (g.in_modal is set while they are built), the rest only while no popup covers
 // the window. The settings window's option list sits at the side and leaves the
 // window usable outside it. The find bar covers what is under it (it can reach
-// past a narrow pane)
+// past a narrow pane). The sidebar reacts only while it shows, where the panes'
+// area doesn't cover it
 ui_interactive :: proc() -> bool {
 	switch {
 	case g.dialog.open, g.menu.open, g.lsp.popup.open: return g.in_popup
@@ -42,6 +43,7 @@ ui_interactive :: proc() -> bool {
 	case lsp_hover_covers_pointer():                  return g.in_popup
 	case lsp_completion_covers_pointer():             return g.in_popup
 	case lsp_rename_covers_pointer():                 return g.in_popup
+	case g.in_sidebar && !pointer_on_sidebar():       return false
 	case g.in_modal:                                  return true
 	case g.finder.open:                               return false
 	case settings_window_docked():                    return !pointer_in(clay.ID("Settings"))
@@ -536,6 +538,15 @@ transition :: proc(
 // color, fully transparent, so only the alpha changes as it fades
 clear_overlay :: proc(background: clay.Color) -> clay.Color {
 	return {background.r, background.g, background.b, 0}
+}
+
+
+// An overlay of the window's color: at 0 what it covers shows as it is, at 255
+// it is hidden in the window (a pane fading in, the sidebar fading out)
+window_overlay :: proc(alpha: f32 = 0) -> clay.Color {
+	c := gfx.theme.panel
+	c.a = alpha
+	return c
 }
 
 

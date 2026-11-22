@@ -233,6 +233,8 @@ foreign lib {
 	SetFontLCD :: proc(font: ^Font, order: c.int) -> bool ---
 	// From typo's patch: advances in whole cells of `advance` pixels, 0 = off.
 	SetFontCellAdvance :: proc(font: ^Font, advance: f32) -> bool ---
+	// From typo's patch: quarter-pixel glyph positions whatever the hinting.
+	SetFontSubpixelPositioning :: proc(font: ^Font, enabled: bool) -> bool ---
 	// From typo's patch: draws the LCD glyphs DrawRendererText queued.
 	FlushRendererText :: proc(engine: ^TextEngine) -> bool ---
 

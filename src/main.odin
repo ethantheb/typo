@@ -48,7 +48,8 @@ App :: struct {
 	panes:           Panes,
 	md_modes:        map[string]mdview.Mode, // Markdown files toggled this session, by path
 	sidebar_visible: bool,
-	sidebar_gone:    bool, // hidden, and done sliding out
+	sidebar_search:  Sidebar_Search,
+	in_sidebar:      bool, // building the sidebar (see ui_interactive)
 	dialog:          Dialog,
 	unsaved:         Unsaved_Flow,
 	menu:            Context_Menu,
@@ -347,6 +348,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_focus()
 	button_chord_frame()
 	finder_frame()
+	sidebar_frame()
 	find_frame()
 	goto_line_frame()
 	panes_frame()
@@ -405,6 +407,7 @@ needs_continuous_frames :: proc() -> bool {
 	     loads_busy(),
 	     ipc_busy(),
 	     finder_busy(),
+	     sidebar_search_busy(),
 	     find_busy(),
 	     panes_busy(),
 	     langs.busy(),
@@ -570,6 +573,7 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 	if settings_window_handle_event(event) do return
 	if finder_handle_event(event) do return
+	if sidebar_search_handle_event(event) do return
 	if goto_line_handle_event(event) do return
 	if find_handle_event(event) do return
 	if lsp_completion_handle_key(event) do return
@@ -620,6 +624,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	ipc_destroy()
 	watch_destroy()
 	finder_destroy()
+	sidebar_search_destroy()
 	find_destroy()
 	goto_line_destroy()
 	menu_close()
