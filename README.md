@@ -9,18 +9,17 @@ executable, low memory footprint, instantaneous startup,
 Obsidian-like MD rendering, etc. 
 
 Currently supported:
-- Open folders, search files
-- Text editing
-- Syntax highlighting (tree-sitter/custom lexer)
-- Themes
-- Integrated terminal (libghostty-vt)
+- Open folders as projects, open files
 - Window panes and splits
+- Edit text files, search within files, go to line, multicursor
+- Syntax highlighting (tree-sitter/custom lexer)
+- Integrated terminal (libghostty-vt), optional persistence (herdr-core)
 - Markdown live rendering/editing
-- LSP (early stages)
+- Git integration (libgit2 + git CLI), diff viewer
+- LSP (goto definition, rename symbol, etc)
 
 Might try soon:
 - Tabular data rendering (CSV)
-- Terminal persistence (herdr-core or something)
 
 #### AI Acknowledgement
 This project is sort of a personal test in LLM dev,
@@ -30,7 +29,7 @@ developed using AI and really shouldn't be used at this point.
 
 #### But hey, go ahead and install it if you want
 Developed on Windows only currently.
-It may be buildable on Linux/MacOS, but I wouldn't try it.
+It may be buildable on Linux/MacOS, try it at your own risk. Let me know how it goes.
 
 ```
 python build.py --install
