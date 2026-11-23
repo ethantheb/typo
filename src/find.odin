@@ -71,7 +71,9 @@ FIND_COMMANDS :: bit_set[Command]{
 // on one line. Returns false if no pane is focused
 find_open :: proc() -> bool {
 	p := g.panes.focused
-	if p == nil do return false
+	if p == nil || !(is_editor(p) || is_terminal(p)) {
+		return false
+	}
 
 	f := &g.find
 	if f.open && f.pane != p {
@@ -163,6 +165,7 @@ find_frame :: proc() {
 	switch c in f.pane.content {
 	case ^Editor:   find_editor_frame(f, c)
 	case ^Terminal: find_term_frame(f, c)
+	case ^Git_View, ^Diff_View: // find_open refuses them
 	}
 }
 
@@ -175,6 +178,7 @@ find_busy :: proc() -> bool {
 	switch c in f.pane.content {
 	case ^Editor:   return !f.done && !f.invalid && f.query != ""
 	case ^Terminal: return find_term_busy(f)
+	case ^Git_View, ^Diff_View:
 	}
 	return false
 }
@@ -228,6 +232,8 @@ find_restart :: proc(f: ^Find, jump: bool) {
 
 	case ^Terminal:
 		find_term_restart(f, c)
+
+	case ^Git_View, ^Diff_View:
 	}
 }
 
@@ -459,6 +465,7 @@ find_step :: proc(dir: int) -> bool {
 		find_editor_step(f, c, dir)
 	case ^Terminal:
 		find_term_step(f, c, dir)
+	case ^Git_View, ^Diff_View:
 	}
 	return true
 }
@@ -741,6 +748,7 @@ find_counts :: proc(f: ^Find) -> (total, current: int, complete: bool) {
 		return len(f.matches), f.current, f.done && !f.capped
 	case ^Terminal:
 		return find_term_counts(f)
+	case ^Git_View, ^Diff_View:
 	}
 	return
 }

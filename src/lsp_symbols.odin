@@ -15,6 +15,7 @@ import "gfx"
 import "langs"
 import "lsp"
 import "syntax"
+import "uitime"
 
 
 // What the finder asked a server
@@ -72,7 +73,7 @@ SYMBOL_KINDS := [27]Symbol_Kind {
 
 // Lists the editor's symbols in the finder (or closes the finder showing them)
 lsp_find_file_symbols :: proc(e: ^Editor) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	if g.finder.open && g.finder.source == .File_Symbols {
 		finder_close()
 		return
@@ -95,7 +96,7 @@ lsp_find_file_symbols :: proc(e: ^Editor) {
 // finder showing them). The focused file's server is asked, else any running
 // server that can
 lsp_find_workspace_symbols :: proc() {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	if g.finder.open && g.finder.source == .Workspace_Symbols {
 		finder_close()
 		return
@@ -116,7 +117,7 @@ lsp_find_workspace_symbols :: proc() {
 // Lists the places the symbol at `offset` is used in the finder. False if none
 // of the editor's servers can say
 lsp_find_references :: proc(e: ^Editor, offset: int) -> bool {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c := langs.client_with(&e.lsp, .References)
 	if c == nil do return false
 
@@ -244,7 +245,7 @@ client_alive :: proc(c: ^langs.Client) -> bool {
 
 // The answer the finder waits for: its items, or why there are none
 lsp_finder_response :: proc(r: langs.Request, resp: lsp.Response) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	lf := &g.lsp.finder
 	if !g.finder.open || r.id != lf.request || r.client != lf.client {
 		return

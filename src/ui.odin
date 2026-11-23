@@ -1,5 +1,8 @@
 package editor
 
+import "core:fmt"
+import "core:math"
+
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
 import "gfx"
@@ -10,8 +13,27 @@ import "gfx"
 
 FONT_SIZE_UI          :: 14
 FONT_SIZE_SMALL       :: 12
+FONT_SIZE_COUNT       :: 11 // a count beside a status bar item's name
 UI_LINE_HEIGHT        :: 20
 PARAGRAPH_LINE_HEIGHT :: 17
+
+
+// Clay keeps data for each clipping element it has seen lately, in a store of
+// about 100 (fixed in the library); past it, it errors. Clipping that only
+// stops a row's text running past its end takes from a budget per frame (well
+// under the store, as a changed list's old rows linger a frame), and goes
+// without once it is spent: the text then runs on, but Clay never errors.
+// Scroll lists and other clipping that layout needs don't take from it
+ROW_CLIP_BUDGET :: 40
+
+
+// A row's clipping (horizontal), while the frame's budget lasts
+row_clip :: proc() -> clay.ClipElementConfig {
+	if g.row_clips >= ROW_CLIP_BUDGET do return {}
+
+	g.row_clips += 1
+	return {horizontal = true}
+}
 
 
 // An element's bounds from the last layout
@@ -43,6 +65,8 @@ ui_interactive :: proc() -> bool {
 	case lsp_hover_covers_pointer():                  return g.in_popup
 	case lsp_completion_covers_pointer():             return g.in_popup
 	case lsp_rename_covers_pointer():                 return g.in_popup
+	case search_popup_covers_pointer():               return g.in_search_popup
+	case project_picker_covers_pointer():             return g.in_project_picker
 	case g.in_sidebar && !pointer_on_sidebar():       return false
 	case g.in_modal:                                  return true
 	case g.finder.open:                               return false
@@ -50,6 +74,7 @@ ui_interactive :: proc() -> bool {
 	case g.settings_window.open:                      return false
 	case goto_line_covers_pointer():                  return g.in_goto_bar
 	case find_bar_covers_pointer():                   return g.in_find_bar
+	case g.in_pane != nil:                            return pointer_over_pane(g.in_pane)
 	}
 	return true
 }
@@ -87,6 +112,34 @@ label :: proc(
 	font := gfx.Font_Id.Body,
 ) {
 	clay.TextDynamic(s, text_config(color, size, font))
+}
+
+
+// A label in a smaller font beside text of `beside`'s size, in a row centred
+// vertically, with its baseline on that text's: a line's text is centred in
+// its line box, which puts a smaller font's baseline higher, so it moves down
+// by the difference (top padding moves a centred child down by half of it)
+label_on_baseline :: proc(
+	s: string,
+	color: clay.Color,
+	size, beside: u16,
+	font := gfx.Font_Id.Body,
+) {
+	ts := &gfx.text_system
+	own := gfx.font_metrics(ts, font, size)
+	other := gfx.font_metrics(ts, font, beside)
+	drop := (other.ascent - other.height / 2) - (own.ascent - own.height / 2)
+
+	padding := u16(max(math.round(2 * drop), 0))
+	if clay.UI()({layout = {padding = {top = padding}}}) {
+		label(s, color, size, font)
+	}
+}
+
+
+// A count beside a status bar item's name, smaller, on the name's baseline
+count_label :: proc(n: int, color: clay.Color) {
+	label_on_baseline(fmt.tprintf("%d", n), color, FONT_SIZE_COUNT, FONT_SIZE_SMALL)
 }
 
 
@@ -145,6 +198,7 @@ icon_button :: proc(
 	icon_size: u16 = 16,
 	tip := "",
 	shortcut := "",
+	badge: Maybe(gfx.Icon_Badge) = nil,
 ) -> bool {
 	if clay.UI(id)({
 		layout = {
@@ -154,7 +208,7 @@ icon_button :: proc(
 		backgroundColor = clay.Hovered() ? gfx.theme.hover : {},
 		cornerRadius = clay.CornerRadiusAll(size / 4),
 	}) {
-		icon(kind, clay.Hovered() ? gfx.theme.text : gfx.theme.text_dim, icon_size)
+		icon(kind, clay.Hovered() ? gfx.theme.text : gfx.theme.text_dim, icon_size, badge)
 	}
 
 	if tip != "" do tooltip(id, tip, shortcut)
@@ -218,11 +272,20 @@ Custom_Data :: union {
 	^Editor,
 	^Terminal,
 	Field_Draw,
+	^Text_Area,
+	Diff_Draw,
 }
 
 
-icon :: proc(kind: gfx.Icon, color: clay.Color, size: u16 = 16) {
-	custom_element({}, gfx.Icon_Data{kind, color, size}, f32(size))
+// An icon, with a badge on its top right corner if given
+icon :: proc(
+	kind: gfx.Icon,
+	color: clay.Color,
+	size: u16 = 16,
+	badge: Maybe(gfx.Icon_Badge) = nil,
+) {
+	data := gfx.Icon_Data{kind = kind, color = color, size = size, badge = badge}
+	custom_element({}, data, f32(size))
 }
 
 
@@ -250,6 +313,11 @@ custom_element :: proc(id: clay.ElementId, data: Custom_Data, size: f32 = 0) {
 
 // --- Modal popups ------------------------------------------------------------------
 
+// The floating layer of popups over the panes: modal, modal_at, the sidebar
+// search's (see Stacking in CLAUDE.md)
+POPUP_LAYER :: 100
+
+
 // A panel centered over a dimmed window. Use as: if modal(...) { contents }
 @(deferred_none = end_modal)
 modal :: proc(
@@ -271,7 +339,7 @@ modal :: proc(
 			padding = {top = top},
 		},
 		backgroundColor = gfx.theme.backdrop,
-		floating = {attachTo = .Root, zIndex = 100},
+		floating = {attachTo = .Root, zIndex = POPUP_LAYER},
 	})
 
 	// The panel
@@ -317,7 +385,7 @@ modal_at :: proc(
 		backgroundColor = backdrop,
 		floating = {
 			attachTo = .Root,
-			zIndex = 100,
+			zIndex = POPUP_LAYER,
 			pointerCaptureMode = modal ? .Capture : .Passthrough,
 		},
 		transition = transition({.BackgroundColor}),

@@ -42,6 +42,7 @@ import "lsp"
 import sdl "../vendor/sdl3"
 import "syntax"
 import "textedit"
+import "uitime"
 import "words"
 
 
@@ -177,7 +178,7 @@ lsp_typed :: proc(e: ^Editor, text: string) {
 	if len(e.lsp.clients) == 0 && !with_words {
 		return
 	}
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	cs := &g.lsp.completion
 	last := text[len(text) - 1:]
 
@@ -389,7 +390,7 @@ ask_completions :: proc(
 	trigger: string,
 	invoked: bool,
 ) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	cs := &g.lsp.completion
 	c := langs.client_with(&e.lsp, .Completion)
 	mode := words_mode(e)
@@ -500,7 +501,7 @@ filter_completions :: proc(e: ^Editor, caret: int) {
 // with digits
 @(private = "file")
 filter_words :: proc(e: ^Editor, word: string) {
-	words_timed()
+	uitime.timed(&words_ui)
 	cs := &g.lsp.completion
 
 	// Hold the words the rows will show
@@ -576,7 +577,7 @@ resolve_chosen :: proc(e: ^Editor) {
 		return
 	}
 
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c := cs.client
 	if cs.resolving != 0 do langs.cancel_request(cs.resolving, c)
 	if c == nil || c.state != .Running {
@@ -595,7 +596,7 @@ resolve_chosen :: proc(e: ^Editor) {
 
 // Completions (taken over), or a chosen item's documentation
 lsp_completion_response :: proc(r: langs.Request, resp: lsp.Response) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	cs := &g.lsp.completion
 	if r.feature == .Completion_Resolve {
 		resolve_response(r, resp)
@@ -898,7 +899,7 @@ signature_step :: proc() {
 	}
 	sig.due = false
 
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c := langs.client_with(&e.lsp, .Signature_Help)
 	if c == nil {
 		lsp_signature_close()
@@ -915,7 +916,7 @@ signature_step :: proc() {
 
 // The call the caret is in, or none: then it closes
 lsp_signature_response :: proc(r: langs.Request, resp: lsp.Response) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	sig := &g.lsp.signature
 	if r.id != sig.request || r.client != sig.client {
 		return
@@ -990,7 +991,7 @@ completion_list :: proc(e: ^Editor, rows: int) {
 	// Only the rows in view (and one more) are laid out, between spacers
 	scroll := clay.GetScrollContainerData(list)
 	if cs.reveal && scroll.found {
-		scroll_to_chosen(&scroll)
+		list_reveal_row(scroll, g.lsp.completion.selected, ROW_HEIGHT)
 		cs.reveal = false
 	}
 	first := 0
@@ -1066,7 +1067,7 @@ completion_row :: proc(row: int, word: string) -> bool {
 		// The label and signature, cut off before the detail
 		if clay.UI()({
 			layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
 			matched := fuzzy.positions(word, item.label)
 			bright := gfx.theme.text_bright
@@ -1079,7 +1080,7 @@ completion_row :: proc(row: int, word: string) -> bool {
 		if item.detail != "" {
 			if clay.UI()({
 				layout = {sizing = {width = clay.SizingFit({max = 160})}},
-				clip = {horizontal = true},
+				clip = row_clip(),
 			}) {
 				label(item.detail, gfx.theme.text_dim, FONT_SIZE_SMALL)
 			}
@@ -1128,21 +1129,6 @@ completion_docs :: proc(e: ^Editor, height: f32) {
 			clay.TextDynamic(item.detail, config)
 		}
 		markdown_blocks(item.documentation, e.hl.lang)
-	}
-}
-
-
-@(private = "file")
-scroll_to_chosen :: proc(scroll: ^clay.ScrollContainerData) {
-	cs := &g.lsp.completion
-	top := f32(cs.selected * ROW_HEIGHT)
-	view := scroll.scrollContainerDimensions.height
-
-	// scrollPosition is negative: content offset upward
-	if top < -scroll.scrollPosition.y {
-		scroll.scrollPosition.y = -top
-	} else if top + ROW_HEIGHT > -scroll.scrollPosition.y + view {
-		scroll.scrollPosition.y = -(top + ROW_HEIGHT - view)
 	}
 }
 

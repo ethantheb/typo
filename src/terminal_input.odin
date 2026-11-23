@@ -21,11 +21,13 @@ terminal_handle_event :: proc(t: ^Terminal, event: ^sdl.Event) -> bool {
 		return true
 	}
 
-	// Keys typo itself handles
+	// Keys typo itself handles: the commands set to work in terminals, when
+	// they apply; the rest go to the shell
 	key := event.key
 	if is_modifier_key(key.key) do return true
-	if cmd, ok := command_for_key(key); ok && cmd in TERMINAL_COMMANDS {
-		return run_command(cmd)
+	cmd, bound := command_for_key(key)
+	if bound && cmd in g.settings.terminal_commands && run_command(cmd) {
+		return true
 	}
 	if key.key == sdl.K_F12 do return false // Clay debug view
 

@@ -34,6 +34,17 @@ Theme :: struct {
 	md_link:      clay.Color,
 	md_marker:    clay.Color, // syntax shown where the caret is
 	md_rule:      clay.Color, // quote bars, thematic breaks, table lines
+	// Git, derived from the terminal colors: a file's change, and diffs
+	git_added:    clay.Color, // added and untracked files
+	git_modified: clay.Color,
+	git_deleted:  clay.Color,
+	git_renamed:  clay.Color,
+	git_conflict: clay.Color,
+	diff_added:   clay.Color, // behind a line the new side adds
+	diff_removed: clay.Color, // behind a line the old side loses
+	diff_added_word:   clay.Color, // behind what changed within a changed line
+	diff_removed_word: clay.Color,
+	diff_filler:  clay.Color, // rows where a side has no line
 	syntax:       [syntax.Highlight]clay.Color,
 	// Terminal colors 0-15: black red green yellow blue magenta cyan white, then bright
 	ansi:         [16]clay.Color,
@@ -56,25 +67,25 @@ Theme_Spec :: struct {
 DEFAULT_THEME :: "typo-dark"
 
 THEMES := [?]Theme_Spec {
-	// GitHub Dark, softened: near-black blue-greys for surfaces, and muted,
-	// almost pastel reds and blues for syntax
+	// Near-black neutral greys for surfaces and text, with muted, almost pastel
+	// reds and blues for syntax
 	{
 		key = "typo-dark", name = "Typo Dark", family = "Typo", dark = true,
-		bg = 0x0d1117, panel = 0x11151c, border = 0x262c36, hover = 0x1e242e, selected = 0x1e2d44,
-		text = 0xc9d1d9, text_dim = 0x7d8590, text_faint = 0x545c67, text_bright = 0xe6edf3,
-		accent = 0x79a8e8, error = 0xe88a88, selection = 0x233755,
-		current_line = 0x141921, caret = 0xc9d1d9,
+		bg = 0x0a0a0a, panel = 0x111111, border = 0x262626, hover = 0x1c1c1c, selected = 0x262626,
+		text = 0xd4d4d4, text_dim = 0x868686, text_faint = 0x5a5a5a, text_bright = 0xededed,
+		accent = 0x79a8e8, error = 0xe88a88, selection = 0x2e2e2e,
+		current_line = 0x131313, caret = 0xd4d4d4,
 		syntax = {
-			.None             = 0xc9d1d9, .Comment   = 0x7d8590, .Keyword     = 0xe88a88,
+			.None             = 0xd4d4d4, .Comment   = 0x7a7a7a, .Keyword     = 0xe88a88,
 			.String           = 0xa4c6ec, .Escape    = 0x79a8e8, .Number      = 0x7fb1e6,
 			.Constant         = 0x7fb1e6, .Type      = 0xe4a6a0, .Function    = 0xc4b0ec,
-			.Variable_Builtin = 0xe88a88, .Parameter = 0xd6dce4, .Property    = 0x92bae6,
-			.Namespace        = 0xe4a6a0, .Operator  = 0xd69694, .Punctuation = 0x8b949e,
-			.Attribute        = 0x92bae6, .Label     = 0xc9d1d9,
+			.Variable_Builtin = 0xe88a88, .Parameter = 0xdcdcdc, .Property    = 0x92bae6,
+			.Namespace        = 0xe4a6a0, .Operator  = 0xd69694, .Punctuation = 0x8c8c8c,
+			.Attribute        = 0x92bae6, .Label     = 0xd4d4d4,
 		},
 		ansi = {
-			0x484f58, 0xe88a88, 0x7ec48e, 0xdebe78, 0x7fb1e6, 0xc4b0ec, 0x78c8d0, 0xb1bac4,
-			0x6e7681, 0xf4a8a2, 0x96d8a2, 0xecce8c, 0xa4c6ec, 0xd6c4f4, 0x94d8de, 0xe6edf3,
+			0x4a4a4a, 0xe88a88, 0x7ec48e, 0xdebe78, 0x7fb1e6, 0xc4b0ec, 0x78c8d0, 0xb4b4b4,
+			0x707070, 0xf4a8a2, 0x96d8a2, 0xecce8c, 0xa4c6ec, 0xd6c4f4, 0x94d8de, 0xededed,
 		},
 	},
 	// GitHub Light with the same roles; syntax colors deeper but still muted
@@ -548,12 +559,24 @@ theme_from_spec :: proc "contextless" (s: Theme_Spec) -> (t: Theme) {
 	t.md_link = t.accent
 	t.md_marker = t.text_faint
 	t.md_rule = mix(t.bg, t.text, 0.22)
+
+	// Git: green, yellow, red, blue and magenta from the terminal's colors
+	green, red := t.ansi[2], t.ansi[1]
+	t.git_added = green
+	t.git_modified = t.ansi[3]
+	t.git_deleted = red
+	t.git_renamed = t.ansi[4]
+	t.git_conflict = t.ansi[5]
+	t.diff_added = mix(t.bg, green, s.dark ? 0.14 : 0.15)
+	t.diff_removed = mix(t.bg, red, s.dark ? 0.14 : 0.13)
+	t.diff_added_word = mix(t.bg, green, 0.32)
+	t.diff_removed_word = mix(t.bg, red, s.dark ? 0.32 : 0.28)
+	t.diff_filler = mix(t.bg, t.text, s.dark ? 0.035 : 0.045)
 	return
 }
 
 
 // a + (b - a) * f, opaque
-@(private = "file")
 mix :: proc "contextless" (a, b: clay.Color, f: f32) -> clay.Color {
 	return {a.r + (b.r - a.r) * f, a.g + (b.g - a.g) * f, a.b + (b.b - a.b) * f, 255}
 }

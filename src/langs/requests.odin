@@ -6,6 +6,7 @@ package langs
 // client's thread converts them to and from the server's positions
 
 import "../lsp"
+import "../uitime"
 
 
 // A request waiting for its response
@@ -66,7 +67,7 @@ track_request :: proc(d: ^Doc, c: ^Client, feature: lsp.Feature, id, offset: int
 
 // Drops the requests about a document (it is closing), cancelling them
 requests_forget :: proc(d: ^Doc) {
-	timed()
+	uitime.timed(&ui_share)
 	for i := len(state.requests) - 1; i >= 0; i -= 1 {
 		r := state.requests[i]
 		if r.doc != d do continue

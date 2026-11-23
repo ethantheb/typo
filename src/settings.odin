@@ -1,12 +1,9 @@
 package editor
 
-import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:strings"
-import "core:sync"
-import "core:thread"
 import "core:time"
 
 import "toml"
@@ -14,16 +11,36 @@ import sdl "../vendor/sdl3"
 import "gfx"
 import "langs"
 
-// User settings, stored as TOML in the per-user config directory
-// (%APPDATA%\typo\settings.toml on Windows, or TYPO_SETTINGS if set). The file
-// is created with defaults on first run, rewritten whenever the settings window
-// changes something, and reloaded when edited by hand.
+// Settings, in two layers of TOML: the user's settings.toml in the per-user
+// config directory (%APPDATA%\typo\settings.toml on Windows, or TYPO_SETTINGS
+// if set), and over it the open project's .typo/settings.toml, where a value
+// set wins for that project (project.odin). The values in effect, read through
+// g.settings, are worked out from the two (settings_resolve). Keybindings and
+// language servers' tables are the user's only, as are settings marked
+// user_only. settings.toml is created with defaults on first run, rewritten
+// whenever the settings window changes it, and read again when edited by hand;
+// after startup both files are read and written on the config thread
+// (config_io.odin).
 //
 // Each setting is described once in SETTINGS; loading, saving, resetting and
 // the settings window all work from that table
 
 
 Settings :: struct {
+	using values:      Setting_Values, // in effect: the project's over the user's
+	user:              Setting_Values, // settings.toml's
+	project:           Setting_Layer,  // the open project's .typo/settings.toml
+	bindings:          Bindings,
+	terminal_commands: bit_set[Command], // work while a terminal has focus
+	servers:           [dynamic]langs.Server_Override, // [lsp.<name>] tables
+
+	path:              string, // settings.toml
+	error:             string, // problem with settings.toml as last read, or ""
+	project_error:     string, // likewise for the project's
+}
+
+// A value for each setting in SETTINGS (strings owned)
+Setting_Values :: struct {
 	restore_session:      bool,
 	ask_above_mb:         int, // a larger file is asked about before it is read; 0 = never
 	collapsed_sections:   string, // settings window sections shown collapsed: keys, ", "-separated
@@ -39,6 +56,7 @@ Settings :: struct {
 	text_antialiasing:    string, // "auto", "subpixel" or "grayscale"
 	terminal_shell:       string, // "" = platform default
 	bundled_conpty:       bool,   // Windows only
+	terminal_backend:     string, // new terminals: "local" or "herdr" (herdr-core)
 	renderer:             string, // SDL render backend; applies on restart
 	show_fps:             bool,
 	markdown_view:        string, // "rendered" or "text"
@@ -52,27 +70,24 @@ Settings :: struct {
 	lsp_fetch_timeout:    int,    // ms the server has before words show; 0 = no limit
 	lsp_enabled:          bool,
 	lsp_hover_delay:      int, // ms; 0 = no hover on the pointer
-	bindings:             Bindings,
-	servers:              [dynamic]langs.Server_Override, // [lsp.<name>] tables
+	recent_files:         int, // unpinned files under RECENT in the sidebar
+}
 
-	path:                 string, // settings.toml
-	error:                string, // problem with the file as last loaded, or ""
+// The values a project's settings file sets
+Setting_Layer :: struct {
+	values: Setting_Values, // those in `set`
+	set:    bit_set[Setting],
+}
 
-	// The watcher runs on SDL's timer thread and the saver on its own; these
-	// are guarded by watch_mutex
-	watcher:              sdl.TimerID,
-	watch_mutex:          sync.Mutex,
-	disk_mtime:           time.Time, // as last read, written or seen by the watcher
-	disk_changed:         bool,
-	saver:                ^thread.Thread, // started by the first settings_save_later
-	save_cond:            sync.Cond,
-	save_text:            string, // owned; waiting to be written
-	saving:               bool,   // a write is waiting or under way: the watcher looks away
-	closing:              bool,
+// Which layer the settings window shows and changes
+Settings_Scope :: enum {
+	User,
+	Project,
 }
 
 Setting :: enum {
 	Restore_Session,
+	Recent_Files,
 	Ask_Above_Mb,
 	Collapsed_Sections,
 	Theme,
@@ -86,6 +101,7 @@ Setting :: enum {
 	Line_Height,
 	Letter_Spacing,
 	Terminal_Shell,
+	Terminal_Backend,
 	Bundled_Conpty,
 	Renderer,
 	Show_Fps,
@@ -103,7 +119,7 @@ Setting :: enum {
 }
 
 // Sections of settings.toml and the settings window, in order
-Section :: enum {
+Section :: enum u8 {
 	General,
 	Appearance,
 	Font,
@@ -127,23 +143,27 @@ SECTION_KEYS := [Section]string {
 	.Advanced         = "advanced",
 }
 
+// The small fields go last, together, which keeps SETTINGS under the size LLVM
+// warns about
 Setting_Info :: struct {
-	section:     Section,
 	key:         string, // within the section in settings.toml
 	name:        string, // in the settings window; "" = only in settings.toml
 	description: string,
 	keywords:    string, // extra search terms
 	default:     union {bool, int, f64, string},
 	choices:     []string, // allowed values of a string setting; nil = any text
-	picker:      bool,     // a string setting chosen from a list (see settings_ui.odin)
 	min, max:    f64,      // range of a number setting
 	step:        f64,      // of a number setting in the settings window; 0 = 1
+	section:     Section,
+	picker:      bool, // a string setting chosen from a list (see settings_ui.odin)
+	user_only:   bool, // not set per project: it applies before or across projects
 }
 
-RENDERERS      := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
-MARKDOWN_VIEWS := [?]string{"rendered", "text"}
-WORDS_MODES    := [?]string{"fallback", "enabled", "disabled"}
-ANTIALIASING   := [?]string{"auto", "subpixel", "grayscale"}
+RENDERERS         := [?]string{"auto", "direct3d11", "direct3d12", "vulkan", "gpu", "opengl"}
+MARKDOWN_VIEWS    := [?]string{"rendered", "text"}
+WORDS_MODES       := [?]string{"fallback", "enabled", "disabled"}
+ANTIALIASING      := [?]string{"auto", "subpixel", "grayscale"}
+TERMINAL_BACKENDS := [?]string{"local", "herdr"}
 
 SETTINGS := [Setting]Setting_Info {
 	.Theme = {
@@ -171,11 +191,23 @@ SETTINGS := [Setting]Setting_Info {
 	.Restore_Session = {
 		section     = .General,
 		key         = "restore_session",
-		name        = "Restore last session",
-		description = "Started without a folder or file, reopen the last folder with its " +
-		              "files and terminals where they were.",
-		keywords    = "startup reopen workspace panes",
+		name        = "Restore projects",
+		description = "Open a project as it was left, with its files and terminals where " +
+		              "they were. Started without a folder or file, reopen the last project.",
+		keywords    = "startup reopen workspace panes session project",
 		default     = true,
+		user_only   = true,
+	},
+	.Recent_Files = {
+		section     = .General,
+		key         = "recent_files",
+		name        = "Recent files",
+		description = "How many recently used files the sidebar lists under RECENT, after " +
+		              "the pinned ones. 0 lists only pinned files.",
+		keywords    = "sidebar recent history pinned files",
+		default     = int(5),
+		min         = 0,
+		max         = 20,
 	},
 	.Ask_Above_Mb = {
 		section     = .General,
@@ -194,6 +226,7 @@ SETTINGS := [Setting]Setting_Info {
 		key         = "collapsed_sections",
 		description = "Sections the settings window shows collapsed, e.g. \"keybindings, lsp\".",
 		default     = "",
+		user_only   = true,
 	},
 	.Smooth_Scroll = {
 		section     = .Appearance,
@@ -291,6 +324,18 @@ SETTINGS := [Setting]Setting_Info {
 		keywords    = "pwsh powershell cmd bash command line",
 		default     = "",
 	},
+	.Terminal_Backend = {
+		section     = .Terminal,
+		key         = "backend",
+		name        = "Keep terminals running",
+		description = "Where new terminals run: \"local\" ends a shell with typo; \"herdr\" " +
+		              "runs it in herdr-core, so it keeps running after typo quits and " +
+		              "shows again, with its history, when the folder is reopened. " +
+		              "Terminals already open keep theirs.",
+		keywords    = "herdr persistent background session detach",
+		default     = "local",
+		choices     = TERMINAL_BACKENDS[:],
+	},
 	.Bundled_Conpty = {
 		section     = .Terminal,
 		key         = "bundled_conpty",
@@ -300,6 +345,7 @@ SETTINGS := [Setting]Setting_Info {
 		              "saved copy. Applies on restart.",
 		keywords    = "conpty openconsole windows terminal",
 		default     = true,
+		user_only   = true,
 	},
 	.Renderer = {
 		section     = .Advanced,
@@ -307,6 +353,7 @@ SETTINGS := [Setting]Setting_Info {
 		description = "Graphics backend; \"auto\" lets SDL choose. Applies on restart.",
 		default     = "auto",
 		choices     = RENDERERS[:],
+		user_only   = true,
 	},
 	.Show_Fps = {
 		section     = .Advanced,
@@ -439,8 +486,6 @@ SETTINGS := [Setting]Setting_Info {
 	},
 }
 
-SETTINGS_POLL_MS :: 500
-
 Setting_Value :: union {
 	^bool,
 	^int,
@@ -449,9 +494,10 @@ Setting_Value :: union {
 }
 
 
-setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
+setting_value :: proc(s: ^Setting_Values, x: Setting) -> Setting_Value {
 	switch x {
 	case .Restore_Session:      return &s.restore_session
+	case .Recent_Files:         return &s.recent_files
 	case .Ask_Above_Mb:         return &s.ask_above_mb
 	case .Collapsed_Sections:   return &s.collapsed_sections
 	case .Theme:                return &s.theme
@@ -465,6 +511,7 @@ setting_value :: proc(s: ^Settings, x: Setting) -> Setting_Value {
 	case .Text_Contrast:        return &s.text_contrast
 	case .Text_Antialiasing:    return &s.text_antialiasing
 	case .Terminal_Shell:       return &s.terminal_shell
+	case .Terminal_Backend:     return &s.terminal_backend
 	case .Bundled_Conpty:       return &s.bundled_conpty
 	case .Renderer:             return &s.renderer
 	case .Show_Fps:             return &s.show_fps
@@ -499,7 +546,7 @@ set_string :: proc(dst: ^string, value: string) {
 }
 
 
-setting_reset :: proc(s: ^Settings, x: Setting) {
+setting_reset :: proc(s: ^Setting_Values, x: Setting) {
 	switch v in setting_value(s, x) {
 	case ^bool:   v^ = SETTINGS[x].default.(bool)
 	case ^int:    v^ = SETTINGS[x].default.(int)
@@ -509,15 +556,57 @@ setting_reset :: proc(s: ^Settings, x: Setting) {
 }
 
 
+// Copies one setting's value from `src` to `dst`
+setting_copy :: proc(dst, src: ^Setting_Values, x: Setting) {
+	switch v in setting_value(dst, x) {
+	case ^bool:   v^ = setting_value(src, x).(^bool)^
+	case ^int:    v^ = setting_value(src, x).(^int)^
+	case ^f64:    v^ = setting_value(src, x).(^f64)^
+	case ^string: set_string(v, setting_value(src, x).(^string)^)
+	}
+}
+
+
+setting_values_destroy :: proc(s: ^Setting_Values) {
+	for x in Setting {
+		v, is_string := setting_value(s, x).(^string)
+		if is_string do delete(v^)
+	}
+	s^ = {}
+}
+
+
+// Puts the user's settings back to their defaults: every value, the
+// keybindings and the servers' tables
 settings_reset_all :: proc(s: ^Settings) {
-	for x in Setting do setting_reset(s, x)
+	for x in Setting do setting_reset(&s.user, x)
 	for cmd in Command do s.bindings[cmd] = default_bindings(cmd)
+	s.terminal_commands = DEFAULT_TERMINAL_COMMANDS
 	langs.server_overrides_clear(&s.servers)
+	settings_resolve(s)
+}
+
+
+// Drops every value the project sets: the user's apply again
+settings_clear_project :: proc(s: ^Settings) {
+	setting_values_destroy(&s.project.values)
+	s.project.set = {}
+	settings_resolve(s)
+}
+
+
+// Works out the values in effect: the project's where it sets one, else the
+// user's
+settings_resolve :: proc(s: ^Settings) {
+	for x in Setting {
+		from := x in s.project.set ? &s.project.values : &s.user
+		setting_copy(&s.values, from, x)
+	}
 }
 
 
 // Steps a choice, bool or number setting by `dir` (-1 or +1), clamped
-setting_step :: proc(s: ^Settings, x: Setting, dir: int) {
+setting_step :: proc(s: ^Setting_Values, x: Setting, dir: int) {
 	info := SETTINGS[x]
 	step := info.step != 0 ? info.step : 1
 
@@ -546,7 +635,8 @@ setting_step :: proc(s: ^Settings, x: Setting, dir: int) {
 
 // --- Load / save -------------------------------------------------------------------
 
-// Called once at startup: works out the path, then loads (or creates) the file
+// Called once at startup, before the window shows: works out the path, then
+// reads (or creates) the file at once, and has the config thread watch it
 settings_init :: proc(s: ^Settings) {
 	settings_reset_all(s)
 
@@ -567,75 +657,135 @@ settings_init :: proc(s: ^Settings) {
 		settings_save(s)
 	}
 
-	// Watch it for changes made by hand
-	sync.guard(&s.watch_mutex)
-	s.watcher = sdl.AddTimer(SETTINGS_POLL_MS, watch_callback, s)
+	mtime, _ := os.last_write_time_by_name(s.path)
+	config_watch(.User_Settings, s.path, mtime)
 }
 
 
-// Stops the watcher, and writes what is waiting to be saved
 settings_destroy :: proc(s: ^Settings) {
-	if s.watcher != 0 {
-		sync.guard(&s.watch_mutex)
-		_ = sdl.RemoveTimer(s.watcher)
-		s.watcher = 0
-	}
-
-	// The saver writes what is waiting, then exits
-	if s.saver != nil {
-		if sync.guard(&s.watch_mutex) {
-			s.closing = true
-			sync.cond_signal(&s.save_cond)
-		}
-		thread.destroy(s.saver)
-	}
-	delete(s.save_text)
-
-	for x in Setting {
-		v, is_string := setting_value(s, x).(^string)
-		if is_string do delete(v^)
-	}
+	setting_values_destroy(&s.values)
+	setting_values_destroy(&s.user)
+	setting_values_destroy(&s.project.values)
 	for &o in s.servers do langs.server_override_destroy(&o)
 	delete(s.servers)
 	delete(s.path)
 	delete(s.error)
+	delete(s.project_error)
 	s^ = {}
 }
 
 
-// Reads the file. On a syntax error the current settings are kept; invalid
-// values fall back to their defaults. Either way the problem is shown in the
-// settings window
+// Reads settings.toml at once (at startup, and in tests). On a syntax error
+// the current settings are kept; invalid values fall back to their defaults.
+// Either way the problem is shown in the settings window
 settings_load :: proc(s: ^Settings) {
-	data, read_err := os.read_entire_file(s.path, context.temp_allocator)
-	mtime, _ := os.last_write_time_by_name(s.path)
-	if sync.guard(&s.watch_mutex) {
-		s.disk_mtime = mtime
-	}
-	if read_err != nil {
-		set_string(&s.error, fmt.tprintf("could not read %s", s.path))
+	loaded := settings_read_file(s.path, .User)
+	settings_take_user(s, &loaded)
+}
+
+
+// What a settings file says, owned: read on the config thread, or at once
+Loaded_Settings :: struct {
+	read:              bool, // read and parsed; else `problems` says why, and nothing is set
+	missing:           bool, // there is no such file (not read)
+	values:            Setting_Values,
+	set:               bit_set[Setting], // the values it sets: all, for the user's
+	bindings:          Bindings,                       // the user's
+	terminal_commands: bit_set[Command],               // the user's
+	servers:           [dynamic]langs.Server_Override, // the user's
+	pinned:            [dynamic]string,                // a project's, as written
+	problems:          string,
+}
+
+
+// Reads and parses a settings file of either layer (on any thread). The
+// user's gives every value, the defaults where it leaves one out or has an
+// invalid one; a project's only what it sets
+settings_read_file :: proc(path: string, scope: Settings_Scope) -> (l: Loaded_Settings) {
+	if !os.exists(path) {
+		l.missing = true
 		return
 	}
 
-	doc, err := toml.parse(string(data), context.temp_allocator)
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		l.problems = fmt.aprintf("could not read %s", path)
+		return
+	}
+	return settings_parse(string(data), scope)
+}
+
+
+// Parses a settings file's text (see settings_read_file)
+settings_parse :: proc(text: string, scope: Settings_Scope) -> (l: Loaded_Settings) {
+	name := scope == .User ? "settings.toml" : ".typo/settings.toml"
+	doc, err := toml.parse(text, context.temp_allocator)
 	defer toml.destroy(doc, context.temp_allocator)
 	if err.line != 0 {
-		set_string(&s.error, fmt.tprintf("settings.toml line %d: %s", err.line, err.msg))
+		l.problems = fmt.aprintf("%s line %d: %s", name, err.line, err.msg)
 		return
 	}
 
+	l.read = true
 	problems := make([dynamic]string, context.temp_allocator)
-	settings_reset_all(s)
 
-	// The settings
+	// The settings: the user's from their defaults
+	if scope == .User {
+		for x in Setting do setting_reset(&l.values, x)
+		l.set = ~bit_set[Setting]{}
+	}
 	for x in Setting {
 		v, found := toml.get(doc.root, setting_path(x))
-		if found && !set_from_toml(s, x, v) {
-			append(&problems, setting_problem(s, x))
+		if !found do continue
+
+		switch {
+		case scope == .Project && SETTINGS[x].user_only:
+			problem := fmt.tprintf("%s is set in your own settings.toml", setting_path(x))
+			append(&problems, problem)
+		case !set_from_toml(&l.values, x, v):
+			append(&problems, setting_problem(&l.values, x))
+		case:
+			l.set += {x}
 		}
 	}
 
-	// The keybindings: one chord, or a list of them
+	switch scope {
+	case .User:
+		parse_bindings(&l.bindings, doc, &problems)
+		parse_terminal_commands(&l.terminal_commands, doc, &problems)
+		langs.load_server_overrides(&l.servers, doc, &problems)
+
+	case .Project:
+		if _, found := toml.get(doc.root, "keybindings"); found {
+			append(&problems, "keybindings are set in your own settings.toml")
+		}
+		if _, found := toml.get(doc.root, TERMINAL_COMMANDS_KEY); found {
+			append(&problems, TERMINAL_COMMANDS_KEY + " is set in your own settings.toml")
+		}
+		parse_pinned(&l.pinned, doc, &problems)
+	}
+
+	l.problems = strings.join(problems[:], "; ")
+	return
+}
+
+
+loaded_settings_destroy :: proc(l: ^Loaded_Settings) {
+	setting_values_destroy(&l.values)
+	for &o in l.servers do langs.server_override_destroy(&o)
+	delete(l.servers)
+	for path in l.pinned do delete(path)
+	delete(l.pinned)
+	delete(l.problems)
+	l^ = {}
+}
+
+
+// The keybindings: one chord, or a list of them, from the defaults
+@(private = "file")
+parse_bindings :: proc(b: ^Bindings, doc: ^toml.Document, problems: ^[dynamic]string) {
+	for cmd in Command do b[cmd] = default_bindings(cmd)
+
 	for info, cmd in COMMANDS {
 		path := strings.concatenate({"keybindings.", info.key}, context.temp_allocator)
 		v, found := toml.get(doc.root, path)
@@ -652,28 +802,127 @@ settings_load :: proc(s: ^Settings) {
 			}
 		}
 
-		s.bindings[cmd] = {}
+		b[cmd] = {}
 		n := 0
 		for text in texts {
 			chord, ok := parse_chord(text)
 			if !ok {
-				append(&problems, fmt.tprintf("keybindings.%s: unknown key %q", info.key, text))
+				append(problems, fmt.tprintf("keybindings.%s: unknown key %q", info.key, text))
 			} else if n < MAX_CHORDS {
-				s.bindings[cmd][n] = chord
+				b[cmd][n] = chord
 				n += 1
 			}
 		}
 	}
+}
 
-	// The language servers' tables
-	langs.load_server_overrides(&s.servers, doc, &problems)
 
-	set_string(&s.error, strings.join(problems[:], "; ", context.temp_allocator))
+// Where settings.toml lists the commands that work while a terminal has focus
+TERMINAL_COMMANDS_SECTION :: "terminal"
+TERMINAL_COMMANDS_NAME    :: "commands"
+TERMINAL_COMMANDS_KEY     :: TERMINAL_COMMANDS_SECTION + "." + TERMINAL_COMMANDS_NAME
+
+
+// The commands that work while a terminal has focus: terminal.commands, a list
+// of command names, else the defaults
+@(private = "file")
+parse_terminal_commands :: proc(
+	set: ^bit_set[Command],
+	doc: ^toml.Document,
+	problems: ^[dynamic]string,
+) {
+	set^ = DEFAULT_TERMINAL_COMMANDS
+	v, found := toml.get(doc.root, TERMINAL_COMMANDS_KEY)
+	if !found do return
+
+	list, is_list := v.([]toml.Value)
+	if !is_list {
+		append(problems, TERMINAL_COMMANDS_KEY + " must be a list of command names")
+		return
+	}
+
+	set^ = {}
+	for item in list {
+		name, _ := item.(string)
+		cmd, known := command_from_key(name)
+		switch {
+		case !known:
+			append(problems, fmt.tprintf("%s: unknown command %q", TERMINAL_COMMANDS_KEY, name))
+		case cmd in EDITOR_COMMANDS:
+			problem := fmt.tprintf("%s: %s only acts in editors", TERMINAL_COMMANDS_KEY, name)
+			append(problems, problem)
+		case:
+			set^ += {cmd}
+		}
+	}
+}
+
+
+// A project's pinned files: project.pinned, a list of paths
+@(private = "file")
+parse_pinned :: proc(pinned: ^[dynamic]string, doc: ^toml.Document, problems: ^[dynamic]string) {
+	v, found := toml.get(doc.root, PINNED_KEY)
+	if !found do return
+
+	list, is_list := v.([]toml.Value)
+	if !is_list {
+		append(problems, PINNED_KEY + " must be a list of paths")
+		return
+	}
+	for item in list {
+		path, is_string := item.(string)
+		if is_string && path != "" {
+			append(pinned, strings.clone(path))
+		}
+	}
+}
+
+
+// Where a project's settings file keeps its pinned files
+PINNED_SECTION :: "project"
+PINNED_NAME    :: "pinned"
+PINNED_KEY     :: PINNED_SECTION + "." + PINNED_NAME
+
+
+// Puts what settings.toml says in place of the user's settings (taking it). On
+// a problem reading it, the settings stay as they were
+settings_take_user :: proc(s: ^Settings, l: ^Loaded_Settings) {
+	defer loaded_settings_destroy(l)
+
+	set_string(&s.error, l.problems)
+	if !l.read do return
+
+	setting_values_destroy(&s.user)
+	s.user, l.values = l.values, {}
+	s.bindings = l.bindings
+	s.terminal_commands = l.terminal_commands
+	for &o in s.servers do langs.server_override_destroy(&o)
+	delete(s.servers)
+	s.servers, l.servers = l.servers, {}
+	settings_resolve(s)
+}
+
+
+// Puts what a project's settings file says in place of the project's layer
+// (taking it; its pinned files are the project's to take first). A missing
+// file sets nothing; on a problem reading it, the layer stays as it was
+settings_take_project :: proc(s: ^Settings, l: ^Loaded_Settings) {
+	defer loaded_settings_destroy(l)
+
+	set_string(&s.project_error, l.problems)
+	if !l.read && !l.missing {
+		return
+	}
+
+	setting_values_destroy(&s.project.values)
+	s.project.values, l.values = l.values, {}
+	s.project.set = l.set
+	settings_resolve(s)
 }
 
 
 @(private = "file")
-set_from_toml :: proc(s: ^Settings, x: Setting, v: toml.Value) -> bool {
+set_from_toml :: proc(s: ^Setting_Values, x: Setting, v: toml.Value) -> bool {
 	info := SETTINGS[x]
 
 	switch dst in setting_value(s, x) {
@@ -712,7 +961,7 @@ set_from_toml :: proc(s: ^Settings, x: Setting, v: toml.Value) -> bool {
 
 
 @(private = "file")
-setting_problem :: proc(s: ^Settings, x: Setting) -> string {
+setting_problem :: proc(s: ^Setting_Values, x: Setting) -> string {
 	info := SETTINGS[x]
 	path := setting_path(x)
 
@@ -755,76 +1004,41 @@ contains :: proc(list: []string, s: string) -> bool {
 }
 
 
-// Writes all settings, replacing the file atomically, before returning. The
-// file then holds valid settings, so a problem reported by the last load no
-// longer applies
+// Writes the user's settings, replacing the file atomically, before returning
+// (at startup, and in tests). The file then holds valid settings, so a problem
+// reported by the last load no longer applies
 settings_save :: proc(s: ^Settings) {
 	if s.path == "" do return
 
-	mtime, ok := write_settings_file(s.path, settings_text(s))
-	if !ok do return
-
-	if sync.guard(&s.watch_mutex) {
-		s.disk_mtime = mtime
+	if _, ok := write_file_atomic(s.path, settings_text(s)); ok {
+		set_string(&s.error, "")
 	}
-	set_string(&s.error, "")
 }
 
 
-// Like settings_save, but the file is written on the saver thread. A save that
-// is still waiting is replaced
+// Like settings_save, but the file is written on the config thread. A save
+// that is still waiting is replaced
 settings_save_later :: proc(s: ^Settings) {
 	if s.path == "" do return
 
-	text := strings.clone(settings_text(s))
-	if sync.guard(&s.watch_mutex) {
-		delete(s.save_text)
-		s.save_text = text
-		s.saving = true
-		sync.cond_signal(&s.save_cond)
-	}
-	if s.saver == nil {
-		s.saver = thread.create_and_start_with_poly_data(s, saver_proc, context)
-	}
+	config_post(Config_Write{
+		path    = strings.clone(s.path),
+		text    = strings.clone(settings_text(s)),
+		watched = .User_Settings,
+	})
 	set_string(&s.error, "")
 }
 
 
-// The saver thread: writes each text handed over, until closing with nothing
-// left to write
-@(private = "file")
-saver_proc :: proc(s: ^Settings) {
-	for {
-		text: string
-		if sync.guard(&s.watch_mutex) {
-			for s.save_text == "" && !s.closing {
-				sync.cond_wait(&s.save_cond, &s.watch_mutex)
-			}
-			if s.save_text == "" do return
-			text, s.save_text = s.save_text, ""
-		}
-
-		mtime, ok := write_settings_file(s.path, text)
-		delete(text)
-
-		// Our own write isn't a change for the watcher to report
-		if sync.guard(&s.watch_mutex) {
-			if ok do s.disk_mtime = mtime
-			s.saving = s.save_text != ""
-		}
-		free_all(context.temp_allocator)
-	}
-}
-
-
-// Writes a temp file, then moves it into place. Returns the file's new time
-@(private = "file")
-write_settings_file :: proc(path, text: string) -> (mtime: time.Time, ok: bool) {
+// Writes a temp file, then moves it into place (on any thread). Returns the
+// file's new time
+write_file_atomic :: proc(path, text: string) -> (mtime: time.Time, ok: bool) {
 	_ = os.make_directory_all(os.dir(path))
 
 	tmp := strings.concatenate({path, ".tmp"}, context.temp_allocator)
 	write_err := os.write_entire_file(tmp, text)
 	if write_err != nil || os.rename(tmp, path) != nil {
+		_ = os.remove(tmp)
 		sdl.Log("could not write %s", strings.clone_to_cstring(path, context.temp_allocator))
 		return {}, false
 	}
@@ -834,16 +1048,12 @@ write_settings_file :: proc(path, text: string) -> (mtime: time.Time, ok: bool) 
 }
 
 
-// settings.toml's text for the current settings (temp)
+// settings.toml's text for the user's settings (temp)
 @(private = "file")
 settings_text :: proc(s: ^Settings) -> string {
 	sb := strings.builder_make(context.temp_allocator)
 	for key, section in SECTION_KEYS {
-		// Each section's values line up in one column
-		Line :: struct {
-			key, value: string,
-		}
-		lines := make([dynamic]Line, context.temp_allocator)
+		lines := make([dynamic]Toml_Line, context.temp_allocator)
 
 		if section == .Keybindings {
 			for info, cmd in COMMANDS {
@@ -859,29 +1069,20 @@ settings_text :: proc(s: ^Settings) -> string {
 					joined := strings.join(chords[:], ", ", context.temp_allocator)
 					value = fmt.tprintf("[%s]", joined)
 				}
-				append(&lines, Line{info.key, value})
+				append(&lines, Toml_Line{info.key, value})
 			}
 		} else {
 			for info, x in SETTINGS {
 				if info.section != section do continue
-
-				value: string
-				switch v in setting_value(s, x) {
-				case ^bool:   value = fmt.tprintf("%v", v^)
-				case ^int:    value = fmt.tprintf("%d", v^)
-				case ^f64:    value = format_decimal(v^)
-				case ^string: value = toml.quote(v^)
-				}
-				append(&lines, Line{info.key, value})
+				append(&lines, Toml_Line{info.key, toml_value(&s.user, x)})
 			}
 		}
-
-		width := 0
-		for line in lines do width = max(width, len(line.key))
+		if key == TERMINAL_COMMANDS_SECTION {
+			append(&lines, Toml_Line{TERMINAL_COMMANDS_NAME, terminal_commands_toml(s)})
+		}
 
 		if section != min(Section) do strings.write_byte(&sb, '\n')
-		fmt.sbprintf(&sb, "[%s]\n", key)
-		for line in lines do fmt.sbprintf(&sb, "%-*s = %s\n", width, line.key, line.value)
+		write_toml_section(&sb, key, lines[:])
 
 		if section == .Language_Servers do langs.write_server_overrides(&sb, s.servers[:])
 	}
@@ -889,47 +1090,109 @@ settings_text :: proc(s: ^Settings) -> string {
 }
 
 
-// Checks settings.toml on SDL's timer thread and wakes the main loop only when
-// it changed, so an idle editor isn't woken just to look
+// The commands that work while a terminal has focus, as a TOML list (temp)
 @(private = "file")
-watch_callback :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) -> u32 {
-	context = runtime.default_context()
-	defer free_all(context.temp_allocator)
-
-	s := (^Settings)(userdata)
-	sync.guard(&s.watch_mutex)
-	if s.watcher == 0 do return 0 // being destroyed
-	if s.saving do return interval
-
-	mtime, err := os.last_write_time_by_name(s.path)
-	if err == nil && mtime != s.disk_mtime {
-		s.disk_mtime = mtime
-		s.disk_changed = true
-		wake_main_loop(nil)
+terminal_commands_toml :: proc(s: ^Settings) -> string {
+	names := make([dynamic]string, context.temp_allocator)
+	for cmd in s.terminal_commands {
+		append(&names, toml.quote(COMMANDS[cmd].key))
 	}
-	return interval
+	return fmt.tprintf("[%s]", strings.join(names[:], ", ", context.temp_allocator))
 }
 
 
-// Reloads the file if the watcher saw it changed by someone else (our own
-// saves set disk_mtime, so the watcher doesn't report them)
-settings_poll :: proc(s: ^Settings) {
-	changed: bool
-	if sync.guard(&s.watch_mutex) {
-		changed = s.disk_changed && !s.saving
-		s.disk_changed = false
-	}
-	if !changed do return
+// A project's .typo/settings.toml text (temp): the values it sets, then its
+// pinned files (paths as written)
+project_settings_text :: proc(layer: ^Setting_Layer, pinned: []string) -> string {
+	sb := strings.builder_make(context.temp_allocator)
+	for key, section in SECTION_KEYS {
+		lines := make([dynamic]Toml_Line, context.temp_allocator)
+		for info, x in SETTINGS {
+			if info.section == section && x in layer.set {
+				append(&lines, Toml_Line{info.key, toml_value(&layer.values, x)})
+			}
+		}
+		if len(lines) == 0 do continue
 
-	settings_load(s)
+		if strings.builder_len(sb) > 0 do strings.write_byte(&sb, '\n')
+		write_toml_section(&sb, key, lines[:])
+	}
+
+	// The pinned files, one to a line
+	if len(pinned) > 0 {
+		if strings.builder_len(sb) > 0 do strings.write_byte(&sb, '\n')
+
+		fmt.sbprintf(&sb, "[%s]\n%s = [\n", PINNED_SECTION, PINNED_NAME)
+		for path in pinned do fmt.sbprintf(&sb, "\t%s,\n", toml.quote(path))
+		strings.write_string(&sb, "]\n")
+	}
+	return strings.to_string(sb)
+}
+
+
+// A key and its value, as a line of a settings file
+@(private = "file")
+Toml_Line :: struct {
+	key, value: string,
+}
+
+
+// "[section]", then its lines, their values lined up in one column
+@(private = "file")
+write_toml_section :: proc(sb: ^strings.Builder, section: string, lines: []Toml_Line) {
+	width := 0
+	for line in lines do width = max(width, len(line.key))
+
+	fmt.sbprintf(sb, "[%s]\n", section)
+	for line in lines do fmt.sbprintf(sb, "%-*s = %s\n", width, line.key, line.value)
+}
+
+
+// A setting's value as TOML (temp)
+@(private = "file")
+toml_value :: proc(s: ^Setting_Values, x: Setting) -> string {
+	switch v in setting_value(s, x) {
+	case ^bool:   return fmt.tprintf("%v", v^)
+	case ^int:    return fmt.tprintf("%d", v^)
+	case ^f64:    return format_decimal(v^)
+	case ^string: return toml.quote(v^)
+	}
+	return ""
+}
+
+
+// The user's settings changed (a value, the keybindings or the servers'
+// tables): they are worked out again, saved (on the config thread) and pushed
+// into the running editor
+settings_changed :: proc() {
+	settings_resolve(&g.settings)
+	settings_save_later(&g.settings)
 	apply_settings()
 }
 
 
-// Saves the settings (on the saver thread) and pushes them into the running
-// editor
-settings_changed :: proc() {
-	settings_save_later(&g.settings)
+// The project's layer changed: it is saved with the project's pinned files
+// and pushed into the running editor
+project_settings_changed :: proc() {
+	settings_resolve(&g.settings)
+	project_save_settings()
+	apply_settings()
+}
+
+
+// A settings file changed on disk was read again (config_io.odin): its values
+// replace its layer's, and apply
+settings_file_read :: proc(file: Watched_File, l: ^Loaded_Settings) {
+	switch file {
+	case .User_Settings:
+		settings_take_user(&g.settings, l)
+	case .Project_Settings:
+		if l.read || l.missing {
+			project_pins_read(l.pinned[:])
+			g.project.has_file = !l.missing
+		}
+		settings_take_project(&g.settings, l)
+	}
 	apply_settings()
 }
 

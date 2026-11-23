@@ -271,7 +271,7 @@ row_installs :: proc(row: Server_Row) -> langs.Installs {
 needs_label :: proc(id: clay.ElementId, text: string) {
 	if clay.UI(id)({
 		layout = {sizing = {width = clay.SizingFit({max = NEEDS_MAX_WIDTH})}},
-		clip = {horizontal = true},
+		clip = row_clip(),
 	}) {
 		label(text, gfx.theme.text_faint, FONT_SIZE_SMALL)
 	}
@@ -721,7 +721,7 @@ server_page :: proc(width, height: f32) {
 			page_installs(row, list)
 			page_actions(row, list)
 		}
-		list_scrollbar(list, &w.scrollbar_drag)
+		list_scrollbar(list, &w.scrollbar_drag, POPUP_LAYER)
 		page_footer(row)
 	}
 }
@@ -910,7 +910,7 @@ install_line :: proc(row: Server_Row, x: langs.Install, index: int, list: clay.E
 		// The command, cut short if the page is narrow
 		if clay.UI()({
 			layout = {sizing = {width = clay.SizingGrow()}, childGap = 8},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
 			label(x.command, gfx.theme.text_dim, FONT_SIZE_SMALL)
 			if x.builds do label("builds from source", gfx.theme.text_faint, FONT_SIZE_SMALL)

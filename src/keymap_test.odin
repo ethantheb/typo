@@ -2,6 +2,7 @@ package editor
 
 import "core:fmt"
 import "core:os"
+import "core:strings"
 import "core:testing"
 
 // Several bindings per command: adding one, taking a chord from the command
@@ -82,6 +83,51 @@ test_bindings_saved :: proc(t: ^testing.T) {
 	testing.expect_value(t, bindings_label(again.bindings[.Go_Back], " "), "Alt+Left")
 	again.path = ""
 	settings_destroy(&again)
+}
+
+
+// The commands that work in terminals are saved as a list and read back the
+// same; editor commands and unknown names are refused, and a project can't set
+// them
+@(test)
+test_terminal_commands_saved :: proc(t: ^testing.T) {
+	tmp := os.temp_directory(context.temp_allocator) or_else "."
+	path := fmt.tprintf("%s/typo-terminal-commands-test-%d.toml", tmp, os.get_pid())
+	defer os.remove(path)
+
+	s: Settings
+	settings_reset_all(&s)
+	testing.expect_value(t, s.terminal_commands, DEFAULT_TERMINAL_COMMANDS)
+	s.path = path
+	s.terminal_commands = {.Find_File, .Toggle_Sidebar}
+	settings_save(&s)
+	s.path = ""
+	settings_destroy(&s)
+
+	again: Settings
+	settings_reset_all(&again)
+	again.path = path
+	settings_load(&again)
+	testing.expect_value(t, again.error, "")
+	testing.expect_value(t, again.terminal_commands, bit_set[Command]{.Find_File, .Toggle_Sidebar})
+	again.path = ""
+	settings_destroy(&again)
+
+	// Refused names, and the defaults where the list is left out
+	text := "[terminal]\ncommands = [\"find\", \"save\", \"nope\"]\n"
+	l := settings_parse(text, .User)
+	testing.expect_value(t, l.terminal_commands, bit_set[Command]{.Find})
+	testing.expect(t, strings.contains(l.problems, "save only acts in editors"))
+	testing.expect(t, strings.contains(l.problems, "unknown command \"nope\""))
+	loaded_settings_destroy(&l)
+
+	l = settings_parse("[terminal]\n", .User)
+	testing.expect_value(t, l.terminal_commands, DEFAULT_TERMINAL_COMMANDS)
+	loaded_settings_destroy(&l)
+
+	l = settings_parse(text, .Project)
+	testing.expect(t, strings.contains(l.problems, "terminal.commands is set in your own"))
+	loaded_settings_destroy(&l)
 }
 
 

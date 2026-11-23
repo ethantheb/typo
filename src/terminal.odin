@@ -8,12 +8,13 @@ import "core:unicode/utf8"
 
 import clay "../vendor/clay-odin"
 import "term"
+import sdl "../vendor/sdl3"
 import ttf "../vendor/sdl3/ttf"
 import "gfx"
 import "textedit"
 
-// One terminal: a term.Session (libghostty-vt plus a shell on a pty) and the
-// view of it.
+// One terminal: a term.Session (libghostty-vt plus its program, on a pty here
+// or in herdr-core: terminal_persist.odin) and the view of it.
 //
 // Each frame, terminal_frame feeds pending shell output to the terminal and
 // refreshes a per-row cache (text runs and background runs with resolved
@@ -29,6 +30,10 @@ Terminal :: struct {
 	initialized: bool,
 	spawned:     bool,   // a shell has been started at least once
 	command:     string, // owned; run in the shell when it first starts
+	persistent:  bool,   // runs in herdr-core, and outlives typo; kept on restart
+	address:     string, // owned; the herdr-core terminal to show when first shown
+	core_id:     string, // owned; the core that address is on
+	has_focus:   bool,   // as the program was last told
 
 	// Shown in titles, e.g. "PowerShell". A fixed buffer: restarting sets it
 	// while this frame's render commands may still point at it
@@ -41,6 +46,7 @@ Terminal :: struct {
 	cursor:      term.Render_Cursor,
 	colors:      term.Render_Colors,
 	view:        gfx.Rect, // cell grid area from the last layout
+	last_view:   gfx.Rect, // the frame before's, to tell that the pane has settled
 	zoom:        int,      // the text's size: steps from 100% in textedit.ZOOM_LEVELS
 	cell_w:      f32,
 	cell_h:      f32,
@@ -77,29 +83,55 @@ Term_Row :: struct {
 // --- Lifecycle ---------------------------------------------------------------------
 
 // Creates the terminal state; the shell starts on the first frame it is shown,
-// once its size is known
+// once its size is known. It runs in herdr-core if the setting says so
 terminal_init :: proc(t: ^Terminal) -> bool {
 	if t.initialized do return true
 
 	t.initialized = term.session_init(&t.session, 80, 24, wake_main_loop, nil)
+	t.persistent = persist_wanted()
 	terminal_apply_theme(t)
 	return t.initialized
 }
 
 
+// Frees the terminal, ending its program (a persistent one too: closing its
+// pane ends it). terminal_detach before keeps a persistent one running
 terminal_destroy :: proc(t: ^Terminal) {
-	if t.initialized do term.session_destroy(&t.session)
+	if t.initialized {
+		term.session_kill(&t.session)
+		term.session_destroy(&t.session)
+	} else if t.address != "" {
+		persist_kill(t.address, t.core_id) // from the session, never shown
+	}
 	for &row in t.rows do row_destroy(&row)
 	delete(t.rows)
 	delete(t.marks)
 	delete(t.command)
+	delete(t.address)
+	delete(t.core_id)
 	t^ = {}
 }
 
 
+// Lets go of the program without ending it: a persistent terminal goes on in
+// herdr-core (typo quitting); a local shell ends. One from the session never
+// shown forgets its address, so terminal_destroy doesn't end it
+terminal_detach :: proc(t: ^Terminal) {
+	if t.initialized {
+		term.session_detach(&t.session)
+		return
+	}
+
+	delete(t.address)
+	delete(t.core_id)
+	t.address, t.core_id = "", ""
+}
+
+
 // Starts the shell; the first time, running the terminal's command in it if
-// it has one
+// it has one. A program that ended is let go of first
 terminal_start_shell :: proc(t: ^Terminal) {
+	term.session_kill(&t.session)
 	shell := g.settings.terminal_shell != "" ? g.settings.terminal_shell : term.default_shell()
 	t.shell_len = copy(t.shell_name[:], shell_display_name(shell))
 
@@ -111,13 +143,20 @@ terminal_start_shell :: proc(t: ^Terminal) {
 		t.command = ""
 	}
 
-	spawned := term.session_spawn(
-		&t.session,
-		line,
-		g.workspace.root,
-		g.settings.bundled_conpty,
-		ipc_shell_env(),
-	)
+	spawned := false
+	local := !t.persistent
+	if t.persistent {
+		spawned, local = persist_start(t, line)
+	}
+	if local {
+		spawned = term.session_spawn(
+			&t.session,
+			line,
+			g.workspace.root,
+			g.settings.bundled_conpty,
+			ipc_shell_env(),
+		)
+	}
 	if !spawned {
 		notice := "Could not start the shell. Press Enter to try again."
 		term.session_print_notice(&t.session, notice)
@@ -153,6 +192,31 @@ shell_running :: proc(shell, command: string) -> string {
 		// Run by /bin/sh, which then becomes the shell
 		return fmt.tprintf("%s; exec %s", command, shell)
 	}
+}
+
+
+// Pins or unpins a terminal, asking first if a program runs in it (the
+// unsaved-changes flow), as its shell restarts
+terminal_ask_repin :: proc(p: ^Pane, pinned: bool) {
+	resolve_unsaved({}, Repinning{p, pinned})
+}
+
+
+// Restarts a terminal pinned (in herdr-core) or here: its shell ends and a new
+// one starts in its place. One from the session not shown yet ends in
+// herdr-core, and one not started yet starts as asked when shown
+terminal_repin :: proc(p: ^Pane, pinned: bool) {
+	t := p.content.(^Terminal)
+	if t.address != "" {
+		persist_kill(t.address, t.core_id)
+		delete(t.address)
+		delete(t.core_id)
+		t.address, t.core_id = "", ""
+	}
+
+	t.persistent = pinned
+	if t.initialized do terminal_restart(t)
+	pane_show(p)
 }
 
 
@@ -241,9 +305,21 @@ to_color :: proc(c: term.Color_Rgb) -> clay.Color {
 // handles the mouse and refreshes the row cache
 terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interactive: bool) {
 	s := &t.session
-	busy, exited := term.session_pump(s, TERMINAL_PUMP_BUDGET)
-	t.busy = busy
-	if exited do term.session_print_notice(s, "Process exited. Press Enter to restart.")
+	pump := term.session_pump(s, TERMINAL_PUMP_BUDGET)
+	t.busy = pump.busy
+	if pump.ended {
+		term.session_print_notice(s, fmt.tprintf("%s Press Enter to restart.", pump.notice))
+	} else if pump.notice != "" {
+		term.session_print_notice(s, pump.notice)
+	}
+
+	// Programs that asked for focus reports hear when the keys come and go
+	window_focused := sdl.GetWindowFlags(g.window) & {.INPUT_FOCUS} != {}
+	has_focus := focused_terminal() == t && window_focused
+	if has_focus != t.has_focus {
+		t.has_focus = has_focus
+		term.session_focus(s, has_focus)
+	}
 	if !visible do return
 
 	zoom := textedit.zoom_factor(t.zoom)
@@ -266,8 +342,19 @@ terminal_frame :: proc(t: ^Terminal, element: clay.ElementId, visible, interacti
 			term.session_resize(s, cols, rows, u32(t.cell_w * gfx.scale), u32(t.cell_h * gfx.scale))
 		}
 
-		// The shell starts once the real size is known, so it never sees 80x24
-		if !t.spawned do terminal_start_shell(t)
+		// The shell starts once the real size is known, so it never sees 80x24.
+		// A pinned one waits for its pane to settle too (the same grid two
+		// frames running), so herdr-core paints it once, at the size it keeps:
+		// a repaint reflowed to another width splits its long lines
+		settled := t.view == t.last_view
+		t.last_view = t.view
+		if !t.spawned {
+			if settled || !t.persistent {
+				terminal_start_shell(t)
+			} else {
+				wake_main_loop(nil) // another frame, to see it settled
+			}
+		}
 	}
 
 	if interactive do terminal_mouse(t, element)

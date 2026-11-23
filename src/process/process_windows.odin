@@ -1,12 +1,13 @@
 #+build windows
-package lsp
+package process
 
-// A language server process with its stdin, stdout and stderr on pipes. Started
-// without a console window (typo is a GUI app, so a console server would get a
-// window of its own), inheriting only its three pipe ends, inside a job object
-// so it and anything it starts end with typo or with process_kill
+// A process with its stdin, stdout and stderr on pipes. Started without a
+// console window (typo is a GUI app, so a console program would get a window
+// of its own), inheriting only its three pipe ends, inside a job object so it
+// and anything it starts end with typo or with process_kill
 
 import "core:fmt"
+import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import win "core:sys/windows"
@@ -25,6 +26,9 @@ PROC_THREAD_ATTRIBUTE_HANDLE_LIST :: 0x00020002
 
 @(private = "file")
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE :: 0x00002000
+
+@(private = "file")
+CREATE_BREAKAWAY_FROM_JOB :: 0x01000000
 
 @(private = "file")
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS :: 9
@@ -103,7 +107,15 @@ foreign kernel32 {
 // Starts `command` (program and arguments) in `cwd`. The program is looked up
 // on PATH; a .cmd or .bat (how npm installs servers) runs through cmd.exe.
 // Returns a reason on failure
-process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool, reason: string) {
+process_spawn :: proc(
+	p: ^Process,
+	command: []string,
+	cwd: string,
+	options: Spawn_Options = {},
+) -> (
+	ok: bool,
+	reason: string,
+) {
 	p^ = {}
 	if len(command) == 0 do return false, "no command"
 
@@ -112,7 +124,8 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 		return false, fmt.tprintf("%s not found on PATH", command[0])
 	}
 
-	// The pipes: the child's ends are inheritable, ours are not
+	// The pipes: the child's ends are inheritable, ours are not. A discarded
+	// stderr goes to NUL
 	child_in, child_out, child_err: win.HANDLE
 	if !make_pipe(&child_in, &p.stdin, child_reads = true) {
 		return false, "could not create pipes"
@@ -121,7 +134,13 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 		close_handles(child_in, p.stdin)
 		return false, "could not create pipes"
 	}
-	if !make_pipe(&p.stderr, &child_err, child_reads = false) {
+	err_ok: bool
+	if options.discard_stderr {
+		child_err, err_ok = open_null()
+	} else {
+		err_ok = make_pipe(&p.stderr, &child_err, child_reads = false)
+	}
+	if !err_ok {
 		close_handles(child_in, p.stdin, p.stdout, child_out)
 		return false, "could not create pipes"
 	}
@@ -159,17 +178,39 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 		return false, "could not set up the process attributes"
 	}
 
-	// The process, suspended until it is in its job
+	// The process: suspended until it is in its job, or a detached one out of
+	// typo's job when that allows it
 	line := command_line(exe, command[1:])
 	cmd := win.utf8_to_wstring(line, context.temp_allocator)
 	dir := cwd != "" ? win.utf8_to_wstring(cwd, context.temp_allocator) : nil
-	flags := win.DWORD(
-		win.EXTENDED_STARTUPINFO_PRESENT | win.CREATE_NO_WINDOW | win.CREATE_SUSPENDED,
-	)
+	flags := win.DWORD(win.EXTENDED_STARTUPINFO_PRESENT | win.CREATE_NO_WINDOW)
+	if !options.detached do flags |= win.CREATE_SUSPENDED
+	env: rawptr
+	if len(options.env) > 0 {
+		env = environment_block(options.env)
+		flags |= win.CREATE_UNICODE_ENVIRONMENT
+	}
+	tries := []win.DWORD{flags}
+	if options.detached {
+		tries = []win.DWORD{flags | CREATE_BREAKAWAY_FROM_JOB, flags}
+	}
 	pi: win.PROCESS_INFORMATION
-	if !win.CreateProcessW(nil, cmd, nil, nil, true, flags, nil, dir, &si.StartupInfo, &pi) {
+	started := false
+	for try in tries {
+		started = bool(
+			win.CreateProcessW(nil, cmd, nil, nil, true, try, env, dir, &si.StartupInfo, &pi),
+		)
+		if started do break
+	}
+	if !started {
 		close_handles(p.stdin, p.stdout, p.stderr)
 		return false, fmt.tprintf("could not start %s (error %d)", exe, win.GetLastError())
+	}
+
+	if options.detached {
+		win.CloseHandle(pi.hThread)
+		p.handle = pi.hProcess
+		return true, ""
 	}
 
 	// Its job: closing the job's last handle (typo exiting) ends everything in it
@@ -190,6 +231,38 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 	win.CloseHandle(pi.hThread)
 	p.handle = pi.hProcess
 	return true, ""
+}
+
+
+// The inherited environment with `extra` in it, as CreateProcessW takes it:
+// UTF-16 "NAME=value" entries, each ended by a NUL, then one more NUL (temp)
+@(private = "file")
+environment_block :: proc(extra: []string) -> rawptr {
+	inherited, _ := os.environ(context.temp_allocator)
+	entries := merged_env(inherited, extra)
+
+	sb := strings.builder_make(context.temp_allocator)
+	for entry in entries {
+		strings.write_string(&sb, entry)
+		strings.write_byte(&sb, 0)
+	}
+	strings.write_byte(&sb, 0)
+
+	block := win.utf8_to_utf16(strings.to_string(sb), context.temp_allocator)
+	return raw_data(block)
+}
+
+
+// An inheritable handle to NUL, for output that goes nowhere
+@(private = "file")
+open_null :: proc() -> (handle: win.HANDLE, ok: bool) {
+	sa := win.SECURITY_ATTRIBUTES {
+		nLength        = size_of(win.SECURITY_ATTRIBUTES),
+		bInheritHandle = true,
+	}
+	handle = win.CreateFileW(win.L("NUL"), win.GENERIC_WRITE, 0, &sa, win.OPEN_EXISTING, 0, nil)
+	if handle == win.INVALID_HANDLE_VALUE do return nil, false
+	return handle, true
 }
 
 

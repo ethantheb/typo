@@ -1,12 +1,15 @@
 package term
 
-// A terminal session: a libghostty-vt terminal fed by a shell on a pty.
+// A terminal session: a libghostty-vt terminal and a backend, where its
+// program runs. The backend is `Local` (a shell on a pty here) or `Remote` (a
+// herdr-core terminal, which keeps running without typo). Rendering, the
+// grid, selection, search and input encoding don't depend on which; the
+// procs under "Backends" below are the only ones that do.
 //
-// A reader thread blocks on the pty and appends output to `incoming`, then
-// calls `wake` so an idle UI loop runs a frame. The UI thread moves that output
-// into the terminal in session_pump, within a time budget, so a flood of output
-// (cat on a large file) never stalls a frame. Everything except the reader
-// thread runs on the UI thread
+// Output arrives on another thread (the local reader thread, or the herdr
+// client's), which calls `wake` so an idle UI loop runs a frame. The UI thread
+// moves that output into the terminal in session_pump, within a time budget,
+// so a flood of output (cat on a large file) never stalls a frame
 
 import "base:runtime"
 import "core:fmt"
@@ -14,6 +17,8 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+
+import "../herdr"
 
 
 MULTI_CLICK_NS :: 500 * time.Millisecond
@@ -47,17 +52,42 @@ Session :: struct {
 	cell_w:     u32,
 	cell_h:     u32,
 
-	pty:        Pty,
-	running:    bool, // a shell is attached
-	closing:    bool, // set by session_kill for the reader thread (atomic)
-	reader:     ^thread.Thread,
-	mutex:      sync.Mutex,
-	incoming:   [dynamic]u8, // written by the reader thread, guarded by mutex
+	backend:    Backend,
+	running:    bool, // a program is attached and takes input
 	work:       [dynamic]u8, // UI-thread copy being fed to the terminal
 	work_pos:   int,
-	parsed:     u64, // bytes of shell output fed to the terminal so far
+	parsed:     u64, // bytes of program output fed to the terminal so far
 	wake:       Notify_Proc,
 	wake_data:  rawptr,
+}
+
+// Where the program runs; nil before it starts and after it ends
+Backend :: union {
+	Local,
+	Remote,
+}
+
+// A shell on a pty, read by a reader thread
+Local :: struct {
+	pty:      Pty,
+	closing:  bool, // set by local_stop for the reader thread (atomic)
+	reader:   ^thread.Thread,
+	mutex:    sync.Mutex,
+	incoming: [dynamic]u8, // written by the reader thread, guarded by mutex
+}
+
+// A herdr-core terminal, through the client's stream
+Remote :: struct {
+	client: ^herdr.Client,
+	stream: ^herdr.Stream,
+	state:  herdr.Stream_State, // as last seen by the pump
+}
+
+// What session_pump found
+Pump :: struct {
+	busy:   bool,   // output is still waiting
+	notice: string, // a line to show in the terminal (temp), or ""
+	ended:  bool,   // the program ended (once): nothing takes input now
 }
 
 
@@ -77,15 +107,7 @@ session_init :: proc(
 	if terminal_new(nil, &s.vt, s.cols, s.rows) != .Success do return false
 	scrollback: uint = SCROLLBACK_BYTES
 	terminal_set(s.vt, .Scrollback_Max_Bytes, &scrollback)
-
-	// ConPTY keeps its own screen without scrollback, and the two screens must
-	// stay row for row the same, or the shell draws in the wrong place: growing
-	// taller adds blank rows at the bottom instead of pulling scrollback down,
-	// and rewrapping drops trailing spaces (patches/ghostty.patch)
-	when ODIN_OS == .Windows {
-		pull := false
-		terminal_set(s.vt, .Resize_Pull_Scrollback, &pull)
-	}
+	pty_semantics(s)
 
 	terminal_set(s.vt, .Userdata, s)
 	terminal_set(s.vt, .Write_Pty, rawptr(Write_Pty_Fn(on_write_pty)))
@@ -111,8 +133,9 @@ session_init :: proc(
 }
 
 
+// Frees the session. A remote terminal is let go, not ended
 session_destroy :: proc(s: ^Session) {
-	session_kill(s)
+	session_detach(s)
 	if s.vt == nil do return
 
 	for ev in s.gesture_ev do selection_gesture_event_free(ev)
@@ -126,26 +149,30 @@ session_destroy :: proc(s: ^Session) {
 	render_state_free(s.render)
 	terminal_free(s.vt)
 
-	delete(s.incoming)
 	delete(s.work)
 	trace_close()
 	s^ = {}
 }
 
 
-// Starts `command` (a full command line) in `cwd`, with `env` ("NAME=value"
-// each) added to its environment. On Windows, `bundled_conpty` runs it
-// through the bundled ConPTY when possible (see pty_spawn)
+// --- Backends ----------------------------------------------------------------------
+
+// Starts `command` (a full command line) on a pty here, in `cwd`, with `env`
+// ("NAME=value" each) added to its environment. On Windows, `bundled_conpty`
+// runs it through the bundled ConPTY when possible (see pty_spawn)
 session_spawn :: proc(
 	s: ^Session,
 	command, cwd: string,
 	bundled_conpty := true,
 	env: []string = nil,
 ) -> bool {
-	if s.running do return true
+	if s.backend != nil do return true
 
+	pty_semantics(s)
+	s.backend = Local{}
+	l := &s.backend.(Local)
 	spawned := pty_spawn(
-		&s.pty,
+		&l.pty,
 		command,
 		cwd,
 		s.cols,
@@ -155,89 +182,332 @@ session_spawn :: proc(
 		bundled_conpty,
 		env,
 	)
-	if !spawned do return false
+	if !spawned {
+		s.backend = nil
+		return false
+	}
 
 	s.running = true
-	sync.atomic_store(&s.closing, false)
-	s.reader = thread.create_and_start_with_poly_data(s, reader_proc)
+	l.reader = thread.create_and_start_with_poly_data2(s, l, reader_proc)
 	return true
 }
 
 
-// Ends the shell (if running) and waits for its last output
-session_kill :: proc(s: ^Session) {
-	if !s.running do return
+// Starts a new herdr-core terminal (`spec`) through `client`, sized and
+// colored like this session, and shows it
+session_start_remote :: proc(
+	s: ^Session,
+	client: ^herdr.Client,
+	spec: herdr.Spec,
+	display: herdr.Display,
+	history: int,
+) {
+	session_detach(s)
+	pty_semantics(s)
 
-	sync.atomic_store(&s.closing, true)
-	pty_close(&s.pty)
-	thread.join(s.reader)
-	thread.destroy(s.reader)
-	pty_close_output(&s.pty)
-	s.reader = nil
-	s.running = false
+	size := herdr.Size{s.cols, s.rows}
+	stream := herdr.stream_start(client, spec, size, with_cell(s, display), history)
+	s.backend = Remote{client = client, stream = stream, state = .Starting}
+	s.running = true
+}
+
+
+// Shows the herdr-core terminal at `address` (on the core `core_id`, if
+// given), with `history` lines of its scrollback
+session_attach_remote :: proc(
+	s: ^Session,
+	client: ^herdr.Client,
+	address, core_id: string,
+	display: herdr.Display,
+	history: int,
+) {
+	session_detach(s)
+	pty_semantics(s)
+
+	size := herdr.Size{s.cols, s.rows}
+	cell := with_cell(s, display)
+	stream := herdr.stream_attach(client, address, core_id, size, cell, history)
+	s.backend = Remote{client = client, stream = stream, state = .Starting}
+	s.running = true
+}
+
+
+// The size a herdr-core terminal was last attached at (its repaint's), or {}
+session_remote_size :: proc(s: ^Session) -> herdr.Size {
+	r, is_remote := s.backend.(Remote)
+	if !is_remote do return {}
+	return herdr.stream_info(r.stream, r.client).asked
+}
+
+
+// The herdr-core terminal's address, "" for a local one (temp)
+session_remote_address :: proc(s: ^Session) -> string {
+	r, is_remote := s.backend.(Remote)
+	if !is_remote do return ""
+	return herdr.stream_info(r.stream, r.client).address
+}
+
+
+// The process of the program it runs (the shell), on this machine: a local
+// shell's, or a remote terminal's as of its last attach. 0 when none runs or
+// it isn't known yet
+session_pid :: proc(s: ^Session) -> int {
+	switch &b in s.backend {
+	case Local:
+		return pty_pid(&b.pty)
+	case Remote:
+		return herdr.stream_info(b.stream, b.client).pid
+	}
+	return 0
+}
+
+
+// Whether the program runs here, ending with typo, rather than in herdr-core
+session_is_local :: proc(s: ^Session) -> bool {
+	_, local := s.backend.(Local)
+	return local
+}
+
+
+// The screen here must stay row for row the same as the pty's, or the shell
+// draws in the wrong place. On Windows that is ConPTY's, which keeps its own
+// screen without scrollback: growing taller adds blank rows at the bottom
+// instead of pulling scrollback down, and rewrapping drops trailing spaces
+// (patches/ghostty.patch). A herdr-core terminal's live output is its own
+// ConPTY's (the core runs on this machine), so both backends resize this way
+@(private = "file")
+pty_semantics :: proc(s: ^Session) {
+	pull := ODIN_OS != .Windows
+	terminal_set(s.vt, .Resize_Pull_Scrollback, &pull)
+}
+
+
+// What a remote shell is told about its terminal (temp): the variables
+// pty_spawn gives a local shell, and TERM_PROGRAM, which herdr-core would
+// otherwise set to its own (Ghostty's)
+shell_identity :: proc() -> []string {
+	ids := make([dynamic]string, context.temp_allocator)
+	when ODIN_OS != .Windows {
+		append(&ids, "TERM=xterm-256color")
+	}
+	append(&ids, "COLORTERM=truecolor", "TERM_PROGRAM=typo")
+	return ids[:]
 }
 
 
 @(private = "file")
-reader_proc :: proc(s: ^Session) {
+with_cell :: proc(s: ^Session, display: herdr.Display) -> herdr.Display {
+	d := display
+	d.cell = {max(s.cell_w, 1), max(s.cell_h, 1)}
+	return d
+}
+
+
+// Ends the program: a local shell, or a remote terminal (killed and removed
+// from herdr-core). Waits for a local shell's last output
+session_kill :: proc(s: ^Session) {
+	switch &b in s.backend {
+	case Local:
+		local_stop(s, &b)
+	case Remote:
+		herdr.stream_close(b.stream, b.client, kill = true)
+	}
+	s.backend = nil
+	s.running = false
+}
+
+
+// Lets go of the program without ending a remote terminal, which goes on in
+// herdr-core. A local shell can't outlive typo: it ends
+session_detach :: proc(s: ^Session) {
+	switch &b in s.backend {
+	case Local:
+		local_stop(s, &b)
+	case Remote:
+		herdr.stream_close(b.stream, b.client, kill = false)
+	}
+	s.backend = nil
+	s.running = false
+}
+
+
+// Ends the shell and joins the reader thread (keeping what it read)
+@(private = "file")
+local_stop :: proc(s: ^Session, l: ^Local) {
+	sync.atomic_store(&l.closing, true)
+	pty_close(&l.pty)
+	thread.join(l.reader)
+	thread.destroy(l.reader)
+	pty_close_output(&l.pty)
+
+	// What the reader read last, for the terminal
+	append(&s.work, ..l.incoming[:])
+	delete(l.incoming)
+	l^ = {}
+}
+
+
+@(private = "file")
+reader_proc :: proc(s: ^Session, l: ^Local) {
 	buf := make([]u8, READ_CHUNK)
 	defer delete(buf)
 
 	for {
-		n := pty_read(&s.pty, buf)
+		n := pty_read(&l.pty, buf)
 		if n <= 0 do break
 		trace("<", buf[:n])
 
-		sync.lock(&s.mutex)
-		append(&s.incoming, ..buf[:n])
-		pending := len(s.incoming)
-		sync.unlock(&s.mutex)
+		sync.lock(&l.mutex)
+		append(&l.incoming, ..buf[:n])
+		pending := len(l.incoming)
+		sync.unlock(&l.mutex)
 		s.wake(s.wake_data)
 
 		// Back-pressure: let the UI thread catch up before reading more. Not
 		// while closing: the UI thread is waiting for this thread to finish, and
 		// the pty may only close once its output is drained
-		for pending > MAX_PENDING && !sync.atomic_load(&s.closing) {
+		for pending > MAX_PENDING && !sync.atomic_load(&l.closing) {
 			time.sleep(time.Millisecond)
-			sync.lock(&s.mutex)
-			pending = len(s.incoming)
-			sync.unlock(&s.mutex)
+			sync.lock(&l.mutex)
+			pending = len(l.incoming)
+			sync.unlock(&l.mutex)
 		}
 	}
 }
 
 
-// Replies to terminal queries (cursor position, device attributes, ...)
+// Replies to terminal queries (cursor position, device attributes, ...). A
+// remote terminal's go back marked as automatic: herdr-core answers display
+// queries itself, and tells these from typing
 @(private = "file")
 on_write_pty :: proc "c" (t: Terminal, userdata: rawptr, data: [^]u8, len: uint) {
 	s := (^Session)(userdata)
 	context = runtime.default_context()
 	trace("reply", data[:len])
-	if s.running do pty_write(&s.pty, data[:len])
+
+	switch &b in s.backend {
+	case Local:  pty_write(&b.pty, data[:len])
+	case Remote: herdr.stream_write(b.stream, b.client, data[:len], automatic = true)
+	}
 }
 
 
-// Feeds pending shell output to the terminal for up to `budget`. Returns true
-// while output is still waiting, so the caller keeps drawing frames.
-// Returns `exited` once, on the frame the shell's last output was consumed
-session_pump :: proc(s: ^Session, budget: time.Duration) -> (busy, exited: bool) {
-	// The reader thread ends once the console is closed; everything it
-	// read is then in `incoming` and is parsed below without a budget
-	if s.running && pty_exited(&s.pty) {
-		session_kill(s)
-		exited = true
+// Sends raw bytes to the program
+session_write :: proc(s: ^Session, data: []u8) {
+	if !s.running || len(data) == 0 {
+		return
 	}
 
+	trace("input", data)
+	switch &b in s.backend {
+	case Local:  pty_write(&b.pty, data)
+	case Remote: herdr.stream_write(b.stream, b.client, data)
+	}
+}
+
+
+// Tells the program whether its terminal has the keys (programs that asked
+// for focus reports get them; herdr-core relays them for remote terminals)
+session_focus :: proc(s: ^Session, focused: bool) {
+	if r, is_remote := s.backend.(Remote); is_remote {
+		herdr.stream_focus(r.stream, r.client, focused)
+	}
+}
+
+
+// Moves output the backend received to `s.work`. `reset`: it is a repaint of
+// a remote terminal, so the terminal must be reset first
+@(private = "file")
+take_output :: proc(s: ^Session) -> (reset: bool) {
+	switch &b in s.backend {
+	case Local:
+		sync.lock(&b.mutex)
+		s.work, b.incoming = b.incoming, s.work
+		sync.unlock(&b.mutex)
+	case Remote:
+		reset = herdr.stream_take(b.stream, b.client, &s.work)
+	}
+	return
+}
+
+
+// Whether the program ended since the last pump, and what to say about it
+@(private = "file")
+check_backend :: proc(s: ^Session) -> (p: Pump) {
+	switch &b in s.backend {
+	case Local:
+		// The reader thread ends once the console is closed; everything it
+		// read is then in s.work and is parsed without a budget
+		if pty_exited(&b.pty) {
+			local_stop(s, &b)
+			s.backend = nil
+			s.running = false
+			return {notice = "Process exited.", ended = true}
+		}
+
+	case Remote:
+		info := herdr.stream_info(b.stream, b.client)
+		if info.state == b.state do return
+		b.state = info.state
+
+		p = remote_notice(info)
+		if p.ended {
+			// Kept until closed or restarted: an ended terminal still has its address
+			s.running = false
+		}
+	}
+	return
+}
+
+
+// What to say when a remote terminal changes state
+@(private = "file")
+remote_notice :: proc(info: herdr.Stream_Info) -> Pump {
+	#partial switch info.state {
+	case .Lost:
+		return {notice = "Lost herdr-core; showing this terminal again once it is back…"}
+	case .Gone:
+		return {notice = "This terminal is no longer in herdr-core.", ended = true}
+	case .Failed:
+		return {notice = fmt.tprintf("%s.", info.failure), ended = true}
+	case .Ended:
+		e := info.ended
+		switch {
+		case e.has_code && e.code != 0:
+			return {notice = fmt.tprintf("Process exited with code %d.", e.code), ended = true}
+		case e.reason == "killed":
+			return {notice = "Process was ended.", ended = true}
+		}
+		return {notice = "Process exited.", ended = true}
+	}
+	return {}
+}
+
+
+// Feeds pending output to the terminal for up to `budget`. `busy` while output
+// is still waiting, so the caller keeps drawing frames. A notice comes with
+// changes in the program's state, and `ended` once it ended (after its last
+// output was consumed)
+session_pump :: proc(s: ^Session, budget: time.Duration) -> (p: Pump) {
+	p = check_backend(s)
+
 	start := time.tick_now()
+	unlimited := p.ended
 	for {
-		// Take what the reader has gathered
+		// Take what the backend has gathered
 		if s.work_pos >= len(s.work) {
 			clear(&s.work)
 			s.work_pos = 0
-			sync.lock(&s.mutex)
-			s.work, s.incoming = s.incoming, s.work
-			sync.unlock(&s.mutex)
-			if len(s.work) == 0 do return false, exited
+			if take_output(s) {
+				// A repaint follows: parsed in one go, so a half-drawn screen
+				// never shows
+				terminal_reset(s.vt)
+				unlimited = true
+			}
+			if len(s.work) == 0 {
+				p.busy = false
+				return
+			}
 		}
 
 		// Feed the terminal a chunk of it
@@ -246,8 +516,9 @@ session_pump :: proc(s: ^Session, budget: time.Duration) -> (busy, exited: bool)
 		s.parsed += u64(end - s.work_pos)
 		s.work_pos = end
 
-		if !exited && time.tick_since(start) > budget {
-			return true, false
+		if !unlimited && time.tick_since(start) > budget {
+			p.busy = true
+			return
 		}
 	}
 }
@@ -255,7 +526,7 @@ session_pump :: proc(s: ^Session, budget: time.Duration) -> (busy, exited: bool)
 
 // --- Input -------------------------------------------------------------------------
 
-// Sends typed input to the shell. Like most terminals, this snaps the view
+// Sends typed input to the program. Like most terminals, this snaps the view
 // back to the bottom and drops the selection
 session_input :: proc(s: ^Session, data: []u8) {
 	if !s.running || len(data) == 0 {
@@ -265,17 +536,6 @@ session_input :: proc(s: ^Session, data: []u8) {
 	terminal_scroll_viewport(s.vt, {tag = .Bottom})
 	session_clear_selection(s)
 	session_write(s, data)
-}
-
-
-// Sends raw bytes to the shell
-session_write :: proc(s: ^Session, data: []u8) {
-	if !s.running || len(data) == 0 {
-		return
-	}
-
-	trace("input", data)
-	pty_write(&s.pty, data)
 }
 
 
@@ -398,7 +658,11 @@ session_resize :: proc(s: ^Session, cols, rows: u16, cell_w, cell_h: u32) {
 
 	s.cols, s.rows, s.cell_w, s.cell_h = cols, rows, cell_w, cell_h
 	terminal_resize(s.vt, cols, rows, cell_w, cell_h)
-	if s.running do pty_resize(&s.pty, cols, rows)
+
+	switch &b in s.backend {
+	case Local:  pty_resize(&b.pty, cols, rows)
+	case Remote: herdr.stream_resize(b.stream, b.client, cols, rows, cell_w, cell_h)
+	}
 }
 
 

@@ -73,7 +73,7 @@ draw :: proc(e: ^View, b: clay.BoundingBox, scale: f32, caret_on: bool) {
 
 		icon := mv.wide_tables[t.first] ? gfx.Icon.Fold_Horizontal : gfx.Icon.Move_Horizontal
 		color := hovered ? gfx.theme.text : gfx.theme.text_faint
-		gfx.draw_icon({icon, color, 15}, r)
+		gfx.draw_icon({kind = icon, color = color, size = 15}, r)
 	}
 }
 
@@ -161,7 +161,7 @@ draw_line_back :: proc(e: ^View, v: Visible, left, scale: f32) {
 		gfx.fill_rounded_rect(r, clay.CornerRadiusAll(6 * scale), gfx.theme.md_code_bg)
 		if img.state == .Failed {
 			icon_box := clay.BoundingBox{r.x, r.y, r.width, r.height * 0.6}
-			gfx.draw_icon({.Image_Off, gfx.theme.text_faint, u16(24)}, icon_box)
+			gfx.draw_icon({kind = .Image_Off, color = gfx.theme.text_faint, size = 24}, icon_box)
 		}
 
 		if box.alt[1] <= box.alt[0] do continue
@@ -595,7 +595,8 @@ draw_run :: proc(
 
 		if run.checked {
 			gfx.fill_rounded_rect(bx, radius, gfx.theme.accent)
-			gfx.draw_icon({.Check, gfx.theme.bg, u16(math.round(f32(run.size) * 0.8))}, bx)
+			check_size := u16(math.round(f32(run.size) * 0.8))
+			gfx.draw_icon({kind = .Check, color = gfx.theme.bg, size = check_size}, bx)
 		} else {
 			gfx.fill_rounded_rect(bx, radius, gfx.theme.text_dim)
 			inner := max(math.round(1.5 * scale), 1)

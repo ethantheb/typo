@@ -56,9 +56,9 @@ marked :: proc(marks: map[string]bool, path: string) -> bool {
 }
 
 
-// Typing filters the index, Up/Down move through the rows within their bounds,
-// Backspace and Enter work, Escape empties the field, and a shortcut gives the
-// keys back to the panes
+// With the popup open, typing filters the index, Up/Down move through the rows
+// within their bounds, Backspace and Enter work, Escape empties the field and
+// closes the popup, and a shortcut closes it and runs
 @(test)
 test_sidebar_search_keys :: proc(t: ^testing.T) {
 	sync.guard(&app_state_lock)
@@ -86,15 +86,18 @@ test_sidebar_search_keys :: proc(t: ^testing.T) {
 		fuzzy.destroy()
 	}
 
+	// Closed, the field doesn't take keys
+	testing.expect(t, !send_text("s"))
+
 	// Typing, with a slip taken back
-	s.typing = true
+	sidebar_search_open()
 	for text in ([]string{"s", "i", "x"}) {
 		testing.expect(t, send_text(text))
 	}
 	testing.expect(t, send_key(sdl.K_BACKSPACE))
 	testing.expect(t, send_text("d"))
 	testing.expect_value(t, line_edit_string(&s.field), "sid")
-	testing.expect(t, sidebar_search_active())
+	testing.expect(t, s.open)
 
 	// The search, as the frames run it
 	query := line_edit_string(&s.field)
@@ -119,8 +122,14 @@ test_sidebar_search_keys :: proc(t: ^testing.T) {
 	testing.expect_value(t, s.selected, rows - 1)
 	testing.expect(t, s.reveal)
 
-	// Enter opens the selected file, next frame, closes the search and gives
-	// the keys back
+	// Page Up goes to the first row
+	testing.expect(t, send_key(sdl.K_PAGEUP))
+	testing.expect_value(t, s.selected, 0)
+	testing.expect(t, send_key(sdl.K_PAGEDOWN))
+	testing.expect_value(t, s.selected, rows - 1)
+
+	// Enter opens the selected file, next frame, empties the field and closes
+	// the popup
 	chosen := f.files[s.search.results[rows - 1].index]
 	testing.expect(t, send_key(sdl.K_RETURN))
 	opened, is_open := g.pending.(Open_File)
@@ -130,24 +139,23 @@ test_sidebar_search_keys :: proc(t: ^testing.T) {
 		delete(string(opened))
 	}
 	g.pending = nil
-	testing.expect(t, !sidebar_search_active())
-	testing.expect(t, !s.typing)
+	testing.expect_value(t, len(s.field.text), 0)
+	testing.expect(t, !s.open)
 	testing.expect(t, !send_key(sdl.K_DOWN)) // the field doesn't have the keys
 
-	// Escape empties the field, back to the tree
-	s.typing = true
+	// Escape empties the field and closes the popup
+	sidebar_search_open()
 	testing.expect(t, send_text("s"))
-	testing.expect(t, sidebar_search_active())
 	testing.expect(t, send_key(sdl.K_ESCAPE))
-	testing.expect(t, !sidebar_search_active())
-	testing.expect(t, !s.typing)
+	testing.expect_value(t, len(s.field.text), 0)
+	testing.expect(t, !s.open)
 
-	// A shortcut gives the keys back and runs
-	s.typing = true
+	// A shortcut closes it and runs
+	sidebar_search_open()
 	visible := g.sidebar_visible
 	testing.expect(t, send_chord(.B, sdl.KMOD_LCTRL)) // Toggle sidebar
 	testing.expect(t, g.sidebar_visible != visible)
-	testing.expect(t, !s.typing)
+	testing.expect(t, !s.open)
 }
 
 

@@ -15,6 +15,7 @@ import "core:sync"
 import "core:time"
 
 import "../buffer"
+import "../process"
 
 
 @(private)
@@ -348,7 +349,7 @@ check_exit :: proc(c: ^Client) {
 		}
 		if !conn_ended(&w.conn) do return
 
-		code := process_exit_code(&w.conn.process)
+		code := process.process_exit_code(&w.conn.process)
 		conn_stop(&w.conn, 1000)
 		reason := fmt.tprintf("exited with code %d", code)
 		if w.last_error != "" do reason = fmt.tprintf("%s: %s", reason, w.last_error)

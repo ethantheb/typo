@@ -53,6 +53,8 @@ Command :: enum {
 	Zoom_In,
 	Zoom_Out,
 	Reset_Zoom,
+	Open_Git,
+	Open_Project,
 }
 
 Command_Info :: struct {
@@ -111,11 +113,14 @@ COMMANDS := [Command]Command_Info {
 	},
 	.Zoom_Out             = {"zoom_out", "Zoom out", {"Ctrl+-", "Ctrl+Keypad -"}},
 	.Reset_Zoom           = {"reset_zoom", "Reset zoom", {"Ctrl+0", "Ctrl+Keypad 0"}},
+	.Open_Git             = {"open_git", "Open Git pane", {"Ctrl+Shift+G"}},
+	.Open_Project         = {"open_project", "Open project", {"Ctrl+R"}},
 }
 
-// App commands that still work while the terminal has focus; every other chord
-// goes to the shell
-TERMINAL_COMMANDS :: bit_set[Command]{
+// The app commands that work while a terminal has focus, unless the user's
+// settings.toml lists others (terminal.commands); every other chord goes to the
+// shell, which needs many (Ctrl+R, Ctrl+E, Ctrl+W...)
+DEFAULT_TERMINAL_COMMANDS :: bit_set[Command]{
 	.Find,
 	.Find_Next,
 	.Find_Previous,
@@ -127,7 +132,48 @@ TERMINAL_COMMANDS :: bit_set[Command]{
 	.Zoom_In,
 	.Zoom_Out,
 	.Reset_Zoom,
+	.Open_Git,
 }
+
+// Commands that act on an editor's text, which a terminal has no use for: their
+// chords always go to the shell
+EDITOR_COMMANDS :: bit_set[Command]{
+	.Find_Match_Case,
+	.Find_Whole_Word,
+	.Find_Regex,
+	.Rename_Symbol,
+	.Save,
+	.Undo,
+	.Redo,
+	.Select_All,
+	.Copy,
+	.Cut,
+	.Paste,
+	.Add_Cursor_Above,
+	.Add_Cursor_Below,
+	.Move_Line_Up,
+	.Move_Line_Down,
+	.Toggle_Markdown_View,
+	.Go_To_Definition,
+	.Find_References,
+	.Go_To_File_Symbol,
+	.Go_To_Line,
+	.Trigger_Completion,
+	.Show_Signature_Help,
+	.Show_Hover,
+	.Next_Problem,
+	.Previous_Problem,
+}
+
+
+// The command settings.toml calls `key`
+command_from_key :: proc(key: string) -> (Command, bool) {
+	for info, cmd in COMMANDS {
+		if info.key == key do return cmd, true
+	}
+	return {}, false
+}
+
 
 // A key or a mouse button, with modifiers. Mouse buttons are the side buttons,
 // named "Mouse4" (back, SDL's X1) and "Mouse5" (forward, X2)
@@ -189,6 +235,12 @@ run_command :: proc(cmd: Command) -> bool {
 
 	case .Go_To_Line:
 		return goto_line_open()
+
+	case .Open_Git:
+		return git_pane_open()
+
+	case .Open_Project:
+		project_picker_toggle()
 
 	case .Find, .Find_Next, .Find_Previous, .Find_Match_Case, .Find_Whole_Word, .Find_Regex:
 		return find_run_command(cmd)

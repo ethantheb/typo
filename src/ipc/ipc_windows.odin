@@ -352,3 +352,19 @@ finish_io :: proc(
 	ok = bool(win.GetOverlappedResult(h, ov, &n, false))
 	return n, ok
 }
+
+
+// The registry of endpoints by project (projects.odin):
+// %LOCALAPPDATA%\typo\ipc, in the user's profile, which only the user may
+// use; "" if LOCALAPPDATA isn't set
+@(private)
+registry_root :: proc(create: bool) -> string {
+	local := os.get_env("LOCALAPPDATA", context.temp_allocator)
+	if local == "" do return ""
+
+	root := fmt.tprintf(`%s\typo\ipc`, local)
+	if create && !os.is_dir(root) && os.make_directory_all(root) != nil {
+		return ""
+	}
+	return root
+}

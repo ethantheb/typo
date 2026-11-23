@@ -1,6 +1,5 @@
 package editor
 
-import "core:math"
 
 import clay "../vendor/clay-odin"
 import "gfx"
@@ -55,8 +54,10 @@ scrollbar_mouse :: proc(
 
 // A scroll bar over the right edge of a Clay scroll container, which should
 // leave SCROLLBAR_GUTTER of padding there for it. Declare it after the
-// container; `drag` is kept per container. Works from last frame's layout
-list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
+// container; `drag` is kept per container; `layer` is the floating zIndex of
+// what holds the list (a pane's, a popup's), and its thumb floats one above,
+// so it never shows over what covers the list. Works from last frame's layout
+list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32), layer: i16) {
 	wheel_scroll_list(list)
 
 	data := clay.GetScrollContainerData(list)
@@ -93,10 +94,26 @@ list_scrollbar :: proc(list: clay.ElementId, drag: ^Maybe(f32)) {
 			attachTo = .ElementWithId,
 			parentId = list.id,
 			offset = {r.x - area.x, r.y - area.y},
-			zIndex = 110, // above popups (100), below the context menu (120) and dialog (150)
+			zIndex = layer + 1,
 			pointerCaptureMode = .Passthrough,
 		},
 	}) {}
+}
+
+
+// Scrolls a list so its row `index` (rows `row_h` tall from the list's top) is
+// in view. `scroll` is the list's data, as last laid out
+list_reveal_row :: proc(scroll: clay.ScrollContainerData, index: int, row_h: f32) {
+	if !scroll.found do return
+
+	// scrollPosition is negative: content offset upward
+	top := f32(index) * row_h
+	view := scroll.scrollContainerDimensions.height
+	if top < -scroll.scrollPosition.y {
+		scroll.scrollPosition.y = -top
+	} else if top + row_h > -scroll.scrollPosition.y + view {
+		scroll.scrollPosition.y = -(top + row_h - view)
+	}
 }
 
 
@@ -217,7 +234,7 @@ update_scroll_containers :: proc() {
 	}
 
 	// Ease the lists along
-	t := 1 - math.exp(-f32(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
+	t := f32(scroll_ease_step())
 	for i := 0; i < smooth.n_moving; {
 		m := &smooth.moving[i]
 		data := scroll_data(m.id)

@@ -1,17 +1,20 @@
 #+build windows
-package editor
+package trash
 
 import "core:strings"
 import win32 "core:sys/windows"
 
-// Deleting to the Recycle Bin through the shell's IFileOperation, without its
-// dialogs. The shell would destroy an item it can't recycle (too big for the
-// bin, or on a drive without one); the progress sink stops it before anything
-// is deleted, and the caller asks first
+// The Recycle Bin, through the shell's IFileOperation, without its dialogs.
+// The shell would destroy an item it can't recycle (too big for the bin, or on
+// a drive without one); the progress sink stops it before anything is
+// deleted. IFileOperation wants a single-threaded apartment, which each call
+// enters on its thread
 
 
-move_to_trash :: proc(path: string) -> Delete_Result {
+move :: proc(path: string) -> Result {
 	hr := win32.CoInitializeEx(nil, .APARTMENTTHREADED)
+	if hr == RPC_E_CHANGED_MODE do return .Failed // a multithreaded apartment already
+
 	initialized := win32.SUCCEEDED(hr)
 	defer if initialized do win32.CoUninitialize()
 
@@ -58,6 +61,9 @@ move_to_trash :: proc(path: string) -> Delete_Result {
 
 @(private = "file")
 FOFX_RECYCLEONDELETE :: 0x00080000
+
+@(private = "file")
+RPC_E_CHANGED_MODE := transmute(win32.HRESULT)u32(0x80010106)
 
 // PreDeleteItem's flags: the item goes to the Recycle Bin, else it is destroyed
 @(private = "file")

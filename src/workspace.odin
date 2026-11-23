@@ -122,6 +122,17 @@ workspace_toggle :: proc(ws: ^Workspace, index: int) {
 }
 
 
+// Whether the tree knows `path` as a folder (from its listings: no disk access)
+workspace_is_folder :: proc(ws: ^Workspace, path: string) -> bool {
+	for node in ws.nodes {
+		if node.is_dir && same_path(node.path, path) {
+			return true
+		}
+	}
+	return false
+}
+
+
 // Expands every directory between the root and `path` so it shows in the tree
 workspace_reveal :: proc(ws: ^Workspace, path: string) {
 	index := 0
@@ -327,12 +338,18 @@ add_visible :: proc(ws: ^Workspace, index: int) {
 
 @(private = "file")
 picked: struct {
-	mutex: sync.Mutex,
-	path:  string,
+	mutex:      sync.Mutex,
+	path:       string,
+	new_window: bool, // what the dialog was shown for: the folder opens in another window
 }
 
 
-show_open_folder_dialog :: proc() {
+// Shows the system's folder dialog; the folder chosen opens in this window,
+// or with `new_window` in another (take_picked_folder)
+show_open_folder_dialog :: proc(new_window := false) {
+	if sync.guard(&picked.mutex) {
+		picked.new_window = new_window
+	}
 	location := strings.clone_to_cstring(g.workspace.root, context.temp_allocator)
 	sdl.ShowOpenFolderDialog(folder_dialog_callback, nil, g.window, location, false)
 }
@@ -356,10 +373,10 @@ folder_dialog_callback :: proc "c" (userdata: rawptr, filelist: [^]cstring, filt
 }
 
 
-// Returns a folder chosen in the dialog since the last call, if any. Caller owns
-// the string
-take_picked_folder :: proc() -> (path: string, ok: bool) {
+// Returns a folder chosen in the dialog since the last call, if any, and
+// whether it is for another window. Caller owns the string
+take_picked_folder :: proc() -> (path: string, new_window, ok: bool) {
 	sync.guard(&picked.mutex)
 	path, picked.path = picked.path, ""
-	return path, path != ""
+	return path, picked.new_window, path != ""
 }

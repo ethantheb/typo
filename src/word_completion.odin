@@ -11,6 +11,7 @@ import "core:strings"
 import "core:time"
 
 import "buffer"
+import "uitime"
 import "words"
 
 
@@ -29,12 +30,10 @@ Words_Mode :: enum {
 // How long typing rests before an editor's words are collected again
 WORDS_DELAY :: 300 * time.Millisecond
 
-// Spent on word completions on the UI thread since the perf suite last looked
-// (`words_timed`)
-words_ui_time: time.Duration
+// Word completion's share of the UI thread, which the perf suite limits
+@(thread_local)
+words_ui: uitime.Share
 
-@(private = "file")
-words_timing: int // `words_timed` calls under way
 @(private = "file")
 indexer: words.Indexer
 @(private = "file")
@@ -102,7 +101,7 @@ words_close :: proc(e: ^Editor) {
 // Takes the collected words, and asks for the focused editor's when its text
 // changed and typing rested, or the caret left the lines they are from
 words_frame :: proc() {
-	words_timed()
+	uitime.timed(&words_ui)
 
 	for r in words.indexer_take(&indexer) {
 		e := editor_waiting_for(r.id)
@@ -170,22 +169,6 @@ words_stale :: proc(e: ^Editor) -> bool {
 	before := index.lo > 0 && caret < index.lo + quarter
 	after := index.hi < index.length && caret > index.hi - quarter
 	return before || after
-}
-
-
-// Counts the time to the end of the caller's scope as word completion work on
-// the UI thread, which the perf suite limits. Nested calls count once
-@(deferred_out = words_timed_end)
-words_timed :: proc() -> time.Tick {
-	words_timing += 1
-	return time.tick_now()
-}
-
-
-@(private = "file")
-words_timed_end :: proc(start: time.Tick) {
-	words_timing -= 1
-	if words_timing == 0 do words_ui_time += time.tick_since(start)
 }
 
 

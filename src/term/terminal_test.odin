@@ -2,11 +2,15 @@ package term
 
 import "base:runtime"
 import "core:encoding/json"
+import "core:fmt"
+import "core:log"
 import "core:os"
 import "core:reflect"
 import "core:strings"
 import "core:testing"
 import "core:time"
+
+import "../herdr"
 
 // Run with: python build.py --test  (builds libghostty-vt first)
 
@@ -39,6 +43,7 @@ test_abi_matches_manifest :: proc(t: ^testing.T) {
 	check_size(t, types, "GhosttySurfacePosition", size_of(Surface_Position))
 	check_size(t, types, "GhosttySelectionGestureGeometry", size_of(Gesture_Geometry))
 	check_size(t, types, "GhosttyCodepointBuffer", size_of(Codepoint_Buffer))
+	check_size(t, types, "GhosttyTerminalScrollbar", size_of(Terminal_Scrollbar))
 
 	// Every value of the enums we bind must be the one the library gives it
 	check_enum(t, types, "GhosttyResult", Result)
@@ -290,7 +295,7 @@ test_session_runs_command :: proc(t: ^testing.T) {
 	exited := false
 	deadline := time.tick_now()
 	for !exited && time.tick_since(deadline) < 10 * time.Second {
-		_, exited = session_pump(&s, 4 * time.Millisecond)
+		exited = session_pump(&s, 4 * time.Millisecond).ended
 		time.sleep(5 * time.Millisecond)
 	}
 	testing.expect(t, exited, "process exit was not reported")
@@ -300,6 +305,49 @@ test_session_runs_command :: proc(t: ^testing.T) {
 		found ||= strings.contains(line, "hello-from-pty")
 	}
 	testing.expect(t, found, "command output not on screen")
+}
+
+
+// A shell at its prompt runs no program; one it starts is found under it by
+// name, and is gone once it ends
+@(test)
+test_programs_under :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+
+	s: Session
+	testing.expect(t, session_init(&s, 80, 10, noop, nil))
+	defer session_destroy(&s)
+	testing.expect(t, session_spawn(&s, "cmd.exe /q /k", ""))
+
+	pid := session_pid(&s)
+	testing.expect(t, pid > 0)
+	testing.expect_value(t, len(programs_under(pid, context.temp_allocator)), 0)
+
+	// A program, once it has started
+	command := "ping -n 3 127.0.0.1\r"
+	session_input(&s, transmute([]u8)command)
+	testing.expect(t, wait_for_ping(pid, true), "ping isn't found under the shell")
+
+	// It ends on its own after about 2 s
+	testing.expect(t, wait_for_ping(pid, false), "ping is still found once it ended")
+	session_kill(&s)
+}
+
+
+// Waits up to 10 s for ping to be found under `pid`, or not to be
+@(private = "file")
+wait_for_ping :: proc(pid: int, running: bool) -> bool {
+	start := time.tick_now()
+	for time.tick_since(start) < 10 * time.Second {
+		found := false
+		for name in programs_under(pid, context.temp_allocator) {
+			found ||= strings.equal_fold(name, "ping")
+		}
+		if found == running do return true
+
+		time.sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 
@@ -322,7 +370,7 @@ test_session_environment :: proc(t: ^testing.T) {
 	exited := false
 	deadline := time.tick_now()
 	for !exited && time.tick_since(deadline) < 10 * time.Second {
-		_, exited = session_pump(&s, 4 * time.Millisecond)
+		exited = session_pump(&s, 4 * time.Millisecond).ended
 		time.sleep(5 * time.Millisecond)
 	}
 	testing.expect(t, exited, "process exit was not reported")
@@ -421,7 +469,9 @@ test_grow_keeps_cursor_row :: proc(t: ^testing.T) {
 // spaces must not become extra rows here
 @(test)
 test_narrow_trims_trailing_spaces :: proc(t: ^testing.T) {
-	when ODIN_OS != .Windows || !GHOSTTY_PATCHED do return
+	when ODIN_OS != .Windows || !GHOSTTY_PATCHED {
+		return
+	}
 
 	s: Session
 	session_init(&s, 20, 4, noop, nil)
@@ -461,3 +511,201 @@ test_narrow_keeps_cursor_after_spaces :: proc(t: ^testing.T) {
 	testing.expect_value(t, c.viewport_y, 3)
 	testing.expect_value(t, c.viewport_x, 2)
 }
+
+
+// A remote terminal's repaint starts from a reset terminal: the scrollback
+// it had is gone, so the repaint's history isn't shown twice
+@(test)
+test_reset_clears_scrollback :: proc(t: ^testing.T) {
+	s: Session
+	session_init(&s, 20, 4, noop, nil)
+	defer session_destroy(&s)
+	for i in 0 ..< 30 {
+		line := fmt.tprintf("line %d\r\n", i)
+		terminal_vt_write(s.vt, raw_data(line), len(line))
+	}
+	testing.expect(t, scrollback_rows(&s) > 4, "lines scrolled off")
+
+	terminal_reset(s.vt)
+	testing.expect_value(t, scrollback_rows(&s), 4)
+	testing.expect_value(t, screen_text(&s)[0], "")
+}
+
+
+@(private = "file")
+scrollback_rows :: proc(s: ^Session) -> u64 {
+	bar: Terminal_Scrollbar
+	terminal_get(s.vt, .Scrollbar, &bar)
+	return bar.total
+}
+
+
+// A persistent terminal in a private herdr-core session: its output reaches
+// the grid, and once typo let go of it and attached again, the screen and its
+// history come back. Skipped when herdr-core isn't installed
+@(test)
+test_remote_session_reattach :: proc(t: ^testing.T) {
+	sb: herdr.Sandbox
+	ok, why := herdr.sandbox_begin(&sb, "typo-herdr-test")
+	if !ok {
+		log.infof("skipped: %s", why)
+		return
+	}
+	defer herdr.sandbox_end(&sb)
+
+	client: herdr.Client
+	herdr.client_start(&client, {"typo=1"}, noop, nil)
+	defer herdr.client_stop(&client)
+
+	when ODIN_OS == .Windows {
+		spec := herdr.Spec{argv = {"cmd.exe", "/q", "/k", "prompt $G"}, labels = {"typo=1"}}
+		rows := "for /l %i in (1,1,40) do @echo row %i\r"
+	} else {
+		spec := herdr.Spec{argv = {"/bin/sh"}, labels = {"typo=1"}}
+		rows := "for i in $(seq 1 40); do echo row $i; done\n"
+	}
+	display := herdr.Display{fg = "#ffffff", bg = "#000000", cursor = "#ffffff"}
+
+	// A new terminal prints 40 rows
+	s: Session
+	session_init(&s, 60, 10, noop, nil)
+	session_resize(&s, 60, 10, 9, 18)
+	session_start_remote(&s, &client, spec, display, 1000)
+	testing.expect(t, pump_until_shown(&s, ">"), "the shell's prompt never showed")
+	session_input(&s, transmute([]u8)rows)
+	testing.expect(t, pump_until_shown(&s, "row 40"), "the output never showed")
+	address := strings.clone(session_remote_address(&s))
+	defer delete(address)
+	testing.expect(t, address != "", "no address")
+
+	// Let go of it (typo quitting), and show it again
+	session_destroy(&s)
+	again: Session
+	session_init(&again, 60, 10, noop, nil)
+	defer session_destroy(&again)
+	session_resize(&again, 60, 10, 9, 18)
+	session_attach_remote(&again, &client, address, "", display, 1000)
+	testing.expect(t, pump_until_shown(&again, "row 40"), "the screen didn't come back")
+	testing.expect(t, scrollback_rows(&again) > 30, "the history didn't come back")
+
+	// Its first rows are in the history
+	terminal_scroll_viewport(again.vt, {tag = .Top})
+	found := false
+	for line in screen_text(&again) {
+		if line == "row 1" do found = true
+	}
+	testing.expect(t, found, "row 1 isn't in the history")
+
+	// Closing it ends it in herdr-core
+	session_kill(&again)
+	testing.expect(t, !again.running)
+}
+
+
+// Pumps until a row of the screen contains `text`; false after 20 seconds
+@(private = "file")
+pump_until_shown :: proc(s: ^Session, text: string) -> bool {
+	deadline := time.tick_now()
+	for time.tick_since(deadline) < 20 * time.Second {
+		_ = session_pump(s, 4 * time.Millisecond)
+		for line in screen_text(s) {
+			if strings.contains(line, text) do return true
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+
+
+// A persistent terminal resized after its screen filled (taller, shorter,
+// narrower so its lines rewrap, and back): what the shell draws next lands
+// where it means, right under the line typed. herdr-core's live output is its
+// ConPTY's, so the screen here must resize as ConPTY's does. Skipped without
+// herdr-core
+@(test)
+test_remote_resize_keeps_rows :: proc(t: ^testing.T) {
+	when ODIN_OS != .Windows do return
+
+	sb: herdr.Sandbox
+	ok, why := herdr.sandbox_begin(&sb, "typo-herdr-resize")
+	if !ok {
+		log.infof("skipped: %s", why)
+		return
+	}
+	defer herdr.sandbox_end(&sb)
+
+	client: herdr.Client
+	herdr.client_start(&client, {"typo=1"}, noop, nil)
+	defer herdr.client_stop(&client)
+
+	// Sizes after the screen fills, from 60 x 10
+	resizes := [][]Resize{
+		{{60, 20}},
+		{{60, 5}, {60, 20}},
+		{{25, 10}, {60, 10}},
+		{{25, 6}, {70, 20}},
+	}
+	for steps, n in resizes {
+		spec := herdr.Spec{argv = {"cmd.exe", "/q", "/k", "prompt $G"}, labels = {"typo=1"}}
+		display := herdr.Display{fg = "#ffffff", bg = "#000000", cursor = "#ffffff"}
+		s: Session
+		session_init(&s, 60, 10, noop, nil)
+		defer session_destroy(&s)
+		session_resize(&s, 60, 10, 9, 18)
+		session_start_remote(&s, &client, spec, display, 1000)
+		testing.expect(t, pump_until_shown(&s, ">"), "the shell's prompt never showed")
+
+		// A full screen of long lines, then the resizes
+		rows := "for /l %i in (1,1,30) do @echo row %i is a fairly long line of text\r"
+		session_input(&s, transmute([]u8)rows)
+		testing.expect(t, pump_until_shown(&s, "row 30"), "the output never showed")
+		for size in steps {
+			session_resize(&s, size.cols, size.rows, 9, 18)
+			pump_for(&s, 1200 * time.Millisecond)
+		}
+
+		// The next command, and its output right under it
+		mark := fmt.tprintf("MARK-%d", n)
+		command := fmt.tprintf("echo %s\r", mark)
+		session_input(&s, transmute([]u8)command)
+		pump_for(&s, 1500 * time.Millisecond)
+
+		lines := screen_text(&s)
+		typed, output := -1, -1
+		for line, i in lines {
+			if strings.contains(line, fmt.tprintf("echo %s", mark)) do typed = i
+			if strings.trim_space(line) == mark do output = i
+		}
+		screen := strings.join(lines, "\n", context.temp_allocator)
+		ok := typed >= 0 && output == typed + 1
+		testing.expectf(
+			t,
+			ok,
+			"resizes %v: typed on row %d, output on %d:\n%s",
+			steps,
+			typed,
+			output,
+			screen,
+		)
+		session_kill(&s)
+	}
+}
+
+
+@(private = "file")
+Resize :: struct {
+	cols, rows: u16,
+}
+
+
+// Pumps output for `d`
+@(private = "file")
+pump_for :: proc(s: ^Session, d: time.Duration) {
+	start := time.tick_now()
+	for time.tick_since(start) < d {
+		_ = session_pump(s, 4 * time.Millisecond)
+		time.sleep(10 * time.Millisecond)
+	}
+}
+

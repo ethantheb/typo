@@ -242,11 +242,11 @@ lsp_status_item :: proc() {
 		if e != nil do errors, warnings = langs.problem_counts(&e.lsp)
 		if errors > 0 {
 			icon(.Close, gfx.theme.error, 12)
-			label(fmt.tprintf("%d", errors), gfx.theme.error, FONT_SIZE_SMALL)
+			count_label(errors, gfx.theme.error)
 		}
 		if warnings > 0 {
 			icon(.Alert, gfx.theme.ansi[3], 12)
-			label(fmt.tprintf("%d", warnings), gfx.theme.ansi[3], FONT_SIZE_SMALL)
+			count_label(warnings, gfx.theme.ansi[3])
 		}
 	}
 

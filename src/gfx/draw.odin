@@ -480,11 +480,52 @@ draw_arc :: proc(cx, cy, radius, thickness, start: f32, c: clay.Color) {
 }
 
 
-// Icons are Lucide glyphs, centred in the element's bounds
+// Icons are Lucide glyphs, centred in the element's bounds. A badge sits on
+// the top right corner, half outside: the icon is drawn through two clips that
+// leave out the badge's square and a gap around it, so its lines stop short of
+// the badge whatever is behind
 draw_icon :: proc(data: Icon_Data, b: clay.BoundingBox) {
-	font := text_get_font(&text_system, .Icons, data.size)
+	badge, has_badge := data.badge.?
+	if !has_badge {
+		draw_glyph(data.kind, data.size, data.color, b)
+		return
+	}
+
+	// The badge's square, in pixels (the bounds are scaled, sizes aren't)
+	scale := b.width / f32(data.size)
+	badge_size := u16(math.round(f32(data.size) * BADGE_SCALE))
+	s := f32(badge_size) * scale
+	gap := max(1, math.round(scale * f32(data.size) / 14))
+	square := clay.BoundingBox{
+		math.round(b.x + b.width - s * 0.62),
+		math.round(b.y - s * 0.3),
+		s,
+		s,
+	}
+
+	// The icon, left of the notch, then under it (a little past its bounds, as
+	// a glyph's edge may be)
+	left, top := i32(b.x) - 2, i32(b.y) - 2
+	right, bottom := i32(b.x + b.width) + 2, i32(b.y + b.height) + 2
+	notch_left := i32(square.x - gap)
+	notch_bottom := i32(square.y + s + gap)
+	push_clip({left, top, max(notch_left - left, 0), bottom - top})
+	draw_glyph(data.kind, data.size, data.color, b)
+	pop_clip()
+	push_clip({notch_left, notch_bottom, right - notch_left, max(bottom - notch_bottom, 0)})
+	draw_glyph(data.kind, data.size, data.color, b)
+	pop_clip()
+
+	draw_glyph(badge.kind, badge_size, badge.color, square)
+}
+
+
+// One Lucide glyph of `size`, centred in `b`
+@(private = "file")
+draw_glyph :: proc(kind: Icon, size: u16, color: clay.Color, b: clay.BoundingBox) {
+	font := text_get_font(&text_system, .Icons, size)
 	if font == nil do return
-	text := text_get(&text_system, font, ICON_GLYPHS[data.kind])
+	text := text_get(&text_system, font, ICON_GLYPHS[kind])
 	if text == nil do return
 
 	// Lucide draws each icon in the em square (baseline to ascent), so centre
@@ -494,5 +535,5 @@ draw_icon :: proc(data: Icon_Data, b: clay.BoundingBox) {
 	em := f32(ttf.GetFontAscent(font))
 	x := math.round(b.x + (b.width - f32(w)) / 2)
 	y := math.round(b.y + (b.height - em) / 2)
-	draw_text(text, x, y, data.color)
+	draw_text(text, x, y, color)
 }

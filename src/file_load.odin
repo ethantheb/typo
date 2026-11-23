@@ -543,6 +543,14 @@ file_load_frame :: proc() {
 				continue
 			}
 			save_landed(e, r)
+
+		case Patch_Result:
+			diff_patch_landed(r)
+			io_result_destroy(r)
+
+		case Delete_Result:
+			delete_landed(r)
+			io_result_destroy(r)
 		}
 	}
 

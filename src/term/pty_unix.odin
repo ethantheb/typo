@@ -121,6 +121,12 @@ pty_exited :: proc(p: ^Pty) -> bool {
 }
 
 
+// The shell's process id, 0 once it exited
+pty_pid :: proc(p: ^Pty) -> int {
+	return pty_exited(p) ? 0 : int(p.pid)
+}
+
+
 // Blocks until the shell writes something. Returns 0 once it has exited
 pty_read :: proc(p: ^Pty, buf: []u8) -> int {
 	for {

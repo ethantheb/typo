@@ -15,6 +15,7 @@ import "core:strings"
 import "core:time"
 
 import "../lsp"
+import "../uitime"
 
 
 State :: struct {
@@ -32,10 +33,11 @@ State :: struct {
 	answers:     [dynamic]lsp.Lookup, // this frame's
 	programs:    map[string]Answer,   // by command name or path (keys owned)
 	roots:       map[string]Answer,   // by folder and root markers (keys owned)
-
-	ui_time:     time.Duration, // spent here since the perf suite last looked (`timed`)
-	timing:      int,           // `timed` calls under way
 }
+
+// The language servers' share of the UI thread, which the perf suite limits
+@(thread_local)
+ui_share: uitime.Share
 
 Client :: struct {
 	using client:    ^lsp.Client, // a restart retires it and starts a new one
@@ -104,7 +106,7 @@ QUIT_WAIT :: 500 * time.Millisecond
 // points into the settings, which a reload replaces), and when the servers'
 // settings changed, reconnects the open files to it
 settings_changed :: proc() {
-	timed()
+	uitime.timed(&ui_share)
 	l := &state
 	config := env.config()
 	build_server_list(config.overrides, &l.servers, &l.languages)
@@ -173,7 +175,7 @@ server_key :: proc(s: ^Server) -> string {
 
 // Stops every client, e.g. when another folder opens
 stop_all :: proc() {
-	timed()
+	uitime.timed(&ui_share)
 	for len(state.clients) > 0 {
 		client_remove(state.clients[len(state.clients) - 1])
 	}
@@ -250,7 +252,7 @@ program_path :: proc(name: string) -> (path: string, known: bool) {
 // The install commands of a server whose programs are found, lightest first.
 // One set up with a path to its program has none
 server_installs :: proc(s: ^Server) -> Installs {
-	timed()
+	uitime.timed(&ui_share)
 	if s.path != "" do return {known = true}
 
 	offered := make([dynamic]Install, context.temp_allocator)
@@ -461,7 +463,7 @@ log_in_use :: proc(path, root: string) -> bool {
 // Starts a client over, e.g. after a crash or from the status popup. Its
 // documents are opened again on the new one
 client_restart :: proc(c: ^Client) {
-	timed()
+	uitime.timed(&ui_share)
 	s := server(c.name)
 	if s == nil do return
 
@@ -485,7 +487,7 @@ restart_by_user :: proc(c: ^Client) {
 
 // Asks a client's server to exit; it stays listed, stopped, until started again
 client_stop :: proc(c: ^Client) {
-	timed()
+	uitime.timed(&ui_share)
 	lsp.client_stop(c.client)
 	c.stopped_by_user = true
 	c.restart_at = nil
@@ -495,7 +497,7 @@ client_stop :: proc(c: ^Client) {
 
 // Stops a client and forgets it, detaching the documents that used it
 client_remove :: proc(c: ^Client) {
-	timed()
+	uitime.timed(&ui_share)
 	docs_detach(c)
 	client_gone(c, removed = true)
 	for other, i in state.clients {
@@ -551,7 +553,7 @@ free_client :: proc(client: ^lsp.Client) {
 // Takes what the clients and lookups reported, restarts crashed clients, and
 // opens documents on new ones
 frame :: proc() {
-	timed()
+	uitime.timed(&ui_share)
 	l := &state
 	take_answers()
 
@@ -583,22 +585,6 @@ frame :: proc() {
 	}
 
 	open_pending_docs()
-}
-
-
-// Counts the time to the end of the caller's scope as language server work on
-// the UI thread, which the perf suite limits. Nested calls count once
-@(deferred_out = timed_end)
-timed :: proc() -> time.Tick {
-	state.timing += 1
-	return time.tick_now()
-}
-
-
-@(private)
-timed_end :: proc(start: time.Tick) {
-	state.timing -= 1
-	if state.timing == 0 do state.ui_time += time.tick_since(start)
 }
 
 

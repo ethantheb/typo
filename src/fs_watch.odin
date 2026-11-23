@@ -83,8 +83,10 @@ Folder_Listing :: struct {
 	entries: []Dir_Entry, // owned, names too; in tree order
 }
 
-// Folders of the tree listed again; `structure` when files were added,
-// removed or renamed (the finder's index is stale)
+// A burst of changes in the workspace (handed over for any, so the Git status
+// follows files written in place): folders of the tree listed again, and
+// `structure` when files were added, removed or renamed (the finder's index is
+// stale)
 Watch_Batch :: struct {
 	listings:  []Folder_Listing,
 	structure: bool,
@@ -491,12 +493,18 @@ parent_dir :: proc(path: string) -> string {
 
 
 // Whether an event is inside a folder the finder ignores (.git, node_modules,
-// build outputs). The ignored folder itself still counts, as the tree shows it
+// build outputs), or is typo's own project state being saved (.typo's
+// session.json and its temp file, written as the user works: no reason to
+// list the tree or refresh Git). The ignored folder itself still counts, as
+// the tree shows it
 watch_ignored :: proc(root, path: string) -> bool {
 	rel := path
 	if len(path) > len(root) && strings.has_prefix(path, root) {
 		rel = strings.trim_left(path[len(root):], "/\\")
 	}
+
+	slashed, _ := strings.replace_all(rel, "\\", "/", context.temp_allocator)
+	if strings.has_prefix(slashed, PROJECT_DIR + "/" + PROJECT_SESSION) do return true
 
 	// Every part but the last
 	start := 0
@@ -706,12 +714,7 @@ hand_over_burst :: proc(t: ^Watch_Thread, now: time.Tick) {
 		}
 	}
 
-	if len(listings) > 0 || p.structure {
-		batch := Watch_Batch{listings[:], p.structure}
-		hand_over(batch)
-	} else {
-		delete(listings)
-	}
+	hand_over(Watch_Batch{listings[:], p.structure})
 	pending_reset(p)
 }
 

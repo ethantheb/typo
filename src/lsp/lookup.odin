@@ -9,6 +9,8 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 
+import "../process"
+
 
 Lookups :: struct {
 	// Shared with the thread, guarded by mutex
@@ -130,7 +132,7 @@ lookups_proc :: proc(l: ^Lookups) {
 		sync.unlock(&l.mutex)
 
 		if x.program != "" {
-			x.answer = find_executable(x.program)
+			x.answer = process.find_executable(x.program)
 		} else {
 			x.answer = find_root(x.file, x.workspace, x.markers)
 		}

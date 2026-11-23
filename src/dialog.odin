@@ -1,7 +1,6 @@
 package editor
 
 import "core:fmt"
-import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
@@ -34,7 +33,9 @@ Deleting :: struct {
 	path:      string, // owned, a file or folder
 	permanent: bool,
 }
-Reset_Settings :: struct {}
+Reset_Settings :: struct {
+	scope: Settings_Scope, // the user's settings, or the project's values
+}
 Notice :: struct {}
 Removing_Server :: struct {
 	name: string, // owned; a server the settings added
@@ -49,6 +50,14 @@ Overwriting :: struct {
 Opening_Large :: struct {
 	id: u64, // the load of a file larger than the ask_above_mb setting
 }
+Ending_Programs :: struct {} // the unsaved-changes flow's step for running programs
+Git_Discarding :: struct {
+	tracked:   []string, // owned; files whose changes go back to the staged version
+	untracked: []string, // owned; files deleted
+}
+Git_Remote_Failed :: struct {
+	line: string, // owned; the git command that failed, to run in a terminal
+}
 
 Dialog_Purpose :: union {
 	Unsaved_Step,
@@ -60,6 +69,9 @@ Dialog_Purpose :: union {
 	Reloading,
 	Overwriting,
 	Opening_Large,
+	Ending_Programs,
+	Git_Discarding,
+	Git_Remote_Failed,
 }
 
 Dialog :: struct {
@@ -113,6 +125,12 @@ dialog_close :: proc() {
 	case Removing_Server: delete(p.name)
 	case Reloading:       delete(p.path)
 	case Overwriting:     delete(p.path)
+	case Git_Remote_Failed: delete(p.line)
+	case Git_Discarding:
+		for path in p.tracked do delete(path)
+		for path in p.untracked do delete(path)
+		delete(p.tracked)
+		delete(p.untracked)
 	}
 
 	serial := d.serial
@@ -124,6 +142,7 @@ dialog_destroy :: proc() {
 	dialog_close()
 	unsaved_reset()
 	delete(g.unsaved.asking)
+	delete(g.unsaved.ending)
 }
 
 
@@ -161,9 +180,15 @@ dialog_apply :: proc(choice: int) {
 	case Notice:
 
 	case Reset_Settings:
-		if confirmed {
+		if !confirmed do break
+
+		switch p.scope {
+		case .User:
 			settings_reset_all(&g.settings)
 			settings_changed()
+		case .Project:
+			settings_clear_project(&g.settings)
+			project_settings_changed()
 		}
 
 	case Removing_Server:
@@ -181,25 +206,20 @@ dialog_apply :: proc(choice: int) {
 	case Opening_Large:
 		large_file_answer(p.id, open = confirmed)
 
+	case Git_Discarding:
+		git_discard_answer(p, confirmed)
+
+	case Git_Remote_Failed:
+		git_remote_failed_answer(p, run = confirmed)
+
 	case Unsaved_Step:
 		unsaved_answer((^Pane)(p), choice)
 
-	case Deleting:
-		if !confirmed do return
+	case Ending_Programs:
+		programs_answer(confirmed)
 
-		path := strings.clone(p.path, context.temp_allocator)
-		switch delete_path(path, p.permanent) {
-		case .Done:
-			path_deleted(path)
-		case .Not_Recyclable:
-			ask_delete_file(path, permanent = true)
-		case .Failed:
-			// Some of a folder may be gone
-			workspace_refresh(&g.workspace)
-			finder_invalidate()
-			message := fmt.tprintf("%s could not be deleted.", relative_to_root(path))
-			show_notice("Couldn't delete", message)
-		}
+	case Deleting:
+		if confirmed do delete_path(p.path, p.permanent)
 	}
 }
 
@@ -317,25 +337,43 @@ dialog_button :: proc(id: clay.ElementId, b: Dialog_Button, focused: bool) -> bo
 
 // --- Unsaved changes ---------------------------------------------------------------
 
-// Closing a file, opening a folder or quitting first asks about each file with
-// unsaved changes, one dialog at a time; then does what was asked, unless
-// cancelled. Before each question, and before doing it, the flow waits for
-// every write under way to land (the writer thread saves): a file a write
+// Closing a pane, opening a folder or quitting first asks about each file with
+// unsaved changes, one dialog at a time, then, if programs run in terminals it
+// would end, about those (terminal_programs.odin); then does what was asked,
+// unless cancelled. Before each question, and before doing it, the flow waits
+// for every write under way to land (the writer thread saves): a file a write
 // saved isn't asked about, and a failed write stops the flow
 
 Closing_Pane :: distinct ^Pane
 Quit :: struct {}
+Repinning :: struct {
+	pane:   ^Pane, // a terminal, restarted pinned (in herdr-core) or here
+	pinned: bool,
+}
 
 After_Unsaved :: union {
 	Closing_Pane,
 	Open_Folder, // owned
 	Quit,
+	Repinning,
 }
 
 Unsaved_Flow :: struct {
-	asking:  [dynamic]^Pane, // files with unsaved changes still to ask about
-	then:    After_Unsaved,
-	waiting: bool, // for writes under way to land (unsaved_frame)
+	asking:   [dynamic]^Pane, // files with unsaved changes still to ask about
+	then:     After_Unsaved,
+	waiting:  bool, // for writes under way to land (unsaved_frame)
+
+	// The terminals `then` ends, and what runs in them
+	programs: Programs_Step,
+	ending:   [dynamic]^Pane, // checked terminals; nil for one closed meanwhile
+	check:    ^Programs_Check,
+}
+
+Programs_Step :: enum {
+	Unchecked,
+	Checking,  // the check's thread lists them (unsaved_frame)
+	Asking,    // the dialog asks whether to end them
+	Confirmed, // none run, or ending them was confirmed
 }
 
 
@@ -370,12 +408,20 @@ unsaved_reset :: proc() {
 	u.then = nil
 	u.waiting = false
 	clear(&u.asking)
+
+	programs_check_release(u.check)
+	u.check = nil
+	u.programs = .Unchecked
+	clear(&u.ending)
 }
 
 
-// Per frame: goes on once the writes the flow waits for have landed
+// Per frame: goes on once the writes the flow waits for have landed, or the
+// programs in the terminals were listed
 unsaved_frame :: proc() {
-	if g.unsaved.waiting && !saves_pending() {
+	u := &g.unsaved
+	listed := u.programs == .Checking && programs_check_done(u.check)
+	if (u.waiting && !saves_pending()) || listed {
 		unsaved_next()
 	}
 }
@@ -403,7 +449,13 @@ unsaved_forget :: proc(p: ^Pane) {
 	if i, found := slice.linear_search(u.asking[:], p); found {
 		ordered_remove(&u.asking, i)
 	}
+	if i, found := slice.linear_search(u.ending[:], p); found {
+		u.ending[i] = nil // still the check's i-th shell
+	}
 	if closing, ok := u.then.(Closing_Pane); ok && (^Pane)(closing) == p {
+		u.then = nil
+	}
+	if repin, ok := u.then.(Repinning); ok && repin.pane == p {
 		u.then = nil
 	}
 }
@@ -436,25 +488,144 @@ unsaved_next :: proc() {
 		return
 	}
 
-	// Nothing left to do: its pane closed meanwhile
-	if u.then == nil do return
+	// Nothing left to do: its pane closed meanwhile (a check under way is let go)
+	if u.then == nil {
+		unsaved_reset()
+		return
+	}
+
+	// Programs running in terminals it ends are asked about
+	if u.programs != .Confirmed {
+		check_programs()
+		if u.programs != .Confirmed do return
+	}
 
 	switch t in u.then {
 	case Closing_Pane:
 		pane_close((^Pane)(t), ask = false)
 
 	case Open_Folder:
-		for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
-			p := g.panes.open[i]
-			if is_editor(p) do pane_close(p, ask = false)
-		}
+		project_leave()
 		open_folder(string(t))
 
 	case Quit:
 		g.quit = true
+
+	case Repinning:
+		terminal_repin(t.pane, t.pinned)
 	}
 
 	unsaved_reset()
+}
+
+
+// The flow's step for running programs: starts listing what runs in the
+// terminals it ends, then, once listed, asks if any runs a program
+@(private = "file")
+check_programs :: proc() {
+	u := &g.unsaved
+
+	switch u.programs {
+	case .Unchecked:
+		append(&u.ending, ..terminals_ended_by(u.then))
+		if len(u.ending) == 0 {
+			u.programs = .Confirmed
+			return
+		}
+		u.check = programs_check_start(u.ending[:])
+		u.programs = .Checking
+
+	case .Checking:
+		if !programs_check_done(u.check) do return
+
+		// The terminals that run one, each with the first it runs
+		running := make([dynamic]^Pane, context.temp_allocator)
+		names := make([dynamic]string, context.temp_allocator)
+		for p, i in u.ending {
+			name := programs_check_first(u.check, i)
+			if p == nil || name == "" {
+				continue
+			}
+
+			append(&running, p)
+			append(&names, strings.clone(name, context.temp_allocator))
+		}
+		programs_check_release(u.check)
+		u.check = nil
+
+		if len(running) == 0 {
+			u.programs = .Confirmed
+			return
+		}
+		u.programs = .Asking
+		ask_ending_programs(running[:], names[:])
+
+	case .Asking, .Confirmed:
+	}
+}
+
+
+// Asks whether to end the programs running in terminals, naming them
+@(private = "file")
+ask_ending_programs :: proc(running: []^Pane, names: []string) {
+	u := &g.unsaved
+
+	// What ends them
+	title, button, doing: string
+	switch t in u.then {
+	case Closing_Pane:
+		title, button, doing = "Close the terminal?", "Close terminal", "Closing the terminal"
+	case Open_Folder:
+		title, button, doing = "Open another folder?", "Open folder", "Opening another folder"
+	case Quit:
+		title, button, doing = "Quit typo?", "Quit", "Quitting"
+	case Repinning:
+		if t.pinned {
+			title, button = "Pin the terminal?", "Pin"
+			doing = "Pinning restarts the terminal in herdr-core, which"
+		} else {
+			title, button = "Unpin the terminal?", "Unpin"
+			doing = "Unpinning restarts the terminal here, which"
+		}
+	}
+
+	message: string
+	if len(running) == 1 {
+		place := pane_title(running[0])
+		message = fmt.tprintf("%s is still running in %s. %s ends it.", names[0], place, doing)
+	} else {
+		list := strings.join(names, ", ", context.temp_allocator)
+		message = fmt.tprintf(
+			"Programs are still running in %d terminals (%s). %s ends them.",
+			len(running),
+			list,
+			doing,
+		)
+	}
+
+	dialog_show(
+		title,
+		message,
+		.Terminal,
+		{{button, .Danger}, {"Cancel", .Normal}},
+		focus = 1,
+		cancel = 1,
+		purpose = Ending_Programs{},
+	)
+}
+
+
+// End them, or Cancel
+@(private = "file")
+programs_answer :: proc(confirmed: bool) {
+	u := &g.unsaved
+	if !confirmed || u.programs != .Asking {
+		unsaved_reset()
+		return
+	}
+
+	u.programs = .Confirmed
+	unsaved_next()
 }
 
 
@@ -487,27 +658,24 @@ unsaved_answer :: proc(p: ^Pane, choice: int) {
 
 // --- Files -------------------------------------------------------------------------
 
-// Asks before deleting a file or folder: to the Recycle Bin, or, where there is
-// none or the item can't go there, permanently
-ask_delete_file :: proc(path: string, permanent := !DELETE_TO_TRASH) {
+// Asks before deleting a file or folder: to the trash, or, when the item
+// can't go there, permanently
+ask_delete_file :: proc(path: string, permanent := false) {
 	name := filepath.base(path)
-	what := os.is_dir(path) ? "The folder and everything in it" : "The file"
+	what := workspace_is_folder(&g.workspace, path) ? "The folder and everything in it" : "The file"
 
 	message, button: string
-	switch {
-	case !permanent:
-		message = fmt.tprintf("%s will be moved to the Recycle Bin.", what)
-		button = "Move to Recycle Bin"
-	case DELETE_TO_TRASH:
+	if permanent {
 		message = fmt.tprintf(
-			"%s can't be moved to the Recycle Bin, so it would be deleted permanently. %s",
+			"%s can't be moved to the %s, so it would be deleted permanently. %s",
 			what,
+			TRASH_NAME,
 			"This can't be undone.",
 		)
 		button = "Delete permanently"
-	case:
-		message = fmt.tprintf("%s will be deleted permanently. This can't be undone.", what)
-		button = "Delete"
+	} else {
+		message = fmt.tprintf("%s will be moved to the %s.", what, TRASH_NAME)
+		button = fmt.tprintf("Move to %s", TRASH_NAME)
 	}
 
 	// Unsaved changes in it go too
@@ -520,7 +688,7 @@ ask_delete_file :: proc(path: string, permanent := !DELETE_TO_TRASH) {
 		}
 	}
 
-	title := permanent && DELETE_TO_TRASH ? "Delete \"%s\" permanently?" : "Delete \"%s\"?"
+	title := permanent ? "Delete \"%s\" permanently?" : "Delete \"%s\"?"
 	buttons := []Dialog_Button{{button, .Danger}, {"Cancel", .Normal}}
 	dialog_show(
 		fmt.tprintf(title, name),
@@ -534,15 +702,22 @@ ask_delete_file :: proc(path: string, permanent := !DELETE_TO_TRASH) {
 }
 
 
-ask_reset_settings :: proc() {
+// Asks before resetting the user's settings, or removing the project's values
+ask_reset_settings :: proc(scope := Settings_Scope.User) {
+	message := "Reset all settings, including keybindings, to their defaults?"
+	if scope == .Project {
+		message = "Remove every setting this project sets, so yours apply? Its pinned " +
+		          "files stay."
+	}
+
 	dialog_show(
 		"Reset settings",
-		"Reset all settings, including keybindings, to their defaults?",
+		message,
 		.Alert,
 		{{"Reset all", .Danger}, {"Cancel", .Normal}},
 		focus = 1,
 		cancel = 1,
-		purpose = Reset_Settings{},
+		purpose = Reset_Settings{scope},
 	)
 }
 

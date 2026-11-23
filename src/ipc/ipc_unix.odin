@@ -227,3 +227,28 @@ wait_ready :: proc(conn: ^Conn, events: posix.Poll_Event, timeout_ms: u32) -> bo
 interrupted :: proc(result: int) -> bool {
 	return result < 0 && posix.errno() == .EINTR
 }
+
+
+// The registry of endpoints by project (projects.odin): a folder in the
+// user's runtime folder that only the user may use, or "". One someone else
+// made, or others may enter, is refused
+@(private)
+registry_root :: proc(create: bool) -> string {
+	base := os.get_env("XDG_RUNTIME_DIR", context.temp_allocator)
+	if base == "" do base = os.get_env("TMPDIR", context.temp_allocator)
+	if base == "" do base = "/tmp"
+	base = strings.trim_right(base, "/")
+	root := fmt.tprintf("%s/typo-projects-%d", base, posix.getuid())
+	path := strings.clone_to_cstring(root, context.temp_allocator)
+
+	st: posix.stat_t
+	if posix.lstat(path, &st) != .OK {
+		if !create do return ""
+		if posix.mkdir(path, {.IRUSR, .IWUSR, .IXUSR}) != .OK do return ""
+		if posix.lstat(path, &st) != .OK do return ""
+	}
+
+	private := posix.S_ISDIR(st.st_mode) && st.st_uid == posix.getuid()
+	others := st.st_mode & {.IRGRP, .IWGRP, .IXGRP, .IROTH, .IWOTH, .IXOTH}
+	return private && others == {} ? root : ""
+}

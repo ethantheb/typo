@@ -66,6 +66,15 @@ test_events_gather_by_folder :: proc(t: ^testing.T) {
 	pending_add(&p, ROOT, {in_root("node_modules"), .Added}, at_ms(40))
 	testing.expect_value(t, p.count, 6)
 
+	// typo saving the project's state: dropped. Its settings count
+	session := in_root(PROJECT_DIR + SEP + PROJECT_SESSION)
+	session_tmp := strings.concatenate({session, ".tmp"}, context.temp_allocator)
+	pending_add(&p, ROOT, {session, .Modified}, at_ms(45))
+	pending_add(&p, ROOT, {session_tmp, .Added}, at_ms(45))
+	testing.expect_value(t, p.count, 6)
+	pending_add(&p, ROOT, {in_root(PROJECT_DIR + SEP + PROJECT_SETTINGS), .Modified}, at_ms(45))
+	testing.expect_value(t, p.count, 7)
+
 	// A file, or a folder it is in
 	key := path_key(in_root("src" + SEP + "a.odin"), context.temp_allocator)
 	testing.expect(t, pending_touches(&p, key))

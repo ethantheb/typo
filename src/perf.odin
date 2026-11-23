@@ -11,9 +11,11 @@ import "core:time"
 
 import "buffer"
 import "fuzzy"
+import "herdr"
 import "langs"
 import "lsp"
 import "markdown"
+import "process"
 import "syntax"
 import "term"
 import clay "../vendor/clay-odin"
@@ -22,6 +24,7 @@ import ttf "../vendor/sdl3/ttf"
 import "gfx"
 import "textedit"
 import "mdview"
+import "uitime"
 import "words"
 
 // The performance suite: `typo --perf` (run by `python build.py --test` on an
@@ -54,6 +57,8 @@ Perf :: struct {
 	frames:           [dynamic]Frame_Time, // of the current phase
 	lsp_times:        [dynamic]f64,        // language server work on the UI thread, per frame
 	words_times:      [dynamic]f64,        // word completion work on the UI thread, per frame
+	herdr_times:      [dynamic]f64,        // herdr-core client work on the UI thread, per frame
+	git_times:        [dynamic]f64,        // Git and diff view work on the UI thread, per frame
 	frame_t0:         time.Tick,           // when the current frame's work began
 	marks:            [Frame_Part]time.Tick,
 	first_present_ns: i64,
@@ -62,6 +67,8 @@ Perf :: struct {
 	results:          int,
 	failures:         [dynamic]string,
 	window_size:      [2]i32, // before a resizing phase
+	clay_errors:      int,    // Clay's error count when the phase began
+	most_clips:       int,    // the most clipping elements a frame of the phase drew
 
 	// Terminal output phase
 	flood_parsed:     u64,
@@ -95,6 +102,12 @@ Phase :: struct {
 	// Limit (ms) on the word completion work done on the UI thread in any frame
 	// (taking and asking for words, filtering them); 0 = not reported
 	words_limit: f64,
+	// Limit (ms) on the herdr-core client's work on the UI thread in any frame
+	// (persistent terminals' output, input and state); 0 = not reported
+	herdr_limit: f64,
+	// Limit (ms) on the Git work done on the UI thread in any frame (taking the
+	// worker's and the diff loader's results, asking for changes); 0 = not reported
+	git_limit:   f64,
 	idle:        bool, // let the app sleep between frames
 }
 
@@ -157,7 +170,17 @@ PHASES := [?]Phase {
 	{name = "several bindings for a command", step = phase_settings_bindings},
 	{name = "context menu and dialogs", step = phase_menu_dialogs},
 	{name = "sidebar behind the panes, its search", step = phase_sidebar, frame_limit = 8},
+	{name = "recent and pinned files, project settings", step = phase_recent},
 	{name = "files changed on disk", step = phase_disk_changes}, // perf_watch.odin
+	{name = "Git pane on a repository", step = phase_git_pane, git_limit = 1}, // perf_git.odin
+	{
+		name        = "scrolling a diff of a large file",
+		step        = phase_git_diff_scroll,
+		frame_limit = 8,
+		git_limit   = 1,
+	},
+	{name = "reverting and staging hunks", step = phase_git_hunks, git_limit = 1},
+	{name = "narrow Git and diff panes", step = phase_git_narrow, git_limit = 1},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
 	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},
@@ -188,6 +211,13 @@ PHASES := [?]Phase {
 	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
 	{name = "pane title bar and mouse buttons", step = phase_pane_header},
 	{name = "typo <file> in the terminal", step = phase_ipc_open},
+	{name = "closing a terminal that runs a program", step = phase_terminal_close},
+	{
+		name        = "persistent terminal (herdr-core)",
+		step        = phase_persistent_terminal,
+		herdr_limit = 1,
+	},
+	{name = "recent projects popup", step = phase_project_picker},
 	{name = "go to line", step = phase_goto_line},
 	{name = "text fields with the mouse and keys", step = phase_text_fields},
 	{name = "zooming panes", step = phase_zoom_panes},
@@ -262,6 +292,8 @@ perf_end :: proc() {
 	delete(p.frames)
 	delete(p.lsp_times)
 	delete(p.words_times)
+	delete(p.herdr_times)
+	delete(p.git_times)
 	for f in p.failures do delete(f)
 	delete(p.failures)
 	delete(p.read_back)
@@ -308,11 +340,17 @@ perf_frame :: proc() -> (done, ok: bool) {
 			prev = p.marks[part]
 		}
 		append(&p.frames, t)
-		append(&p.lsp_times, time.duration_milliseconds(langs.state.ui_time))
-		append(&p.words_times, time.duration_milliseconds(words_ui_time))
+		p.most_clips = max(p.most_clips, g.frame_clips)
+		append(&p.lsp_times, time.duration_milliseconds(langs.ui_share.total))
+		append(&p.words_times, time.duration_milliseconds(words_ui.total))
+		append(&p.herdr_times, time.duration_milliseconds(herdr.ui_share.total))
+		append(&p.git_times, time.duration_milliseconds(git_ui.total))
 	}
-	langs.state.ui_time = 0
-	words_ui_time = 0
+
+	// Each frame's from zero
+	for share in ([]^uitime.Share{&langs.ui_share, &words_ui, &herdr.ui_share, &git_ui}) {
+		uitime.take(share)
+	}
 
 	// This frame's step, moving on to the next phase when one finishes
 	for p.phase < len(PHASES) {
@@ -346,16 +384,40 @@ start_phase :: proc(p: ^Perf) {
 	clear(&p.frames)
 	clear(&p.lsp_times)
 	clear(&p.words_times)
+	clear(&p.herdr_times)
+	clear(&p.git_times)
 
+	p.clay_errors = g.clay_errors.count
+	p.most_clips = 0
 	gpu_counter_start(&p.gpu) // first: querying the counters costs CPU time
 	p.phase_t0 = time.tick_now()
 	p.cpu0 = process_cpu_ns()
 }
 
 
+// The most clipping elements a frame may draw: Clay's store holds about 100,
+// and a changed list's old rows linger in it a frame
+@(private = "file")
+CLIP_LIMIT :: 80
+
+
 @(private = "file")
 finish_phase :: proc(p: ^Perf) {
 	phase := PHASES[p.phase]
+
+	// Whatever a phase does, Clay must lay it out without an error, and its
+	// clipping elements stay well under Clay's store (see ROW_CLIP_BUDGET)
+	errors := g.clay_errors.count - p.clay_errors
+	if errors > 0 {
+		last := string(g.clay_errors.last[:g.clay_errors.last_len])
+		fmt.printfln("  %d Clay errors, the last %v: %s", errors, g.clay_errors.kind, last)
+	}
+	check(p, "Clay lays it out without an error", errors == 0)
+	if p.most_clips >= CLIP_LIMIT {
+		fmt.printfln("  %d clipping elements in a frame", p.most_clips)
+	}
+	check(p, "and with clipping elements to spare", p.most_clips < CLIP_LIMIT)
+
 	if phase.lsp_limit > 0 {
 		worst := slice.max(p.lsp_times[:]) if len(p.lsp_times) > 0 else 0
 		result(p, "language servers, UI thread, worst", worst, "ms", phase.lsp_limit)
@@ -363,6 +425,14 @@ finish_phase :: proc(p: ^Perf) {
 	if phase.words_limit > 0 {
 		worst := slice.max(p.words_times[:]) if len(p.words_times) > 0 else 0
 		result(p, "word completions, UI thread, worst", worst, "ms", phase.words_limit)
+	}
+	if phase.herdr_limit > 0 {
+		worst := slice.max(p.herdr_times[:]) if len(p.herdr_times) > 0 else 0
+		result(p, "herdr-core client, UI thread, worst", worst, "ms", phase.herdr_limit)
+	}
+	if phase.git_limit > 0 {
+		worst := slice.max(p.git_times[:]) if len(p.git_times) > 0 else 0
+		result(p, "Git, UI thread, worst", worst, "ms", phase.git_limit)
 	}
 
 	limit := phase.frame_limit
@@ -659,7 +729,7 @@ read_ink :: proc(s: string, alpha: f32) -> (ink: Ink) {
 
 // Asks for an area of this frame (logical pixels) once it is drawn, in
 // p.read_back by the next frame's step
-@(private = "file")
+@(private)
 want_frame :: proc(p: ^Perf, r: gfx.Rect) {
 	s := gfx.scale
 	p.read_area = {i32(r.x * s), i32(r.y * s), i32(r.w * s), i32(r.h * s)}
@@ -1591,7 +1661,6 @@ phase_finder_ranks :: proc(p: ^Perf, frame: int) -> bool {
 	sep := os.Path_Separator
 	alpha := path_in_dir(p, fmt.tprintf("ranked%calpha%cdata.txt", sep, sep))
 	omega := path_in_dir(p, fmt.tprintf("ranked%comega%cdata.txt", sep, sep))
-	root := g.workspace.root
 
 	if frame == 0 {
 		// The two equal files, indexed again
@@ -1608,8 +1677,8 @@ phase_finder_ranks :: proc(p: ^Perf, frame: int) -> bool {
 			code = panes_open_file_beside(path_in_dir(p, "code.odin"))
 		}
 		pane_focus(focused)
-		recent_add(&g.recent, root, path_in_dir(p, "long.js"))
-		recent_add(&g.recent, root, path_in_dir(p, "flood.txt"))
+		recent_add(&g.recent,path_in_dir(p, "long.js"))
+		recent_add(&g.recent,path_in_dir(p, "flood.txt"))
 
 		finder_toggle()
 		step, p.mark_frame = 1, frame
@@ -1641,7 +1710,7 @@ phase_finder_ranks :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "an open file is marked open", ranked && rank.open)
 
 		// omega/ used recently
-		recent_add(&g.recent, root, omega)
+		recent_add(&g.recent,omega)
 		reopen_finder("data")
 		next_step(p, &step, frame)
 
@@ -1651,7 +1720,7 @@ phase_finder_ranks :: proc(p: ^Perf, frame: int) -> bool {
 
 		// alpha/ instead
 		recent_forget(&g.recent, omega)
-		recent_add(&g.recent, root, alpha)
+		recent_add(&g.recent,alpha)
 		reopen_finder("data")
 		next_step(p, &step, frame)
 
@@ -2115,7 +2184,19 @@ phase_settings_bindings :: proc(p: ^Perf, frame: int) -> bool {
 		only := bindings_label(b[.Toggle_Sidebar], " ") == "Ctrl+B"
 		check(p, "a press on a chip's x removes its binding", only)
 
+		// Its terminal toggle; editor commands have none
+		_, editor_toggle := element_rect(clay.ID("BindingTerminal", u32(Command.Save)))
+		check(p, "editor commands have no terminal toggle", !editor_toggle)
+		click_element(clay.ID("BindingTerminal", u32(Command.Toggle_Sidebar)))
+		next_step(p, &step, frame)
+
+	case 7:
+		on := .Toggle_Sidebar in g.settings.terminal_commands
+		_, reset := element_rect(clay.ID("BindingReset", u32(Command.Toggle_Sidebar)))
+		check(p, "a press on the terminal toggle sets it, and Reset shows", on && reset)
+
 		// The defaults back
+		set_terminal_command(.Toggle_Sidebar, false)
 		b[.Toggle_Sidebar] = default_bindings(.Toggle_Sidebar)
 		b[.Go_To_Line] = default_bindings(.Go_To_Line)
 		settings_changed()
@@ -2190,6 +2271,18 @@ clipped_point :: proc(r: gfx.Rect) -> (at: [2]f32, found: bool) {
 MENU_SHOW_TIME :: 700 * time.Millisecond
 
 
+// Where the open context menu has the item that runs `cmd`, or -1
+@(private = "file")
+menu_item_index :: proc(cmd: Menu_Command) -> int {
+	for item, i in g.menu.items[:g.menu.count] {
+		if !item.separator && item.cmd == cmd {
+			return i
+		}
+	}
+	return -1
+}
+
+
 // Right-clicks a file in the tree, picks Rename, types a new name in place of
 // the selected one (the name before the extension) and presses Enter; then
 // edits that file and closes it, answering "Don't save"; then makes a new file
@@ -2244,9 +2337,9 @@ phase_menu_dialogs :: proc(p: ^Perf, frame: int) -> bool {
 	case 1: // the menu is open; click Rename
 		if menu_still_showing(since) do return false
 
-		menu_open := g.menu.open && g.menu.items[0].cmd == .Rename_File
-		check(p, "right-click opens the menu", menu_open)
-		at, _ := element_center(clay.ID("MenuItem", 0))
+		rename := menu_item_index(.Rename_File)
+		check(p, "right-click opens the menu", g.menu.open && rename >= 0)
+		at, _ := element_center(clay.ID("MenuItem", u32(max(rename, 0))))
 		g.mouse_pos, g.mouse_pressed = at, true
 		step, since = 2, time.tick_now()
 
@@ -2439,9 +2532,12 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) row_at: [2]f32  // a folder's row, while shown
 	@(static) before: string  // the file open before, reopened at the end
 	@(static) mouse: [2]f32
+	@(static) early: gfx.Rect // the search's popup as it opens
 	sep := os.Path_Separator
 	folder := path_in_dir(p, "sidebar_dir")
-	target := path_in_dir(p, fmt.tprintf("sidebar_dir%cdeep%csidebar_target.txt", sep, sep))
+	// In a folder whose name makes its row in the search's popup wider than it
+	deep := "deep_folder_with_a_name_long_enough_to_make_its_row_wider_than_the_popup"
+	target := path_in_dir(p, fmt.tprintf("sidebar_dir%c%s%csidebar_target.txt", sep, deep, sep))
 	below := path_in_dir(p, "sidebar_below.txt")
 
 	if frame == 0 {
@@ -2462,8 +2558,8 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 		p.mark_frame = frame
 		return false
 	}
-	// Step 4 looks while the panes slide back
-	sliding := step == 4
+	// Step 4 looks while the panes slide back, step 6 while the popup opens
+	sliding := step == 4 || step == 6
 	if (g.animating && !sliding) || frame < p.mark_frame + 2 {
 		return false
 	}
@@ -2540,14 +2636,37 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 		g.mouse_pos, g.mouse_pressed, g.mouse_down, g.mouse_clicks = at, true, true, 1
 		next_step(p, &step, frame)
 
-	case 6: // type a query
+	case 6: // the popup opens, growing
 		g.mouse_down = false
-		check(p, "a press on the field gives it keys", s.typing)
+		check(p, "a press on the field opens its popup", s.open)
+
+		early, _ = element_rect(clay.ID("SidebarSearchPopup"))
+		next_step(p, &step, frame)
+
+	case 7: // grown out of the field, which stays in place; open files first
+		if sidebar_search_busy() do return false
+
+		popup, _ := element_rect(clay.ID("SidebarSearchPopup"))
+		grew := early.h > 0 && early.h < popup.h && early.w < popup.w
+		check(p, "the popup grows as it opens", grew)
+		check(p, "and reaches over the panes", popup.x + popup.w > area.x)
+
+		slot, _ := element_rect(clay.ID("SidebarSearchSlot"))
+		field, _ := element_rect(clay.ID("SidebarSearch"))
+		check(p, "its field is where the sidebar's was", field.x == slot.x && field.y == slot.y)
+
+		results := s.search.results
+		open_first := false
+		if len(results) > 0 {
+			rank, ranked, _ := search_file_rank(&s.search, results[0].index)
+			open_first = ranked && rank.open
+		}
+		check(p, "with no query it lists the open files first", open_first)
 
 		type_text("sidebar_target")
 		next_step(p, &step, frame)
 
-	case 7: // the files match in place of the tree; press the one found
+	case 8: // the files match in the popup, the tree stays; press the one found
 		if sidebar_search_busy() do return false
 
 		_, listed := element_rect(clay.ID("SidebarResults"))
@@ -2555,38 +2674,49 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 		found := listed && len(results) > 0 && same_path(g.finder.files[results[0].index], target)
 		check(p, "typing lists the matching files", found)
 
+		_, tree := element_rect(clay.ID("SidebarFiles"))
+		check(p, "and the tree stays in the sidebar", tree)
+
+		// A row wider than the popup cuts its text, and leaves the field alone
+		popup, _ := element_rect(clay.ID("SidebarSearchPopup"))
+		field, _ := element_rect(clay.ID("SidebarSearch"))
+		clear, _ := element_rect(clay.ID("SidebarSearchClear"))
+		right := popup.x + popup.w
+		inside := field.x + field.w <= right && clear.x + clear.w <= right
+		check(p, "a long path keeps the field and its clear button in the popup", inside)
+
 		at, _ := element_center(search_row_id(target))
 		g.mouse_pos, g.mouse_pressed, g.mouse_down, g.mouse_clicks = at, true, true, 1
 		next_step(p, &step, frame)
 
-	case 8:
+	case 9:
 		g.mouse_down = false
 		next_step(p, &step, frame)
 
-	case 9: // opened and focused; the search closed; then Enter on a query
+	case 10: // opened and focused; the popup closed; then Enter on a query
 		e := focused_editor()
 		opened := e != nil && same_path(e.path, target)
 		check(p, "a press on a result opens it", opened)
-		check(p, "and closes the search", !sidebar_search_active() && !s.typing)
+		check(p, "and closes the popup", !s.open && len(s.field.text) == 0)
 
 		if pane := pane_with_file(target); pane != nil {
 			pane_close(pane, ask = false)
 		}
-		s.typing = true
+		sidebar_search_open()
 		type_text("sidebar_target")
 		next_step(p, &step, frame)
 
-	case 10: // Enter opens the first match
+	case 11: // Enter opens the first match
 		if sidebar_search_busy() do return false
 
 		press(sdl.K_RETURN)
 		next_step(p, &step, frame)
 
-	case 11: // opened, and the search closed; then Escape on a query
+	case 12: // opened, and the popup closed; then Escape on a query
 		e := focused_editor()
 		opened := e != nil && same_path(e.path, target)
 		check(p, "Enter opens the first match", opened)
-		check(p, "and closes the search", !sidebar_search_active() && !s.typing)
+		check(p, "and closes the popup", !s.open && len(s.field.text) == 0)
 
 		// The tree selects the focused file's row, and none while a terminal is focused
 		file_selected := opened && same_path(tree_selected_file(), target)
@@ -2596,22 +2726,22 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "the tree selects the focused file", file_selected)
 		check(p, "and nothing while a terminal is focused", none_selected)
 
-		s.typing = true
+		sidebar_search_open()
 		type_text("sidebar")
 		press(sdl.K_ESCAPE)
 		next_step(p, &step, frame)
 
-	case 12:
-		_, tree := element_rect(clay.ID("SidebarFiles"))
-		back := tree && !sidebar_search_active() && !s.typing
-		check(p, "Escape brings the tree back", back)
+	case 13:
+		_, popup := element_rect(clay.ID("SidebarSearchPopup"))
+		closed := !popup && !s.open && len(s.field.text) == 0
+		check(p, "Escape empties the field and closes the popup", closed)
 
-		// The empty field shows Find file's key, which gives the field the keys
+		// The empty field shows Find file's key, which opens the popup
 		_, hint := element_rect(clay.ID("SidebarSearchHint"))
 		check(p, "the empty field shows Find file's key", hint)
 		run_command(.Find_File)
-		check(p, "Find file gives the field the keys", s.typing && !g.finder.open)
-		s.typing = false
+		check(p, "Find file opens the popup", s.open && !g.finder.open)
+		sidebar_search_close()
 
 		// With the sidebar hidden, Find file opens the finder
 		g.sidebar_visible = false
@@ -2733,6 +2863,295 @@ menu_still_showing :: proc(since: time.Tick) -> bool {
 element_center :: proc(id: clay.ElementId) -> (c: [2]f32, ok: bool) {
 	r := element_rect(id) or_return
 	return {r.x + r.w / 2, r.y + r.h / 2}, true
+}
+
+
+// RECENT and pinned files, and the project's settings. The files used show
+// under RECENT, newest first, above TERMINALS and lined up with its rows, the
+// focused one drawn selected. A right-click pins one: it goes first, once, and
+// is written to .typo/settings.toml in a folder made with its .gitignore. In
+// Project scope the settings window lists no keybindings or user-only
+// settings; a change there is the project's, written to its file, and leaves
+// the user's value; Delete has it follow the user's again. A length of 0
+// leaves only the pinned files, and RECENT hides with none. The scope switch
+// takes the theme's colors, dark and light. Each state stays up a moment so
+// the window can be looked at
+@(private = "file")
+phase_recent :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) since: time.Tick
+	@(static) before: string // the file open before, reopened at the end
+	@(static) shelved: ^Pane // a terminal on the shelf, whose row RECENT's line up with
+	sep := os.Path_Separator
+	files := [3]string {
+		path_in_dir(p, fmt.tprintf("recent_dir%cone.txt", sep)),
+		path_in_dir(p, fmt.tprintf("recent_dir%ctwo.txt", sep)),
+		path_in_dir(p, fmt.tprintf("recent_dir%cthree.txt", sep)),
+	}
+	one, three := files[0], files[2]
+	settings_path := project_file(g.project.root, PROJECT_SETTINGS)
+	default_count := SETTINGS[.Recent_Files].default.(int)
+	s := &g.settings
+	w := &g.settings_window
+
+	if frame == 0 {
+		step = 0
+		if e := focused_editor(); e != nil {
+			before = strings.clone(e.path)
+		}
+
+		// Three files used, the last one focused, and a terminal on the shelf
+		_ = os.make_directory_all(parent_dir(one))
+		for path in files {
+			_ = os.write_entire_file(path, transmute([]u8)string("recent\n"))
+			open_loaded(path)
+		}
+		shelved = panes_add_terminal()
+		g.sidebar_visible = true
+		workspace_refresh(&g.workspace)
+		p.mark_frame = frame
+		return false
+	}
+	if g.animating || frame < p.mark_frame + 2 {
+		return false
+	}
+	waited := frame - p.mark_frame
+
+	switch step {
+	case 0: // RECENT lists them above TERMINALS, lined up with its rows
+		rows := recent_rows()
+		newest := len(rows) >= 3 && same_path(rows[0].path, three) && same_path(rows[2].path, one)
+		check(p, "RECENT lists the files used, newest first", newest)
+
+		section, shown := element_rect(clay.ID("Recent"))
+		shelf, _ := element_rect(clay.ID("Shelf"))
+		check(p, "RECENT sits above TERMINALS", shown && section.y + section.h <= shelf.y)
+
+		row, _ := element_rect(recent_row_id(three))
+		terminal, _ := element_rect(clay.ID("ShelfRow", shelved.id))
+		lined_up := row.x == terminal.x && row.w == terminal.w && row.h == terminal.h
+		check(p, "its rows line up with the shelf's", lined_up)
+
+		want_frame(p, row)
+		next_step(p, &step, frame)
+
+	case 1: // the focused file's row drawn selected; right-click the oldest
+		selected := read_back_is(p, gfx.theme.selected)
+		check(p, "the focused file's row is drawn selected", selected)
+
+		at, _ := element_center(recent_row_id(one))
+		g.mouse_pos, g.right_pressed = at, true
+		next_step(p, &step, frame)
+
+	case 2: // the menu offers Pin
+		check(p, "a row's menu offers Pin", g.menu.open && g.menu.items[0].cmd == .Pin_File)
+		click_element(clay.ID("MenuItem", 0))
+		next_step(p, &step, frame)
+
+	case 3: // pinned: first, with a pin, and listed once
+		rows := recent_rows()
+		listed := 0
+		for row in rows {
+			if same_path(row.path, one) do listed += 1
+		}
+		first := len(rows) > 0 && rows[0].pinned && same_path(rows[0].path, one)
+		check(p, "Pin puts the file first, listed once", first && listed == 1)
+		next_step(p, &step, frame)
+
+	case 4: // written, once the config thread has
+		written := file_has(settings_path, `"recent_dir/one.txt"`)
+		if !written && waited < WRITE_WAIT_FRAMES {
+			return false
+		}
+
+		check(p, "a pin is written to .typo/settings.toml", written)
+		ignore := project_file(g.project.root, ".gitignore")
+		check(p, "in a folder made with a .gitignore", file_has(ignore, TYPO_GITIGNORE))
+		since = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 5: // shown a moment; then the settings in Project scope, every section open
+		if menu_still_showing(since) do return false
+
+		set_string(&s.user.collapsed_sections, "")
+		settings_resolve(s)
+		settings_window_toggle()
+		next_step(p, &step, frame)
+
+	case 6:
+		click_element(scope_switch_side(.Project))
+		next_step(p, &step, frame)
+
+	case 7: // only what a project may set; its recent files down to 0
+		check(p, "the switch shows the project's settings", w.scope == .Project)
+		check(p, "Project scope lists no keybindings", count_items(Command) == 0)
+		users := false
+		for item in w.items {
+			x, is_setting := item.(Setting)
+			users ||= is_setting && SETTINGS[x].user_only
+		}
+		check(p, "nor settings that are the user's only", !users)
+
+		focus_item(Setting.Recent_Files)
+		for _ in 0 ..< default_count do press(sdl.K_LEFT)
+		next_step(p, &step, frame)
+
+	case 8: // the project's value, the user's kept; only the pinned file listed
+		project := .Recent_Files in s.project.set && s.recent_files == 0
+		check(p, "a change in Project scope is the project's", project)
+		check(p, "and leaves the user's value", s.user.recent_files == default_count)
+		rows := recent_rows()
+		check(p, "a length of 0 lists only the pinned files", len(rows) == 1 && rows[0].pinned)
+
+		r, _ := element_rect(scope_switch_side(.Project))
+		want_frame(p, r)
+		next_step(p, &step, frame)
+
+	case 9: // written to the project's file; the switch in the theme's colors
+		written := file_has(settings_path, "recent_files = 0")
+		if !written && waited < WRITE_WAIT_FRAMES {
+			return false
+		}
+
+		check(p, "the project's value is written to its file", written)
+		check(p, "the scope switch takes the theme's colors", read_back_is(p, gfx.theme.selected))
+		since = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 10: // shown a moment; then User scope
+		if menu_still_showing(since) do return false
+
+		click_element(scope_switch_side(.User))
+		since = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 11: // shown a moment; then both again in a light theme
+		if menu_still_showing(since) do return false
+
+		check(p, "the switch shows the user's settings", w.scope == .User)
+		set_string(&s.user.theme, "typo-light")
+		settings_changed()
+		click_element(scope_switch_side(.Project))
+		next_step(p, &step, frame)
+
+	case 12:
+		r, _ := element_rect(scope_switch_side(.Project))
+		want_frame(p, r)
+		next_step(p, &step, frame)
+
+	case 13:
+		light := read_back_is(p, gfx.theme.selected) && !gfx.THEMES[theme_at(s.theme)].dark
+		check(p, "and in a light theme", light)
+		since = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 14:
+		if menu_still_showing(since) do return false
+
+		click_element(scope_switch_side(.User))
+		since = time.tick_now()
+		next_step(p, &step, frame)
+
+	case 15: // back to Project scope
+		if menu_still_showing(since) do return false
+
+		click_element(scope_switch_side(.Project))
+		next_step(p, &step, frame)
+
+	case 16: // Delete there: the user's value again
+		focus_item(Setting.Recent_Files)
+		press(sdl.K_DELETE)
+		follows := .Recent_Files not_in s.project.set && s.recent_files == default_count
+		check(p, "Delete has it follow the user's setting again", follows)
+
+		// 0 again, the window closed, and the pinned row's menu
+		for _ in 0 ..< default_count do press(sdl.K_LEFT)
+		settings_window_toggle()
+		at, _ := element_center(recent_row_id(one))
+		g.mouse_pos, g.right_pressed = at, true
+		next_step(p, &step, frame)
+
+	case 17: // the pinned file's menu offers Unpin
+		unpin := g.menu.open && g.menu.items[0].cmd == .Unpin_File
+		check(p, "a pinned row's menu offers Unpin", unpin)
+		click_element(clay.ID("MenuItem", 0))
+		next_step(p, &step, frame)
+
+	case 18: // nothing to list: RECENT hides
+		_, shown := element_rect(clay.ID("Recent"))
+		check(p, "RECENT hides with nothing to list", len(recent_rows()) == 0 && !shown)
+
+		// Back as it was: the project's settings empty, the default theme, the
+		// window showing the user's settings
+		settings_clear_project(s)
+		project_settings_changed()
+		set_string(&s.user.theme, gfx.DEFAULT_THEME)
+		settings_changed()
+		w.scope = .User
+		next_step(p, &step, frame)
+
+	case 19: // once the project's file is empty again
+		emptied := !file_has(settings_path, "recent_files") && !file_has(settings_path, "pinned")
+		if !emptied && waited < WRITE_WAIT_FRAMES {
+			return false
+		}
+
+		check(p, "the project's file follows", emptied)
+		for path in files {
+			pane := pane_with_file(path)
+			if pane != nil do pane_close(pane, ask = false)
+		}
+		pane_close(shelved, ask = false)
+		shelved = nil
+		if before != "" do open_loaded(before)
+		delete(before)
+		before = ""
+		return true
+	}
+	return false
+}
+
+
+// How many frames phase_recent waits for the config thread to write a file
+@(private = "file")
+WRITE_WAIT_FRAMES :: 300
+
+
+// Whether a file holds `text` (perf only: the UI thread reads it)
+@(private = "file")
+file_has :: proc(path, text: string) -> bool {
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	return err == nil && strings.contains(string(data), text)
+}
+
+
+// Whether the middle of the area read back (want_frame), a few pixels in from
+// its left, is the color, give or take a little
+@(private = "file")
+read_back_is :: proc(p: ^Perf, c: clay.Color) -> bool {
+	read := p.read_area
+	if len(p.read_back) != int(read.w * read.h) || read.w < 8 {
+		return false
+	}
+
+	x := int(3 * gfx.scale)
+	y := int(read.h) / 2
+	px := p.read_back[y * int(read.w) + x]
+	return channel_near(px[0], c.r) && channel_near(px[1], c.g) && channel_near(px[2], c.b)
+}
+
+
+@(private = "file")
+channel_near :: proc(a: u8, b: f32) -> bool {
+	return abs(f32(a) - b) <= 6
+}
+
+
+// The theme's index in gfx.THEMES, or the first
+@(private = "file")
+theme_at :: proc(key: string) -> int {
+	i, _ := gfx.theme_index(key)
+	return i
 }
 
 
@@ -2898,6 +3317,23 @@ phase_find_terminal :: proc(p: ^Perf, frame: int) -> bool {
 
 	press(sdl.K_ESCAPE)
 	check(p, "Escape closes the bar", !f.open && len(t.marks) == 0)
+
+	// Toggle sidebar's chord goes to the shell until it is set to work in terminals
+	sidebar := g.sidebar_visible
+	press_chord(.B, sdl.KMOD_LCTRL)
+	shell := g.sidebar_visible == sidebar && focused_terminal() == t
+	check(p, "a command not set for terminals leaves its chord to the shell", shell)
+
+	// cmd.exe typed it as ^B, which the next phases' commands would start with
+	press_chord(.BACKSPACE, {})
+
+	// Set directly: settings_changed would resolve the settings again, dropping the
+	// shell phase_terminal_redraw put in g.settings for the phases after this one
+	g.settings.terminal_commands += {.Toggle_Sidebar}
+	press_chord(.B, sdl.KMOD_LCTRL)
+	check(p, "set to work in terminals, it runs there", g.sidebar_visible != sidebar)
+	g.settings.terminal_commands -= {.Toggle_Sidebar}
+	g.sidebar_visible = sidebar
 	return true
 }
 
@@ -4398,7 +4834,7 @@ phase_lsp_typing :: proc(p: ^Perf, frame: int) -> bool {
 	if frame == 0 {
 		step = 0
 		client^ = nil
-		fake := lsp.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
+		fake := process.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
 		check(p, "the fake server is built", fake != "")
 		if fake == "" do return true
 
@@ -5269,7 +5705,7 @@ phase_lsp_settings :: proc(p: ^Perf, frame: int) -> bool {
 	w := &g.settings_window
 
 	if frame == 0 {
-		fake := lsp.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
+		fake := process.find_executable(PERF_FAKE_SERVER, context.temp_allocator)
 		check(p, "the fake server is built", fake != "")
 		if fake == "" do return true
 		fake, _ = os.get_absolute_path(fake, context.temp_allocator)

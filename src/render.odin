@@ -14,6 +14,7 @@ import "gfx"
 
 render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scale: f32) {
 	gfx.begin_frame()
+	g.frame_clips = 0 // counted for the perf suite (see ROW_CLIP_BUDGET)
 
 	for i in 0 ..< commands.length {
 		cmd := clay.RenderCommandArray_Get(commands, i)
@@ -39,6 +40,7 @@ render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scal
 			gfx.draw_border(b, radius, data.width, data.color, scale)
 
 		case .ScissorStart:
+			g.frame_clips += 1
 			gfx.push_clip({
 				i32(math.round(b.x)),
 				i32(math.round(b.y)),
@@ -68,6 +70,10 @@ render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scal
 				draw_terminal(c, b, scale)
 			case Field_Draw:
 				draw_text_field(c, b, scale)
+			case ^Text_Area:
+				draw_text_area(c, b, scale)
+			case Diff_Draw:
+				draw_diff_side(c, b, scale)
 			}
 
 		case .Image:

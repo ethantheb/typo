@@ -19,6 +19,7 @@ STATUSBAR_HEIGHT :: 24
 
 build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 	clay.BeginLayout()
+	g.row_clips = 0
 
 	if clay.UI(clay.ID("Root"))({
 		layout = {
@@ -32,6 +33,8 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 			panes_ui()
 		}
 		status_bar()
+		sidebar_search_popup()
+		project_picker_ui()
 		finder_ui()
 		settings_window_ui()
 		lsp_hover_ui()
@@ -62,6 +65,7 @@ status_bar :: proc() {
 		backgroundColor = gfx.theme.statusbar,
 	}) {
 		status_buttons()
+		git_status_item()
 
 		// The focused pane
 		if e := focused_editor(); e != nil {
@@ -96,13 +100,19 @@ status_buttons :: proc() {
 			run_command(.Toggle_Sidebar)
 		}
 
+		// With a pin while new terminals are pinned; right-click picks which
+		// (context_menu.odin)
+		pinned := persist_wanted()
+		badge: Maybe(gfx.Icon_Badge)
+		if pinned do badge = gfx.Icon_Badge{.Pin, gfx.theme.accent}
 		if icon_button(
 			clay.ID("TerminalToggle"),
 			.Terminal,
 			20,
 			15,
-			"Toggle terminal",
+			pinned ? "Toggle terminal · new terminals are pinned" : "Toggle terminal",
 			first_chord_label(.Toggle_Terminal),
+			badge,
 		) {
 			defer_action(Run_Command(.Toggle_Terminal))
 		}
@@ -200,6 +210,8 @@ update_mouse_cursor :: proc() {
 	case g.over_text_field:
 		want = .TEXT
 	case lsp_rename_covers_pointer(),
+	     search_popup_covers_pointer(),
+	     project_picker_covers_pointer(),
 	     g.finder.open,
 	     g.find.open && pointer_in(clay.ID("FindBar")),
 	     g.settings_window.open && !ui_interactive():

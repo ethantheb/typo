@@ -134,6 +134,13 @@ Terminal_Data :: enum c.int {
 	Mode            = 37,
 }
 
+// Rows of the scrollable area (scrollback and screen), and the viewport in it
+Terminal_Scrollbar :: struct {
+	total:  u64,
+	offset: u64,
+	len:    u64,
+}
+
 Scroll_Viewport_Tag :: enum c.int {
 	Top    = 0,
 	Bottom = 1,
@@ -451,6 +458,8 @@ Mouse_Encoder_Option :: enum c.int {
 foreign vt {
 	terminal_new :: proc(allocator: rawptr, terminal: ^Terminal, cols, rows: u16) -> Result ---
 	terminal_free :: proc(terminal: Terminal) ---
+	// Back to a new terminal's state, scrollback included (as RIS)
+	terminal_reset :: proc(terminal: Terminal) ---
 	terminal_resize :: proc(
 		terminal: Terminal,
 		cols, rows: u16,
@@ -513,7 +522,10 @@ foreign vt {
 		option: Mouse_Encoder_Option,
 		value: rawptr,
 	) -> Result ---
-	mouse_encoder_set_from_terminal :: proc(encoder: Mouse_Encoder, terminal: Terminal) -> Result ---
+	mouse_encoder_set_from_terminal :: proc(
+		encoder: Mouse_Encoder,
+		terminal: Terminal,
+	) -> Result ---
 	mouse_encoder_encode :: proc(
 		encoder: Mouse_Encoder,
 		event: Mouse_Event,
@@ -531,7 +543,11 @@ foreign vt {
 		out_formatter: ^Formatter,
 		terminal: Terminal,
 	) -> Result ---
-	formatter_set :: proc(formatter: Formatter, option: Formatter_Option, value: rawptr) -> Result ---
+	formatter_set :: proc(
+		formatter: Formatter,
+		option: Formatter_Option,
+		value: rawptr,
+	) -> Result ---
 	formatter_format_alloc :: proc(
 		formatter: Formatter,
 		allocator: rawptr,

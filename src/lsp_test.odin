@@ -377,8 +377,8 @@ test_short_path :: proc(t: ^testing.T) {
 }
 
 
-// A save handed to the saver thread is written by the time the settings are
-// destroyed
+// A later save writes the user's settings as they are when it is asked for
+// (at once here: tests don't start the config thread)
 @(test)
 test_settings_saved_later :: proc(t: ^testing.T) {
 	dir := os.temp_directory(context.temp_allocator) or_else "."
@@ -388,9 +388,9 @@ test_settings_saved_later :: proc(t: ^testing.T) {
 	s: Settings
 	settings_reset_all(&s)
 	s.path = strings.clone(path)
-	set_string(&s.theme, "one-light")
+	set_string(&s.user.theme, "one-light")
 	settings_save_later(&s)
-	set_string(&s.theme, "one-dark")
+	set_string(&s.user.theme, "one-dark")
 	settings_save_later(&s)
 	settings_destroy(&s)
 

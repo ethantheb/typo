@@ -436,6 +436,15 @@ pty_exited :: proc(p: ^Pty) -> bool {
 }
 
 
+// The shell's process id, 0 once it exited
+pty_pid :: proc(p: ^Pty) -> int {
+	if p.process == nil || pty_exited(p) {
+		return 0
+	}
+	return int(win.GetProcessId(p.process))
+}
+
+
 // Blocks until the shell writes something. Returns 0 once the console is closed
 pty_read :: proc(p: ^Pty, buf: []u8) -> int {
 	n: win.DWORD

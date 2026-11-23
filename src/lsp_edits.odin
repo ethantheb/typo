@@ -16,6 +16,7 @@ import "buffer"
 import "langs"
 import "lsp"
 import "textedit"
+import "uitime"
 
 
 Lsp_Edits :: struct {
@@ -50,7 +51,7 @@ Write_Failure :: struct {
 // Applies an edit (taking it over): `reply` is the id of the server's request
 // to answer, "" for a rename
 lsp_apply_workspace_edit :: proc(c: ^langs.Client, edit: lsp.Workspace_Edit, reply, what: string) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	edit := edit
 	ed := &g.lsp.edits
 

@@ -111,8 +111,9 @@ rename_focused_pane :: proc() -> bool {
 	if p == nil do return false
 
 	switch c in p.content {
-	case ^Editor:   rename_start_file(c.path, .Title, p)
-	case ^Terminal: rename_start_terminal(p, .Title)
+	case ^Editor:               rename_start_file(c.path, .Title, p)
+	case ^Terminal:             rename_start_terminal(p, .Title)
+	case ^Git_View, ^Diff_View: return false
 	}
 	return true
 }

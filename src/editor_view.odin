@@ -17,7 +17,11 @@ import "textedit"
 // (textedit.Kind)
 
 
-SCROLL_EASE :: 18 // higher settles faster; ~150 ms to settle
+// Scrolling, shared by every scrolling text: the editor, the diff view, the
+// commit message box and lists
+SCROLL_EASE   :: 18 // higher settles faster; ~150 ms to settle
+WHEEL_LINES   :: 3  // lines a wheel notch scrolls a text
+WHEEL_COLUMNS :: 6  // columns a sideways notch scrolls a text
 
 // How long (ns) an opened file waits for images in view to load before it is
 // drawn anyway
@@ -158,9 +162,9 @@ editor_mouse :: proc(e: ^Editor) {
 	if inside && g.wheel != {} {
 		dx, dy := g.wheel.x, g.wheel.y
 		if sdl.GetModState() & sdl.KMOD_SHIFT != {} do dx, dy = dy, 0
-		e.target_y -= f64(dy * 3) * k.scroll_step(e)
+		e.target_y -= f64(dy * WHEEL_LINES) * k.scroll_step(e)
 
-		step_x := dx * 6 * e.char_w
+		step_x := dx * WHEEL_COLUMNS * e.char_w
 		if k.wheel_x == nil || !k.wheel_x(e, p, -step_x) {
 			e.target_x -= step_x
 		}
@@ -324,13 +328,20 @@ editor_animate :: proc(e: ^Editor) {
 		return
 	}
 
-	t := 1 - math.exp(-f64(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
+	t := scroll_ease_step()
 	e.scroll_y += (e.target_y - e.scroll_y) * t
 	e.scroll_x += f32(f64(e.target_x - e.scroll_x) * t)
 
 	// Settle on the target once close
 	if abs(e.target_y - e.scroll_y) < 0.25 do e.scroll_y = e.target_y
 	if abs(e.target_x - e.scroll_x) < 0.25 do e.scroll_x = e.target_x
+}
+
+
+// The part of the way to its target a scroll eases this frame (independent of
+// the frame rate)
+scroll_ease_step :: proc() -> f64 {
+	return 1 - math.exp(-f64(clamp(g.dt, 0, 1.0 / 30)) * SCROLL_EASE)
 }
 
 

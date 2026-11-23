@@ -5,13 +5,20 @@ package editor
 // names it in its shells' environment (ipc.ENV_NAME); a typo started there
 // sends the files it was given, prints what the window answers and exits.
 // A folder, --new, or an endpoint that doesn't answer (that typo has exited)
-// start a new window as usual
+// start a new window as usual.
+//
+// Persistent shells (terminal_persist.odin) outlive their typo, so they get
+// the project's name instead (ipc/projects.odin): each window lists its
+// endpoint under the project it shows, written by the registry thread here,
+// and `typo <file>` there reaches whichever window shows the project
 
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 
 import "ipc"
 
@@ -24,16 +31,46 @@ remote: struct {
 	queue:   [dynamic][]string, // owned; each request's files, from the server's thread
 }
 
+// Lists this window's endpoint under its project, off the UI thread
+@(private = "file")
+registry: struct {
+	thread:   ^thread.Thread,
+	mutex:    sync.Mutex,
+	cond:     sync.Cond,
+	wanted:   string, // owned; the project to be listed under ("" for none)
+	shown:    string, // owned, UI thread: the folder `wanted` was made from
+	stopping: bool,
+}
+
 
 // --- The window's side -------------------------------------------------------------
 
 // Starts listening for typo started in this window's terminals
 ipc_init :: proc() {
 	remote.running = ipc.server_start(&remote.server, answer_request, nil)
+	if remote.running {
+		// Its own temp allocator
+		ctx := runtime.default_context()
+		ctx.allocator = context.allocator
+		registry.thread = thread.create_and_start(registry_proc, ctx)
+	}
 }
 
 
 ipc_destroy :: proc() {
+	// The registry thread takes this window off its project's list first
+	if registry.thread != nil {
+		sync.lock(&registry.mutex)
+		registry.stopping = true
+		sync.cond_signal(&registry.cond)
+		sync.unlock(&registry.mutex)
+		thread.join(registry.thread)
+		thread.destroy(registry.thread)
+	}
+	delete(registry.wanted)
+	delete(registry.shown)
+	registry = {}
+
 	if remote.running do ipc.server_stop(&remote.server)
 
 	for paths in remote.queue do delete_paths(paths)
@@ -50,6 +87,65 @@ ipc_shell_env :: proc() -> []string {
 	env := make([]string, 1, context.temp_allocator)
 	env[0] = fmt.tprintf("%s=%s", ipc.ENV_NAME, remote.server.endpoint)
 	return env
+}
+
+
+// The variables a persistent shell gets (temp): the project's name, which
+// outlives this window's endpoint
+ipc_persistent_env :: proc() -> []string {
+	if !remote.running || g.workspace.root == "" {
+		return nil
+	}
+
+	env := make([]string, 1, context.temp_allocator)
+	env[0] = fmt.tprintf("%s=%s", ipc.ENV_NAME, ipc.project_name(g.workspace.root))
+	return env
+}
+
+
+// The registry thread: lists the endpoint under the project wanted, until
+// told to stop, then takes it off
+@(private = "file")
+registry_proc :: proc() {
+	listed := ""
+	defer delete(listed)
+
+	sync.lock(&registry.mutex)
+	defer sync.unlock(&registry.mutex)
+	for {
+		for !registry.stopping && registry.wanted == listed {
+			sync.cond_wait(&registry.cond, &registry.mutex)
+		}
+		wanted := registry.stopping ? "" : strings.clone(registry.wanted)
+		sync.unlock(&registry.mutex)
+
+		// Off the old project's list, onto the new one's
+		if listed != "" do ipc.project_unregister(listed)
+		if wanted != "" do ipc.project_register(wanted, remote.server.endpoint)
+		delete(listed)
+		listed = wanted
+		free_all(context.temp_allocator)
+
+		sync.lock(&registry.mutex)
+		if registry.stopping && listed == "" {
+			return
+		}
+	}
+}
+
+
+// Has the registry thread list this window under the folder it shows
+@(private = "file")
+registry_follow :: proc() {
+	if registry.thread == nil || registry.shown == g.workspace.root {
+		return
+	}
+	set_string(&registry.shown, g.workspace.root)
+
+	name := g.workspace.root != "" ? ipc.project_name(g.workspace.root) : ""
+	sync.guard(&registry.mutex)
+	set_string(&registry.wanted, name)
+	sync.cond_signal(&registry.cond)
 }
 
 
@@ -94,6 +190,7 @@ open_problem :: proc(path: string) -> string {
 // Hands the next queued request to apply_pending_action, when no other action
 // waits
 ipc_frame :: proc() {
+	registry_follow()
 	if g.pending != nil do return
 
 	sync.guard(&remote.mutex)
@@ -145,18 +242,27 @@ forward_to_window :: proc(args: Args) -> (exit_code: int, forwarded: bool) {
 		return 1, true
 	}
 
-	reply, err := ipc.send(endpoint, {command = .Open, paths = paths})
-	switch err {
-	case .Not_Running:
-		return 0, false
-	case .Failed:
-		print_error("the typo window did not answer")
-		return 1, true
-	case .None:
-	}
+	// A project's name: the windows showing it, newest first
+	endpoints := []string{endpoint}
+	project := strings.has_prefix(endpoint, ipc.PROJECT_PREFIX)
+	if project do endpoints = ipc.project_endpoints(endpoint)
 
-	for m in reply.messages do print_error(m)
-	return reply.ok ? 0 : 1, true
+	for e in endpoints {
+		reply, err := ipc.send(e, {command = .Open, paths = paths})
+		switch err {
+		case .Not_Running:
+			if project do ipc.project_forget(endpoint, e)
+			continue
+		case .Failed:
+			print_error("the typo window did not answer")
+			return 1, true
+		case .None:
+		}
+
+		for m in reply.messages do print_error(m)
+		return reply.ok ? 0 : 1, true
+	}
+	return 0, false
 }
 
 

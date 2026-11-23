@@ -1,15 +1,17 @@
 # typo
 
 A code editor in Odin: SDL3 + SDL_ttf (window, text), Clay (layout), tree-sitter plus a
-fallback lexer (highlighting), libghostty-vt (integrated terminal), and a Language Server
-Protocol client (src/lsp). Developed on Windows.
+fallback lexer (highlighting), libghostty-vt (integrated terminal), a Language Server
+Protocol client (src/lsp), and Git through libgit2 and the git command line (src/git).
+Developed on Windows.
 
 ## How to work
 
 - **The UI thread does only UI.** Anything that waits, parses, spawns, searches, walks
   files, writes logs or does file IO runs on another thread and hands over finished
   results, even if each is "only a few ms". Give such features a perf limit on their
-  UI-thread share per frame (like `langs.timed` and `lsp_limit` in perf.odin), not just
+  UI-thread share per frame (a thread-local `uitime.Share` its procs start with
+  `uitime.timed`, read by perf.odin like `langs.ui_share` and `lsp_limit`), not just
   frame time.
 - **Edit source with the Edit/Write tools**, not shell or Python scripts, so the style
   hook runs. If it doesn't report back, run `python .claude/hooks/check_style.py <files>`
@@ -43,6 +45,10 @@ Protocol client (src/lsp). Developed on Windows.
   ty, ruff, pyright, basedpyright in Zed's folders (%LOCALAPPDATA%\Zed\languages\<name>\...,
   ols in Zed\extensions\work\odin\ols-dev-*\). On another machine, check what's
   installed. ols takes about 4 s to initialize on typo's source.
+- herdr-core (`hc`, %LOCALAPPDATA%\Programs\herdr-core) runs the user's own agents:
+  never stop, restart or update their core, or touch terminals you didn't start.
+  Experiments and tests use a private session (`herdr.sandbox_begin`: `HC_SESSION`
+  and scratch `XDG_STATE_HOME`/`XDG_CONFIG_HOME`), stopped at the end.
 
 ## Build and test
 
@@ -56,8 +62,13 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
 ```
 
 - `build.py` builds the dependencies as static libraries (tree-sitter with clang,
-  libghostty-vt with a pinned Zig, SDL3/SDL3_ttf with CMake) and fetches the ConPTY
-  files `src/term/pty_windows.odin` embeds. Fonts and the icon (`assets/`, exe icon via
+  libghostty-vt with a pinned Zig, SDL3/SDL3_ttf and libgit2 with CMake) and fetches the
+  ConPTY files `src/term/pty_windows.odin` embeds. libgit2 (`LIBGIT2_VERSION`, bindings
+  in vendor/libgit2 for what typo uses, license in vendor/libgit2/COPYING) is built with
+  nothing that reaches the network (no HTTPS or SSH: the git command line pushes, pulls
+  and fetches), with its bundled zlib, regex and http parser, as a build type of its own
+  (`Optimized`): its Release flags on MSVC include /GL, which makes every link redo
+  link-time code generation. Fonts and the icon (`assets/`, exe icon via
   `assets/icon/typo.rc`) are embedded: the executable is the only runtime file.
 - `--test` and `--perf` first build `build/fake_lsp` (src/lsp/fake_server): a language
   server that keeps the documents it is sent ("fake/text" returns its copy), answers
@@ -116,10 +127,19 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   large-file question, finder (open and recent files first), find in files and the
   terminal, moving lines, settings window (several bindings for a command), context
   menu and dialogs, the sidebar behind the panes (what shows between them read
-  back from a real frame) and its search, files changed on disk, terminal, block
+  back from a real frame) and its search popup, RECENT and pinned files and the
+  project's settings (the scope switch read back in a dark and a light theme),
+  files changed on disk, the Git pane on a repository of its own (its status, keys
+  and message box), a diff of a large file loaded, scrolled and its hunks reverted
+  and staged by their buttons, both panes narrower than their content (cut off at
+  their edge, read back) (perf_git.odin; `git_limit` limits Git's UI-thread
+  share per frame), terminal, block
   elements and box drawing
   read back from the terminal and an editor, panes, zoom, `typo <file>` in the
-  terminal, go to line, text fields, idle CPU/GPU) and exits
+  terminal, a persistent terminal shown again from a private herdr-core session
+  (perf_persist.odin; skipped without hc), closing a terminal that runs a program
+  (perf_terminal_close.odin), go to line, text fields, idle CPU/GPU) and
+  exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
   setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed`, sending other mouse
   buttons through `mouse_button_event` and keys through `handle_key_event`; chords
@@ -130,18 +150,25 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   by other load; rerun once before investigating a result just over. A feature with a
   per-frame or per-keystroke cost gets a phase or result; a UI behavior gets a check.
 - `TYPO_SETTINGS` points typo at another settings.toml (the perf suite uses a temp one);
-  session.json is written beside it.
+  state.json (the project to reopen) is kept beside it. A project's own data is in its
+  `.typo/` folder; tests and perf phases use temp folders as projects.
 
 ## Architecture
 
 Packages import downward only: `editor` (src/) -> `mdview` -> `textedit` -> `gfx`, with
 `markdown`, `buffer` and `syntax` below them (gfx uses syntax for theme colors). For
-language servers, `editor` -> `langs` -> `lsp`: `lsp` imports only core and `buffer`
-(its copies of documents); `langs` (the app's servers, documents, problems and
-requests, no UI) imports `lsp`, `textedit`, `buffer` and `toml`, and reaches the app
-only through `langs.env`, set in lsp.odin. `fuzzy` (the fzy-style scorer), `ipc`
-(a typo's endpoint and its clients) and `diff` (line diffs) stand alone; `words` (a
-document's words, for completion) imports `buffer` and `textedit`.
+language servers, `editor` -> `langs` -> `lsp`: `lsp` imports only core, `buffer`
+(its copies of documents) and `process`; `langs` (the app's servers, documents,
+problems and requests, no UI) imports `lsp`, `textedit`, `buffer` and `toml`, and
+reaches the app only through `langs.env`, set in lsp.odin. `git` (a repository through
+libgit2, the git command line, the worker thread) imports `process` and
+vendor/libgit2 and `trash`; `herdr` (the herdr-core client) imports `process`;
+`term` imports `herdr`. `process` (child processes without a console window, PATH
+lookups), `fuzzy` (the fzy-style scorer), `ipc` (a typo's endpoint and its
+clients), `diff` (line diffs, side-by-side rows, changed words), `trash` (the
+system's trash, from any thread) and `uitime` (a feature's share of the UI thread)
+stand alone; `words` (a document's words, for completion) imports `buffer` and
+`textedit`; `langs` and `herdr` import `uitime`.
 
 The UI thread does UI: input, editing buffers, layout, drawing. Work that waits on
 something or can take long (language servers, file system searches, parsing what
@@ -209,19 +236,27 @@ other processes send) runs on other threads, which hand over finished results.
   telling the watcher (`watch_file_synced`) before handing the result over;
   `save_landed` then marks that text saved (`buffer.end_save`: edits made meanwhile
   keep the file modified; steps never merge into a state being written) or shows why
-  it failed. A save asked for during a write follows it. The unsaved-changes flow
+  it failed. The writer also patches a file no editor has open (`Patch_Job`, a diff
+  view's revert), only if it still has the size and hash read, and deletes a tree item
+  (`Delete_Job`: to the trash package's trash, or permanently once confirmed). A save
+  asked for during a write follows it. The unsaved-changes flow
   waits for writes before each question and before closing or quitting
   (`unsaved_frame`); quitting with a write under way waits for it, and `io_destroy`
   finishes queued writes. Without the threads (unit tests that don't start them) a job
   runs at once on the calling thread.
-- **Panes** (panes.odin): each open file (`^Editor`) or terminal (`^Terminal`) is a
-  `Pane` in `g.panes.open`. Shown panes are the leaves of a split tree (`Tile`) filling
+- **Panes** (panes.odin): each open file (`^Editor`), terminal (`^Terminal`), the Git
+  pane (`^Git_View`) or a diff (`^Diff_View`) is a `Pane` in `g.panes.open`. Shown panes are the leaves of a split tree (`Tile`) filling
   `work_rect()`; terminals not shown wait on the shelf, listed under the file tree.
   Files come from the tree (click, or drag into place); a file that loses its place to
   another closes unless it has unsaved changes (the tree marks those with a dot).
   Every pane, wherever it is in the tree, is a floating child of "Main" at its leaf's
   rect, so changes to the tree
   only move and resize panes and their transitions animate them (never reparented).
+  A pane clips what it holds: its header and body are laid out at least their
+  minimum width (`PANE_HEADER_MIN`, `pane_body_min`: 0 for editors and terminals,
+  `GIT_MIN_WIDTH`, `DIFF_MIN_WIDTH`) and at most the pane's, so a narrower pane cuts
+  them off at its edge; while they are built (`g.in_pane`) `ui_interactive` refuses
+  the pointer outside the pane or under the maximized one.
   Every change of place is a `Drop` applied by `drop_apply` (also run on a temp copy
   of the tree for the drag preview); a pane leaving the layout fades out as an empty
   frame (`Leaving`). Keys go to `g.panes.focused`, which is always a pane in view:
@@ -250,30 +285,42 @@ other processes send) runs on other threads, which hand over finished results.
   floating at the work area under the panes, easing as they do, passthrough) marks
   what covers the sidebar: its
   own checks go through `pointer_on_sidebar` (shown, and left of "WorkArea" as last
-  laid out, so rows the panes still cover while sliding back don't react):
-  `ui_interactive` refuses while building it (`g.in_sidebar`) elsewhere, as do tree
-  and shelf hit tests, drops and the context menu. Top to bottom: the folder's
-  name, the search field, the tree (or the search's files) and the shelf. The tree
+  laid out, so rows the panes still cover while sliding back don't react, and not
+  under the search's popup): `ui_interactive` refuses while building it
+  (`g.in_sidebar`) elsewhere, as do tree and shelf hit tests, drops and the context
+  menu. Top to bottom: the folder's name, the search field, the tree, RECENT and
+  the shelf. RECENT (sidebar_recent.odin, `recent_rows`): the project's pinned files, each with
+  a pin, then its recent files up to the `recent_files` setting, not repeating a
+  pinned one; headed and spaced as the shelf, its rows the shelf's insets. A row
+  acts as a tree row (a click opens it in place of the editor in use, a press can
+  drag it, drag source `.Recent`; the focused file is selected); a right-click on it
+  or on a file in the tree pins or unpins (`project_pin`). Not laid out while it
+  would list nothing (0 and no pins). The tree
   marks open files with unsaved changes and every folder they are in, collapsed or
   not, with a dot (`unsaved_marks`: each modified file's ancestors below the root,
   by `path_key_ascii`, per frame from the open editors).
 - **Sidebar search** (sidebar.odin, `g.sidebar_search`): a `Line_Edit` above the
-  tree, showing Find file's key at its right while empty. Find file (Ctrl+E,
-  `find_file`) gives it the keys with its query selected while the sidebar shows,
-  else opens the finder; a press on it gives it the keys (`typing`), a press
-  anywhere else, hiding the sidebar, Enter or another shortcut (which then runs)
-  gives them back. While
-  it holds text its files show in place of the tree: the finder's index and scoring
-  (`Search`, finder.odin) with its own results, stepped in `sidebar_frame` within
-  `SEARCH_BUDGET` (paused while the finder is open), open and recent files boosted.
-  Up/Down select, Enter opens through `Open_File` (as a tree click: in place of the
-  editor in use, the tree revealing it); a press on a row opens it or drags it into a
-  pane like a tree row (`sidebar_file_under_pointer` in `drag_press`, source
-  `.Search`). Opening a result (Enter or a click, not a drag), Escape or the x
-  empties the field and brings the tree back (`sidebar_search_close`; its scroll
-  kept: another list). With the sidebar hidden, Find file opens the finder popup,
-  which also lists open and recent files with no query and has symbols and places
-  as sources.
+  tree, showing Find file's key at its right while empty, that opens a popup as a
+  browser's address bar does. Find file (Ctrl+E, `find_file`) opens it with the
+  query selected while the sidebar shows, else opens the finder; so does a press
+  on the field (`sidebar_search_open`). The popup (`sidebar_search_popup`, declared
+  after the sidebar, floating on the field's place "SidebarSearchSlot" at the
+  popups' layer) grows out of the field (its enter transition starts at the
+  field's box) over the panes, with the field at its top exactly where it was in
+  the sidebar (the slot is empty meanwhile) and the files under it: the finder's
+  index and scoring (`Search`, finder.odin) with its own results, stepped in
+  `sidebar_frame` within `SEARCH_BUDGET` (paused while the finder is open), open
+  and recent files ranked when it opens: with no query only those and the
+  shortest paths, as the finder lists them, marked "open" or "recent". It covers
+  what is under it (`search_popup_covers_pointer` in `ui_interactive` and
+  `pointer_on_sidebar`; built with `g.in_search_popup`). Up/Down and Page Up/Down
+  select, Enter or a click on a row (opened next frame, `clicked`) opens through
+  `Open_File` (as a tree click: in place of the editor in use, the tree revealing
+  it). Opening a file or Escape empties the field and closes the popup
+  (`sidebar_search_close`); a press outside it, hiding the sidebar, another
+  shortcut (which then runs) or the finder opening closes it and keeps the query.
+  With the sidebar hidden, Find file opens the finder popup, which has symbols and
+  places as sources too.
 - **Zoom** (zoom.odin): each pane's text has its own size, a step from 100% in
   `textedit.ZOOM_LEVELS` (50%..300%): `textedit.View.zoom` for an editor (both kinds),
   `Terminal.zoom`. The interface doesn't zoom. Zoom in/out/reset act on the focused
@@ -345,13 +392,79 @@ other processes send) runs on other threads, which hand over finished results.
   edits a dialog asks (Reload / Keep my version); saving over a version typo hasn't read
   asks first (`save_or_ask`). A deleted or moved-away file stays open, unsaved
   (`Disk_State.missing`). Results carry a generation (or a reload serial); older ones
-  are dropped. settings.toml keeps its own poll (it is usually outside the workspace).
-- **Terminal** (terminal*.odin, term/): on Windows the shell runs in ConPTY, which keeps
-  its own copy of the screen, and the two must stay row for row the same or the shell
-  draws on the wrong row. So on resize ghostty doesn't pull scrollback down (growing
-  adds blank rows at the bottom) and its reflow trims trailing spaces
-  (`term.session_init`, patches/ghostty.patch). The grid is resized only once panes
-  stop animating.
+  are dropped. Three things look at files on a timer, each where the watcher can't:
+  this poll of open files outside the workspace, the config thread's poll of
+  settings.toml and the project's .typo/settings.toml (`CONFIG_POLL_MS`; the stat
+  outside its lock), and the Git worker's poll of the files that describe the
+  repository (`git.POLL`). The watcher ignores typo's own saves of
+  .typo/session.json (`watch_ignored`), so saving the session as it goes lists no
+  folders and refreshes no Git status.
+- **Terminal** (terminal*.odin, term/): a `term.Session` is libghostty-vt plus a
+  `Backend`, where the program runs: `Local` (a pty and its reader thread) or
+  `Remote` (a herdr-core terminal through a `herdr.Stream`). Only session.odin's
+  backend procs (spawn/start/attach, write, resize, focus, kill/detach, the pump's
+  source and state) differ; drawing, the row cache, find, selection and input
+  encoding don't. `session_pump` returns a `Pump` (busy, a notice, ended). On Windows
+  a local shell runs in ConPTY, which keeps its own copy of the screen, and the two
+  must stay row for row the same or the shell draws on the wrong row. So on resize
+  ghostty doesn't pull scrollback down (growing adds blank rows at the bottom) and its
+  reflow trims trailing spaces (`pty_semantics`, patches/ghostty.patch). A herdr
+  terminal resizes the same way: herdr-core passes on its ConPTY's live output, and
+  the cursor positions in it are ConPTY's (test_remote_resize_keeps_rows). Only the
+  repaint after an attach comes from herdr-core's own terminal, which reflows with
+  Ghostty's defaults, so after resizes while typo wasn't attached that repaint can
+  differ from ConPTY's screen until the shell redraws. The grid is resized only once
+  panes stop animating.
+- **Persistent terminals** (terminal_persist*.odin, herdr/, docs/terminal_persistence.md):
+  the `terminal.backend` setting ("local", default, or "herdr") picks where new
+  terminals run; a terminal keeps its backend (`Terminal.persistent`), Restart too.
+  The UI calls persistent terminals pinned: their icon (title, shelf, drag chip) has
+  an accent pin on its corner (`pane_badge`; `gfx.Icon_Badge`, the icon drawn
+  through two clips that leave a notch around the badge, so it reads on any
+  background) with a tooltip. A terminal's menu has Pin or Unpin, which restarts it
+  in the other mode (`terminal_ask_repin`: the unsaved-changes flow's `Repinning`
+  step, asking first if a program runs in it); right-click on the shelf's + or the
+  status bar's terminal button picks what new terminals are ("New terminals: Local
+  / Pinned", `persist_set_wanted`, changing the settings layer in effect), and that
+  button shows the pin while new terminals are pinned.
+  One `herdr.Client` per typo (`persist_init`): its reader thread finds hc (PATH, then
+  its install folder), and once a stream or a command needs the core starts `hc
+  connect` (herdr/hc.odin, through `process` with `discard_stderr` and `detached`:
+  no window, outside typo's job objects, as a core it starts inherits its job; its
+  stdin and stdout pipes are the line, with two locks so a write stuck on a core
+  that stopped reading can't hold up the kill that ends it), says hello
+  in framed mode, subscribes to events of terminals labeled `typo=1`, and reads
+  frames (u32 channel, u8 kind, u32 length; JSON-RPC on channel 0), reconnecting with
+  a backoff; its writer thread turns queued commands into frames. The UI thread only
+  queues and takes (`herdr.ui_share`, limited per frame by the perf suite). Request
+  frames carry the connection they were made for and are dropped after a reconnect. A terminal is
+  started with `keep`, `outlive_parent`, labels `typo=1` and `typo.project=<root>`, the
+  shell (split as Windows splits arguments), typo's shell identity
+  (`term.shell_identity`: TERM_PROGRAM=typo, as herdr-core would claim Ghostty) and
+  `TYPO_IPC` with the project's name, sized and colored like the pane. An attach is
+  a full repaint with `herdr.DEFAULT_HISTORY` lines: the stream marks it, and the pump
+  resets the terminal and parses it in one go. Streams attach again after a
+  reconnect, a `restarted` event (a lost program replaced by a shell), and when
+  typo gets the size back from another viewer (`size` events; herdr gives
+  interactive viewers no repaint). Quitting and leaving the project detach
+  (`panes_close_all` calls `terminal_detach`); closing a pane kills and removes
+  its herdr terminal (`terminal_destroy`). The session keeps each
+  persistent terminal's address and core (`Session_Pane.herdr`, `herdr_core`); a
+  restored one attaches when first shown (`persist_restore`). One that ended while
+  typo was closed shows its last screen and history as text with an "exited" line;
+  Enter starts a new one. Without hc, new terminals start locally and say so.
+- **Running programs** (terminal_programs.odin, term/processes_*.odin): closing a
+  terminal whose shell is alive (either backend), quitting or opening another
+  folder (local shells only: persistent ones go on) asks first if a program runs
+  in it ("ping is still running in PowerShell"), as a step of the unsaved-changes
+  flow after the files (`Unsaved_Flow.programs`). A terminal runs one when its
+  shell has processes under it (`term.programs_under`: a Toolhelp snapshot, the
+  shell's descendants level by level, console hosts left out, ids reused since
+  the shell started skipped), from the shell's process id (`term.session_pid`; a
+  herdr terminal's from its attach, as herdr's own foreground is always the shell
+  on Windows). The snapshot runs on a thread per check (`Programs_Check`, freed by
+  whichever side lets go last), so closing a terminal takes a frame or two. Not
+  looked up on Unix yet: closing there doesn't ask.
 - **Box drawing and blocks** (gfx/box_glyphs.odin): box drawing, block elements,
   Powerline separators and Symbols for Legacy Computing (`gfx.is_box_glyph`) aren't
   drawn from the font but as shapes filling the exact cell, so they join across cells
@@ -394,7 +507,7 @@ other processes send) runs on other threads, which hand over finished results.
   server is now off, not found or set up differently (`Client.server_key`,
   `langs.reattach_all`); the others keep their documents. On Windows servers start
   without a console window, inherit only their pipes, and live in a job object that
-  ends them with typo. `langs.timed` marks the UI thread's share, which the perf suite
+  ends them with typo. `langs.ui_share` is the UI thread's share, which the perf suite
   limits per frame. The app answers `langs.env`: its open documents, a document
   closing (`doc_closing`), a client gone (`client_gone`: stopped, crashed, restarted or
   removed; whatever waits on it lets go) and responses (`lsp_response`).
@@ -408,7 +521,7 @@ other processes send) runs on other threads, which hand over finished results.
   they replace. Install (`lsp_install`) opens a terminal whose shell runs an install
   command and stays open (`panes_run_in_terminal`, `shell_running`); the program is
   looked for again as output comes (`watch_installs`), and once found the server
-  starts. settings.toml is written on a saver thread (`settings_save_later`).
+  starts. settings.toml is written on the config thread (`settings_save_later`).
 - **Installing servers** (lsp/install.odin, `langs.server_installs`): a server has
   several install commands (`Server_Spec.install`; a table's `install`, one string or
   a list, replaces them). Each command's program (its first word) is looked up on PATH
@@ -446,7 +559,8 @@ other processes send) runs on other threads, which hand over finished results.
   with a DACL for the current user only (the default one lets everyone read), else a
   Unix socket (0600) in a 0700 folder. Only its terminals' shells get it, as
   `TYPO_IPC` (`ipc_shell_env`, passed to `term.session_spawn`; typo's own environment
-  and so language servers never have it, and a new typo unsets an inherited one). Run
+  and so language servers never have it, and a new typo unsets an inherited one, as
+  it does Claude Code's session markers, `AGENT_SESSION_ENV` in main.odin). Run
   there, `typo <files>` (`forward_to_window`, before SDL starts) sends their absolute
   paths, prints the reply's messages (`attach_console`) and exits 1 if any was
   refused; a folder, `--new`/`-n`, `-t` or an endpoint that doesn't answer start a
@@ -457,7 +571,14 @@ other processes send) runs on other threads, which hand over finished results.
   new pane (`panes_open_file_beside`), the first right of the editor in use (above
   the rest when none is shown, so the terminal stays), the others each beside the one
   before, the last focused, and the window raised. No editor loses its place; a file
-  already open is shown and focused.
+  already open is shown and focused. Persistent shells outlive their typo, so their
+  `TYPO_IPC` is the project's name (`project:<hash of the folder>`,
+  `ipc.project_name`) instead: each window lists its endpoint under the project it
+  shows (ipc/projects.odin; a file per process in %LOCALAPPDATA%\typo\ipc\<hash>,
+  else a 0700 folder of the user's runtime folder, refused if anyone else made it or
+  may enter it), written by ipc_open.odin's registry thread as the folder changes,
+  and `typo <file>` there tries them newest first through the usual checks,
+  forgetting entries that don't answer.
 - **The finder** (finder.odin) lists a `Finder_Source`: the workspace's files
   (Ctrl+E), or a server's `Finder_Item`s (lsp_symbols.odin): a file's outline
   (Ctrl+Shift+O, the caret's symbol selected), the project's symbols (Ctrl+T, asked
@@ -477,18 +598,86 @@ other processes send) runs on other threads, which hand over finished results.
   query: the open files, most recently used first, then the recent ones, then the
   shortest paths; the focused file isn't listed, so Enter switches. With a query
   they get `FINDER_BOOST` on their score. Their rows say "open" or "recent".
-- **Recent files** (recent.odin, `g.recent`): per workspace folder (at most
-  `RECENT_MAX_FOLDERS`), the files whose panes were focused, most recent first (at
-  most `RECENT_MAX_FILES`; `recent_touch` from `pane_focus`). Renaming and deleting in
-  typo update them; session.json keeps them (`Session.recent`, written on exit even
-  when the session isn't restored), dropping files the finder's complete index
-  doesn't have (`recent_drop_missing`).
+- **Recent projects** (project_picker.odin, `g.project_picker`): state.json keeps
+  the projects opened, most recent first (`state_project_opened` from
+  `project_open`, at most `RECENT_PROJECTS_MAX`; folders gone are dropped when it is
+  read at startup). Open project (Ctrl+R) or the sidebar's open folder button shows
+  a popup of them, filtered as typed (fuzzy, the folder's name counting more),
+  under that button while the sidebar shows, else at the top of the window, at the
+  popups' layer (`project_picker_covers_pointer`, `g.in_project_picker`). Enter or a
+  click opens one in this window (`Open_Folder`); Ctrl+Enter or a row's window
+  button in another typo window (`Open_Window`: `launch_window` starts typo on the
+  folder from a thread of its own, which waits on it to free its handle; a typo
+  started outside its terminals never hands a folder to this one). Its last row,
+  Open folder…, shows the system's folder dialog, whose choice opens the same way
+  (`show_open_folder_dialog(new_window)`, `take_picked_folder`). Esc, a press
+  outside or another shortcut closes it.
+- **Recent files** (recent.odin, `g.recent`): the open project's files whose panes
+  were focused, most recent first (at most `RECENT_MAX_FILES`; `recent_touch` from
+  `pane_focus`). Renaming and deleting in typo update them; the project's
+  session.json keeps them (`Session.recent_files`, saved even when sessions aren't
+  restored), dropping files the finder's complete index doesn't have
+  (`recent_drop_missing`).
+- **Projects** (project.odin, `g.project`): the folder open is the project, with its
+  data in a `.typo/` folder inside it, as Zed's `.zed/`: `.typo/settings.toml` (its
+  settings layer and `[project] pinned`, paths relative to the project with forward
+  slashes) and `.typo/session.json` (its last state, session.odin). `.typo/` is made
+  only when there is something to write, then with a `.gitignore` holding
+  `session.json` (`TYPO_GITIGNORE`), so the settings can be shared. `open_folder` calls
+  `project_open`, which has the config thread read both; until they land
+  (`project_read`) the pending Action waits (files from the command line, `-t`'s
+  terminal and `typo <file>` go after the restored panes) and the window stays hidden
+  at startup. Then the layer applies, pins and recent files are listed, and with
+  `restore_session` the session is restored (the window's size only for the run's
+  first project). Leaving a project (`project_leave`: opening another folder, after
+  the unsaved-changes flow) saves its state and closes every pane (local shells
+  end, persistent ones go on); quitting saves it. It is also saved as it goes
+  (`session_save_frame`, at the end of a frame): at most every `SESSION_CHECK` the
+  state is built and written on the config thread if it differs from the last
+  write (`saving`), and a one-shot SDL timer wakes an idle loop for a last check
+  after frames that weren't checked, so a crash loses little. Leaving also drops
+  recent files the index no longer has (`recent_drop_missing`, which walks it);
+  saving as it goes doesn't. A folder opened for a file given alone isn't a project (nothing
+  restored or saved) unless it has `.typo/` or typo writes one there (a pin). Paths
+  in the files go through `project_rel`/`project_abs`. state.json beside
+  settings.toml (`App_State`, session.odin) keeps what isn't per project: the project
+  reopened with no arguments; the first start without it takes over an older typo's
+  session.json (`imported`: its layout for its folder, each folder's recent files),
+  handed to each project when it next opens without a session of its own.
+- **Settings layers** (settings.odin): `Settings` holds the values in effect
+  (`using values: Setting_Values`, what the app reads as `g.settings.x`), the user's
+  (`user`, settings.toml) and the project's (`project: Setting_Layer`, values and
+  the `set` it names); `settings_resolve` works out the first from the others.
+  Keybindings, servers' tables and `user_only` settings (restore_session, renderer,
+  bundled ConPTY, collapsed sections) are the user's only; a project file setting one
+  gets a problem. Files are parsed into `Loaded_Settings` (`settings_parse`, any
+  thread) and taken in on the UI thread (`settings_take_user`/`_project`).
+  `settings_changed` (user layer, bindings, servers) saves settings.toml;
+  `project_settings_changed` saves the project's file with its pins. The settings
+  window's User/Project switch (`scope`, `scope_switch_side`) picks the layer shown and
+  changed (`shown_values`, `edit_values`: a change in Project scope starts from the
+  user's value it followed); Project scope hides what is the user's only, notes each
+  setting the project sets (Del follows the user's again), and its footer resets the
+  project's values or opens `.typo/settings.toml` (written first if missing); User
+  scope notes a setting the project sets in its place.
+- **Config thread** (config_io.odin): settings files, projects' files and state.json
+  are read and written on one thread, in order (a waiting write to a file is replaced
+  by a newer one); results land in `config_frame`. A timer on SDL's timer thread polls
+  the watched files' write times (`Watched_File`: settings.toml, the project's
+  settings) and queues a read when one changed, made or deleted, not after typo's own
+  writes. settings.toml and state.json are read at once at startup, before the window
+  shows. Without the thread (unit tests) a job runs at once and its result applies.
 - **Keybindings in the settings** (settings_ui.odin): a command's bindings (up to
   `MAX_CHORDS`) are chips, each with an x on hover; Add records one more (a key or a
   side button), taking it from the command that had it (`bindings_add`), which the
   row then says (`bind_note`); Reset puts the defaults back. Keys: Enter on the row
   adds, ←→ move the focus between the row and its chips (`chip`, `chip_command`),
   Delete or Backspace removes the focused chip, Delete on the row resets.
+  At the row's right a terminal toggle says whether the command works while a
+  terminal has focus (`Settings.terminal_commands`, settings.toml's
+  `terminal.commands`, user only; `DEFAULT_TERMINAL_COMMANDS` when left out); other
+  chords go to the shell, as do a set command's when it doesn't apply.
+  `EDITOR_COMMANDS` (acting on an editor's text) have no toggle and always do.
 - **Completion and signature help** (lsp_completion.odin): `lsp_typed` (from
   `editor_text_input`) marks completions due: once identifier typing rests
   `COMPLETION_DELAY` (not on a number, nor in a comment or string by the highlighter),
@@ -527,7 +716,7 @@ other processes send) runs on other threads, which hand over finished results.
   typed, words with digits; the list holds the index its rows show (`word_index`).
   A typed word gets words once it is long enough; Trigger completion at any length.
   Accepting one replaces the word before every caret through `accept_completion`.
-  `words_timed` marks the UI thread's share, which the perf suite limits per frame
+  `words_ui` is the UI thread's share, which the perf suite limits per frame
   (`words_limit`).
 - **Rename and workspace edits** (lsp_rename.odin, lsp_edits.odin, lsp/edits.odin):
   Rename (F2) renames the symbol at the caret when the editor's server can, else the
@@ -540,12 +729,82 @@ other processes send) runs on other threads, which hand over finished results.
   thread does (`lsp.write_file_edit`, only if the file is unchanged). A server's
   workspace/applyEdit (`lsp.Apply_Edit` event) goes the same way and is answered with
   `lsp.reply_apply_edit`.
+- **Git** (git/, git_state.odin): libgit2 does reads and the index in-process
+  (git/repo.odin: finding the repository from the workspace folder, the status as
+  `git.Status` entries by `git.Area` (conflicts, staged, changes, untracked), HEAD's
+  branch and short id, the upstream and ahead/behind, file versions in HEAD or the
+  index, staging, unstaging, discarding from the index, moving untracked files to the
+  trash (`Delete_Untracked.to_trash`; tests delete them for good), and
+  `splice_index` for a hunk); the git command line does commit (`--file=-`, so hooks
+  and signing work), push, pull and fetch (git/cli.odin: no console window,
+  `GIT_TERMINAL_PROMPT=0`, a credential helper's own window still shows). File
+  versions are read as checked out (libgit2's smudge filters: the work tree's line
+  endings) and text put in the index is cleaned first. Nothing of it runs on the UI
+  thread: `git.Worker` (git/worker.odin) owns the repository for writes, takes
+  requests in order, follows each change with a fresh status, and hands events over
+  (`worker_take`); commands run one at a time on a thread of their own, which quitting
+  ends (`running_end` kills git and what it started). The diff loader keeps a
+  read-only repository handle of its own (HEAD and index versions). A folder change
+  drops the requests and events still queued, and events from work begun before it
+  (they carry the folder generation they were made under: their paths would name
+  other files in the new repository). The status
+  follows the repository: the watcher's bursts (any burst is handed over as a
+  `Watch_Batch`, so files written in place count) call `git_workspace_changed`, and the
+  worker polls the files that describe the repository every `git.POLL` (index, HEAD,
+  the branch's and upstream's refs, packed-refs, FETCH_HEAD, MERGE_HEAD: outside the
+  workspace for a linked worktree, and the watcher drops .git), so a commit in a
+  terminal shows up. Refreshes asked for meanwhile are done once, never closer
+  together than the last one took (`REFRESH_GAP` at least). A failed push, pull or
+  fetch shows git's words in a dialog that can run the command in a typo terminal
+  (`panes_run_in_terminal`). `git_ui` is the UI thread's share, which the perf suite
+  limits (`git_limit`).
+- **Git pane** (git_pane.odin, `Git_View`, one at most): beside its title, faded, the
+  upstream (else the branch) and a merge or rebase under way (`git_title_note`); a
+  commit message box (`Text_Area`, Ctrl+Enter commits), Commit (the key small at its
+  right while it fits, `commit_hint_fits`) and the push, pull and fetch group with the
+  commits to push and pull, how the last command went, and the files in collapsible
+  sections, each
+  row with its icon, name, folder and a letter colored by its change (`git_*` theme
+  colors), stage/unstage/discard buttons on hover (per section on its header; discard
+  asks first, `Git_Discarding`). Rows aren't stored: `row_at` finds one from the
+  sections' sizes, and only the rows in view are laid out. Keys: Up/Down, Enter (diff
+  or collapse), Space (stage or unstage), Delete (discard), Tab/Esc into and out of the
+  box. Open Git pane (Ctrl+Shift+G, the status bar's branch item) opens it left of the
+  editor in use or focuses it. A row clicked opens its diff next frame (`chosen`).
+- **Text area** (text_area.odin): a multi-line field on `textedit.View` with its own
+  kind (`AREA_KIND`) in the interface font: the editor's caret movement, selections,
+  undo and clipboard; it grows with its lines up to `TEXT_AREA_MAX_LINES`, then
+  scrolls. Its owner decides focus and takes the keys it wants first.
+- **Diff view** (diff_view.odin, diff_load.odin, diff/rows.odin): a pane comparing a
+  file's versions side by side: changes (index | work tree), staged (HEAD | index),
+  untracked (nothing | work tree), conflict (HEAD | work tree). The work tree side is
+  the open editor's text (a snapshot) when the file is open, else the file. The
+  loader thread reads both, diffs them by lines (`diff.line_hunks`: line endings don't
+  count, as git sees a file checked out with other endings), finds changed words
+  (`diff.words`, within `WORD_LINE_MAX`/`WORD_PAIRS_MAX`), and builds each side's
+  buffer and highlighter (Markdown is plain text); a job carries what the view shows
+  (`Diff_Signature`), so a load that would change nothing costs nothing. Rows aren't
+  stored (`diff.row_at` finds a row from the hunks); only rows in view are drawn, both
+  sides scrolling together. Each hunk has buttons in the strip between the sides
+  (laid out by Clay, scrolling with the rows): the arrow reverts it to the left
+  side's text (in the open editor through `textedit.apply_edits`, one undo step,
+  with that editor's line endings; else on the writer thread as a `Patch_Job`, only
+  if the file is still as read), + stages it (`git_splice_index`), and in a staged
+  diff the arrow unstages it. A press is recorded and applied next frame (`clicked`).
+  A view loads again on every new status and once an open editor's edits rest
+  `DIFF_EDIT_DELAY`; what it showed is freed on the loader thread
+  (`diff_load_retire`). Clicking a file opens its diff in the diff pane shown, else in
+  place of the editor in use, else right of the Git pane. Git and diff panes close
+  when they leave the layout (no shelf); the session keeps both.
 
 ### A frame (`app_iterate`, main.odin)
 
-1. Apply the pending `Action`, the loader's and writer's results (`file_load_frame`;
-   `unsaved_frame` goes on once writes landed) and the watcher's (`file_sync_frame`),
-   update focus, run `finder_frame` and `panes_frame`
+1. Apply the config thread's results (`config_frame`: settings files read again, a
+   project's files, writes), the pending `Action` (it waits while a project's files
+   are read), the loader's and writer's results (`file_load_frame`;
+   `unsaved_frame` goes on once writes landed or a programs check finished), the
+   watcher's (`file_sync_frame`), the Git worker's (`git_frame`) and the diff
+   loader's (`diff_views_frame`), update focus, run `finder_frame` and `panes_frame`
    (divider and pane drags, then each pane's `editor_frame`/`terminal_frame`), which
    read last frame's layout (`element_rect`, `pointer_in`) and handle the mouse.
 2. `build_ui` (layout.odin) declares the Clay tree; editors and terminals are custom
@@ -573,11 +832,15 @@ src/                 package editor: the app
   keymap.odin        Command enum, default bindings, chords (a key, or a mouse side
                      button: "Mouse4" back, "Mouse5" forward), adding and removing
                      bindings, run_command
-  settings.odin      Settings model: SETTINGS table, TOML load/save (saver thread), file
-                     watcher
+  settings.odin      Settings model: SETTINGS table, the user's and the project's layers
+                     and the values in effect, parsing and writing both files
+  config_io.odin     The config thread: settings files, projects' files and state.json
+                     read and written in order; the watch timer
+  project.odin       The project: its .typo folder, opening (files read, state restored)
+                     and leaving, pinned files, project-relative paths
   settings_ui.odin   Settings window from SETTINGS, sections collapsible (kept in
-                     collapsed_sections); theme/font picker docked at the side;
-                     keybinding rows with a chip per binding
+                     collapsed_sections); the User/Project scope switch; theme/font
+                     picker docked at the side; keybinding rows with a chip per binding
   settings_servers.odin  Language servers in the settings window: rows, a server's page,
                      Add/Remove, Install
   render.odin        Clay render commands -> gfx calls; Clay text measurement
@@ -586,8 +849,10 @@ src/                 package editor: the app
   scrollbar.odin     Scroll bars (either axis, on gfx/scrollbar.odin), list_scrollbar,
                      wheel routing
   layout.odin        Window layout: "Main" (sidebar, panes), status bar, mouse cursor
-  sidebar.odin       The sidebar behind the panes (folder name, search field, file
-                     tree with unsaved dots, shelf), fading as they cover it
+  sidebar.odin       The sidebar behind the panes (folder name, search field and its
+                     popup, file tree with unsaved dots, RECENT, shelf), fading as
+                     they cover it
+  sidebar_recent.odin  RECENT: pinned and recent files, their rows
   panes.odin         Panes: shelf, split tree, drops, divider and pane dragging,
                      pane UI, focus, pane commands
   editor.odin        Editor: state, Markdown attachment, renames, keys, commands,
@@ -597,18 +862,25 @@ src/                 package editor: the app
   text_view.odin     TEXT_KIND: line grid, gutter, highlighting, line/column movement
   md_env.odin        mdview.env: the app state mdview may see
   terminal*.odin     Terminal: session, row cache, drawing, input
+                     (terminal_persist*.odin: persistent terminals in herdr-core: the
+                     client, starting and attaching, the session's ids, the
+                     setting's note)
+  terminal_programs.odin  Programs running in terminals, looked up on a thread
+                     before closing a terminal, quitting or opening a folder
   dialog.odin        In-app dialogs (dialog_show; a choice applies next frame), the
-                     unsaved-changes flow (resolve_unsaved), the delete prompt
+                     unsaved-changes flow (resolve_unsaved; files, then running
+                     programs), the delete prompt
   context_menu.odin  Right-click menu on tree rows, pane titles and shelf terminals
   rename.odin        Renaming in place (tree row, shelf row or pane title; F2), and
                      naming a new file or folder in a new tree row
   line_edit.odin     The text field every input uses: editing keys, words, clipboard,
                      undo, the mouse, sideways scrolling (Line_Edit, text_field)
-  fs_ops*.odin       Create, rename and delete, keeping open files (path, highlighting,
-                     Markdown mode), the tree and the finder in step. On Windows,
-                     delete goes to the Recycle Bin through IFileOperation; an item
-                     that can't go there is not deleted, and the user is asked to
-                     delete it permanently. Names Windows can't use are refused.
+  fs_ops.odin        Create, rename and delete, keeping open files (path, highlighting,
+                     Markdown mode), the tree and the finder in step. Delete moves to
+                     the trash (`TRASH_NAME`: Recycle Bin or Trash) on the writer
+                     thread (`Delete_Job`, `delete_landed`); an item that can't go
+                     there is not deleted, and the user is asked to delete it
+                     permanently. Names Windows can't use are refused.
   finder.odin        The finder: files (Ctrl+E: background indexer, incremental
                      search, shared with the sidebar's field) or a server's symbols
                      and places; rows in view only
@@ -616,10 +888,12 @@ src/                 package editor: the app
                      word, case, regex), libghostty search in terminals
   goto_line.odin     Go to line (Ctrl+G): the bar, reading "line:column", previewing
   workspace.odin     Lazy file tree, folder dialog
-  session.odin       The session (folder, window, panes and layout, recent files)
-                     saved on exit to session.json and reopened when started with no
-                     arguments
-  recent.odin        Recently used files per workspace folder, for the finder
+  session.odin       A project's state (window, panes and layout, open folders, recent
+                     files) in its .typo/session.json; state.json (the project to
+                     reopen), taking over an older typo's session.json
+  recent.odin        The project's recently used files, for RECENT and the finder
+  project_picker.odin  Recent projects: the popup (Ctrl+R, the open folder button),
+                     opening one here or in another window
   ipc_open.odin      `typo <file>` from typo's terminals: the listener, its queue, the
                      shells' TYPO_IPC, and the command line's side (forward_to_window)
   fs_walk*.odin      Directory listing (the tree's order: read_tree_folder), recursive
@@ -648,16 +922,30 @@ src/                 package editor: the app
                      server's program (file dialog, saved as its path) or turn off
                      a server not found
   zoom.odin          Zoom per pane: commands, the status bar item and its popup
-  perf*.odin         Perf suite and CPU/GPU counters
+  git_state.odin     Git in the app: the worker's events, staging, discarding (asked
+                     first), commit/push/pull/fetch, a failure's dialog, the status bar's
+                     branch item, git_ui
+  git_pane.odin      The Git pane: branch, message box, Commit and remote buttons,
+                     sections of files (rows found, not stored), keys, opening diffs
+  text_area.odin     A multi-line text field on textedit.View (AREA_KIND)
+  diff_view.odin     The diff pane: following the file, hunk buttons (revert, stage,
+                     unstage), scrolling, keys, drawing both sides
+  diff_load.odin     The diff loader thread: reading both versions, diffing, changed
+                     words, each side's buffer and highlighter; freeing retired sides
+  perf*.odin         Perf suite and CPU/GPU counters (perf_persist.odin: the
+                     persistent terminal phase)
   *_test.odin        App tests (editor_test, md_view_test: a Markdown file in the editor,
                      panes_test: the split tree, find_test: searching an editor,
                      line_edit_test: keys in a text field, fs_watch_test: bursts,
                      the tree following listings, reloads, recent_test: the recent
-                     files and the session, goto_line_test: places and keys in the
+                     files, project_test: settings layers, pins written, each
+                     project's state restored, the old session.json taken over,
+                     goto_line_test: places and keys in the
                      bar, keymap_test: adding, taking and removing bindings,
                      file_load_test: loads and writes on their threads, the unsaved
                      flow waiting, sidebar_test: folders marked for unsaved files,
-                     keys in the search field)
+                     keys in the search popup, diff_view_test: hunks reverted on disk
+                     and in an editor, staged and unstaged, on a temp repository)
 src/gfx/             Drawing: draw.odin (primitives on gfx.renderer, clips, overlays,
                      selection shapes), scrollbar.odin (scroll bar geometry, dragging
                      and look along either axis),
@@ -693,10 +981,19 @@ src/markdown/        Parser: doc.odin (incremental), block.odin (line classifier
 src/buffer/          Piece table (treap), stores in blocks that never move, newline
                      index, undo, change log, snapshots
 src/syntax/          Highlighter: tree-sitter (Odin, TOML), line lexer (others)
-src/term/            libghostty-vt bindings, Session (vt + pty + reader thread)
+src/term/            libghostty-vt bindings, Session (vt + backend: pty and reader
+                     thread, or a herdr-core stream), processes_*.odin (programs
+                     running under a shell)
+src/herdr/           herdr-core client: frame.odin (framing), protocol.odin (requests,
+                     results, events), client.odin (threads, reconnects, streams),
+                     hc.odin (finding hc, starting hc connect), sandbox.odin (private
+                     sessions for tests and the perf suite, one at a time: they set
+                     HC_SESSION process-wide; the stop at the end names its session
+                     in its own environment, as hc without HC_SESSION reaches the
+                     user's own core)
 src/langs/           The app's language servers, no UI: config.odin ([lsp.<name>]
                      tables, the merged server list), clients.odin (state, env, the
-                     clients, restarts, lookups, the frame, timed), docs.odin (documents
+                     clients, restarts, lookups, the frame, ui_share), docs.odin (documents
                      on their servers: open, change, save, close), problems.odin
                      (published, shifted by edits, counted), requests.odin (which
                      client, matching responses)
@@ -709,19 +1006,38 @@ src/lsp/             LSP client: registry.odin (LANGUAGES, SERVERS, roots), inst
                      rewriting a file), changes.odin (a frame's changes as edits;
                      shifting and merging problems), rpc.odin (framing), protocol.odin
                      (capabilities, params, Feature), position.odin (columns, offsets
-                     in a document, file URIs), process_*/exec_* (spawning, PATH
-                     search); fake_server/ for tests
+                     in a document, file URIs); fake_server/ for tests
 src/fuzzy/           fzy-style scorer (files, symbols, completions)
 src/words/           A document's words from a snapshot (collect, Index) and the
                      thread that collects them (Indexer)
 src/ipc/             A typo's endpoint: message.odin (frames, requests, replies,
                      validation), server.odin (server thread, send), ipc_windows.odin
-                     (named pipe, its DACL, overlapped I/O), ipc_unix.odin (socket)
-src/diff/            Line diffs (Myers), for reloading files changed on disk
+                     (named pipe, its DACL, overlapped I/O), ipc_unix.odin (socket),
+                     projects.odin (endpoints by project, for persistent shells)
+src/diff/            Line diffs (Myers): byte hunks for reloading files changed on disk,
+                     line hunks and side-by-side rows (rows.odin) and changed words for
+                     the diff view
+src/git/             A repository: git.odin (Status, Entry, Area, paths), repo.odin
+                     (libgit2: open, status, versions, stage, unstage, discard,
+                     splice_index, the files the poll watches), worker.odin (the worker
+                     thread: requests, events, refreshes, the poll), cli.odin (the git
+                     command line on a thread of its own); git_test on temp repositories
+src/process/         Child processes on pipes without a console window, in a job object
+                     on Windows (unless `detached`), with extra environment variables
+                     and stderr discarded if asked; PATH lookups; process_test
 src/toml/            Minimal TOML reader
+src/trash/           Moving to the system's trash from any thread: trash_windows.odin
+                     (IFileOperation in a single-threaded apartment, stopped before
+                     destroying what can't be recycled), trash_darwin.odin
+                     (NSFileManager trashItemAtURL), trash_freedesktop.odin (Linux and
+                     BSDs: the home trash or the device's .Trash-$uid, a .trashinfo
+                     reserving each name; tested there with a temp XDG_DATA_HOME)
+src/uitime/          A feature's share of the UI thread (Share, timed, take)
 vendor/              clay-odin, tree-sitter* (do not edit); sdl3: Odin's SDL3 bindings with
-                     foreign imports pointed at the static libraries
+                     foreign imports pointed at the static libraries; libgit2: bindings
+                     for what typo uses, and its license
 ref/clay_docs.md     Clay API reference
+docs/                Design notes (terminal_persistence.md: herdr-core's protocol)
 ```
 
 ## Clay
@@ -742,13 +1058,22 @@ Use Clay before writing UI machinery; read `ref/clay_docs.md` and
   directly in a clipping panel is as tall as its rows, so a list in it never scrolls
   and has no bar. Size what a clipping panel holds to the panel (`modal_at`'s pages
   are fixed; their lists are Grow inside them).
+- **Clipping elements are few**: Clay's store of clip and scroll containers holds about
+  100 (a changed list's old ones linger a frame); past that it fails with "out of
+  bounds array access". Lists lay out only the rows in view, and a row clips its
+  text through `row_clip()`, which stops clipping past `ROW_CLIP_BUDGET` a frame.
+  Every perf phase checks Clay reported no error and no frame drew `CLIP_LIMIT` (80)
+  clipping elements (`g.frame_clips`, counted in `render_clay_commands`).
 - **Scrolling**: use `update_scroll_containers`, not `clay.UpdateScrollContainers`. The
   wheel goes to the topmost list registered with `wheel_scroll_list` (`list_scrollbar`
   does that), not to any clipping element.
 - **Stacking** (floating zIndex): the sidebar in the base layout, "WorkArea" and
-  leaving panes 1, panes 2-3, popups (`modal`, finder, settings) 100,
-  scroll bar thumbs 110, hover popup 115, completion list, signature and rename field
-  116, context menu, language server and zoom popups 120, dialog 150, tooltips 300.
+  leaving panes 1, panes 2 (maximized 4: `pane_layer`), find bar 5, go to line 6,
+  popups (`modal`, finder, settings, sidebar search) 100 (`POPUP_LAYER`), hover
+  popup 115, completion list, signature and rename field 116, context menu,
+  language server and zoom popups 120, dialog 150, tooltips 300. A list's scroll bar
+  thumb (`list_scrollbar`) floats one above the layer of what holds the list, so
+  whatever covers the list covers it too.
 
 ## Markdown
 
@@ -859,10 +1184,15 @@ path_deleted :: proc(path: string) {
   `line_edit_event` (any text input), `modal` + `clicked_outside`, `dialog_show`
   (never a blocking native box), `resolve_unsaved` before closing files, `textedit.line_span`,
   `textedit.next_col`, `set_string`, `list_scrollbar` (with `SCROLLBAR_GUTTER` right
-  padding), `list_row` (sidebar rows), `gfx.draw_caret`.
-- New setting: a `Setting` value, a `Settings` field, a `SETTINGS` entry, a
-  `setting_value` case. Long-list string settings set `picker = true` and fill
-  `picker_options`; related number settings go in `picker_extras`.
+  padding and the layer of what holds the list), `list_reveal_row` (the selected row
+  in view), `list_row` (sidebar rows), `gfx.draw_caret`, `scroll_ease_step`,
+  `WHEEL_LINES` and `WHEEL_COLUMNS` (scrolling text).
+- New setting: a `Setting` value, a `Setting_Values` field, a `SETTINGS` entry, a
+  `setting_value` case; `user_only` if a project can't set it. Long-list string
+  settings set `picker = true` and fill `picker_options`; related number settings go
+  in `picker_extras`. Code reads the values in effect (`g.settings.x`); a change goes
+  to a layer (`g.settings.user`, or the settings window's `edit_values`), then
+  `settings_changed` or `project_settings_changed`.
 - New command: a `Command` value, a `COMMANDS` entry, a case in `run_command` or
   `editor_run_command`. A chord may name a mouse side button (`MOUSE_BUTTONS`); its
   press runs the command next frame on the pane under the pointer, which it focuses
@@ -929,10 +1259,9 @@ The architecture should allow these without rewrites:
   - Snippets select only the first tabstop (Tab doesn't move on); commit characters
     aren't used.
   - Completion closes when any caret leaves the word (multi-caret); re-filtering a
-    long list isn't inside `langs.timed`; a crash isn't noticed while a child of the
+    long list isn't timed in `langs.ui_share`; a crash isn't noticed while a child of the
     server still holds its stdout.
-  - Still on the UI thread: reading settings.toml when it changes on disk, and a
-    file's stat before saving (`changed_since_read`).
+  - Still on the UI thread: a file's stat before saving (`changed_since_read`).
   - On Windows `python` may be the Microsoft Store's alias, which only offers to
     install Python: `python -m pip` is offered then (when neither pip nor py is found).
   - A program installed where PATH only reaches in new processes isn't found until

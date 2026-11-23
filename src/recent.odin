@@ -2,48 +2,41 @@ package editor
 
 import "core:strings"
 
-// Recently used files, kept per workspace folder, most recent first: a file
-// moves to the front when its pane is focused. The finder lists them after the
-// open files and ranks them up among its matches; the session (session.json)
-// keeps them. A file deleted or renamed in typo leaves or follows; one gone
-// otherwise isn't listed (the finder lists only files it found) and is dropped
-// when the session is saved after the finder's index was built
+// The open project's recently used files, most recent first: a file moves to
+// the front when its pane is focused. The sidebar lists the first few under
+// RECENT (sidebar_recent.odin); the finder lists them after the open files and
+// ranks them up among its matches; the project's session keeps them
+// (session.odin). A file deleted or renamed in typo leaves or follows; one gone
+// otherwise isn't listed by the finder (it lists only files it found) and is
+// dropped when the session is saved after the finder's index was built
 
 
-RECENT_MAX_FILES   :: 50 // per folder
-RECENT_MAX_FOLDERS :: 20
+RECENT_MAX_FILES :: 50
 
 Recent_Files :: struct {
-	folders: [dynamic]Recent_Folder, // most recently used first
-}
-
-Recent_Folder :: struct {
-	root:  string,          // owned
 	files: [dynamic]string, // owned full paths, most recent first
 }
 
 
-// A file's pane was focused: it goes first in the workspace folder's list
+// A file's pane was focused: it goes first in the project's list
 recent_touch :: proc(path: string) {
 	if path == "" || g.workspace.root == "" {
 		return
 	}
 
-	recent_add(&g.recent, g.workspace.root, path)
+	recent_add(&g.recent, path)
 }
 
 
-// The workspace folder's recent files, most recent first
+// The project's recent files, most recent first
 recent_files :: proc() -> []string {
-	return recent_list(&g.recent, g.workspace.root)
+	return g.recent.files[:]
 }
 
 
-// Puts a file first in a folder's list (and the folder first), keeping at most
-// RECENT_MAX_FILES files and RECENT_MAX_FOLDERS folders
-recent_add :: proc(r: ^Recent_Files, root, path: string) {
-	folder := recent_folder(r, root)
-	files := &folder.files
+// Puts a file first, keeping at most RECENT_MAX_FILES
+recent_add :: proc(r: ^Recent_Files, path: string) {
+	files := &r.files
 
 	// Already first: focus changes with every press in a pane
 	if len(files) > 0 && same_path(files[0], path) {
@@ -68,23 +61,12 @@ recent_add :: proc(r: ^Recent_Files, root, path: string) {
 }
 
 
-// A folder's recent files, most recent first; nil if it has none
-recent_list :: proc(r: ^Recent_Files, root: string) -> []string {
-	for &folder in r.folders {
-		if same_path(folder.root, root) do return folder.files[:]
-	}
-	return nil
-}
-
-
-// A file or folder was deleted: it and what was inside it leave every list
+// A file or folder was deleted: it and what was inside it leave the list
 recent_forget :: proc(r: ^Recent_Files, path: string) {
-	for &folder in r.folders {
-		for i := len(folder.files) - 1; i >= 0; i -= 1 {
-			if path_within(folder.files[i], path) {
-				delete(folder.files[i])
-				ordered_remove(&folder.files, i)
-			}
+	for i := len(r.files) - 1; i >= 0; i -= 1 {
+		if path_within(r.files[i], path) {
+			delete(r.files[i])
+			ordered_remove(&r.files, i)
 		}
 	}
 }
@@ -92,99 +74,58 @@ recent_forget :: proc(r: ^Recent_Files, path: string) {
 
 // A file or folder was renamed: it and what was inside it follow
 recent_renamed :: proc(r: ^Recent_Files, from, to: string) {
-	for &folder in r.folders {
-		for &f in folder.files {
-			if !path_within(f, from) do continue
+	for &f in r.files {
+		if !path_within(f, from) do continue
 
-			renamed := strings.concatenate({to, f[len(from):]})
-			delete(f)
-			f = renamed
-		}
+		renamed := strings.concatenate({to, f[len(from):]})
+		delete(f)
+		f = renamed
 	}
 }
 
 
-// Takes the lists saved with the session (copied), in their order
-recent_load :: proc(r: ^Recent_Files, saved: []Session_Recent) {
-	for s in saved {
-		if s.root == "" || recent_list(r, s.root) != nil {
-			continue
-		}
-		if len(r.folders) >= RECENT_MAX_FOLDERS do break
+// Takes a list as the session saved it (copied), in its order, in place of the
+// current one
+recent_load :: proc(r: ^Recent_Files, saved: []string) {
+	recent_clear(r)
+	for path in saved {
+		if len(r.files) >= RECENT_MAX_FILES do break
+		if path == "" do continue
 
-		folder := Recent_Folder{root = strings.clone(s.root)}
-		for path in s.files[:min(len(s.files), RECENT_MAX_FILES)] {
-			append(&folder.files, strings.clone(path))
+		duplicate := false
+		for f in r.files {
+			if same_path(f, path) do duplicate = true
 		}
-		append(&r.folders, folder)
+		if !duplicate do append(&r.files, strings.clone(path))
 	}
 }
 
 
-// The lists as the session saves them, in the temp allocator (the strings are
-// the lists' own)
-recent_saved :: proc(r: ^Recent_Files) -> []Session_Recent {
-	saved := make([]Session_Recent, len(r.folders), context.temp_allocator)
-	for folder, i in r.folders {
-		saved[i] = {root = folder.root, files = folder.files[:]}
-	}
-	return saved
+recent_clear :: proc(r: ^Recent_Files) {
+	for f in r.files do delete(f)
+	clear(&r.files)
 }
 
 
-// Drops the workspace folder's recent files that the finder's index, once
-// complete, shows are gone
+// Drops the recent files that the finder's index, once complete, shows are
+// gone from the project's folder
 recent_drop_missing :: proc() {
+	files := &g.recent.files
+	missing, known := finder_unindexed(files[:])
+	if !known do return
+
 	root := g.workspace.root
-	for &folder in g.recent.folders {
-		if !same_path(folder.root, root) do continue
-
-		missing, known := finder_unindexed(folder.files[:])
-		if !known do return
-
-		for i := len(folder.files) - 1; i >= 0; i -= 1 {
-			if missing[i] && path_within(folder.files[i], root) {
-				delete(folder.files[i])
-				ordered_remove(&folder.files, i)
-			}
+	for i := len(files) - 1; i >= 0; i -= 1 {
+		if missing[i] && path_within(files[i], root) {
+			delete(files[i])
+			ordered_remove(files, i)
 		}
-		return
 	}
 }
 
 
 recent_destroy :: proc(r: ^Recent_Files) {
-	for folder in r.folders do folder_destroy(folder)
-	delete(r.folders)
+	recent_clear(r)
+	delete(r.files)
 	r^ = {}
-}
-
-
-@(private = "file")
-folder_destroy :: proc(folder: Recent_Folder) {
-	delete(folder.root)
-	for f in folder.files do delete(f)
-	delete(folder.files)
-}
-
-
-// A folder's entry, moved first; added if new (the oldest folder makes room)
-@(private = "file")
-recent_folder :: proc(r: ^Recent_Files, root: string) -> ^Recent_Folder {
-	for folder, i in r.folders {
-		if !same_path(folder.root, root) do continue
-
-		if i > 0 {
-			ordered_remove(&r.folders, i)
-			inject_at(&r.folders, 0, folder)
-		}
-		return &r.folders[0]
-	}
-
-	if len(r.folders) >= RECENT_MAX_FOLDERS {
-		folder_destroy(pop(&r.folders))
-	}
-
-	inject_at(&r.folders, 0, Recent_Folder{root = strings.clone(root)})
-	return &r.folders[0]
 }

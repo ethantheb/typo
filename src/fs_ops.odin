@@ -9,26 +9,40 @@ import "core:strings"
 // files, the tree and the finder's index in step
 
 
-// Deleting moves to the Recycle Bin on Windows (fs_ops_windows.odin), unless an
-// item can't go there; then, and elsewhere, it is permanent once confirmed
-DELETE_TO_TRASH :: ODIN_OS == .Windows
+// Deleting moves to the system's trash (the trash package) on the writer thread
+// (file_io.odin); an item that can't go there is deleted permanently only once
+// the user agrees. The trash, as dialogs call it:
+TRASH_NAME :: "Recycle Bin" when ODIN_OS == .Windows else "Trash"
 
-Delete_Result :: enum {
-	Done,
-	Failed,
-	Not_Recyclable, // nothing was deleted
+
+// Deletes a file or folder on the writer thread, to the trash or permanently;
+// delete_landed takes what happened
+delete_path :: proc(path: string, permanent: bool) {
+	r, done := io_post_delete(Delete_Job{path = strings.clone(path), permanent = permanent})
+	if done {
+		delete_landed(r)
+		io_result_destroy(r)
+	}
 }
 
 
-delete_path :: proc(path: string, permanent: bool) -> Delete_Result {
-	when DELETE_TO_TRASH {
-		if !permanent do return move_to_trash(path)
-	}
+// What deleting did: the tree and open files forget it, or the user is asked
+// to delete it permanently, or told it failed
+delete_landed :: proc(r: Delete_Result) {
+	switch r.outcome {
+	case .Done:
+		path_deleted(r.path)
 
-	if os.remove_all(path) != nil {
-		return .Failed
+	case .Not_Recyclable:
+		ask_delete_file(r.path, permanent = true)
+
+	case .Failed:
+		// Some of a folder may be gone
+		workspace_refresh(&g.workspace)
+		finder_invalidate()
+		message := fmt.tprintf("%s could not be deleted.", relative_to_root(r.path))
+		show_notice("Couldn't delete", message)
 	}
-	return .Done
 }
 
 
@@ -135,8 +149,9 @@ rename_path :: proc(path, name: string) -> (problem: string) {
 		g.md_modes[renamed] = mode
 	}
 
-	// And the recent files
+	// And the recent and pinned files
 	recent_renamed(&g.recent, path, to)
+	project_pins_renamed(path, to)
 
 	workspace_refresh(&g.workspace)
 	finder_invalidate()
@@ -188,9 +203,11 @@ create_path :: proc(dir, name: string, folder: bool) -> (problem: string) {
 
 
 // After deleting a file or folder: its open files close (it was confirmed, so
-// unsaved changes go too) and the tree, the finder and the recent files forget it
+// unsaved changes go too) and the tree, the finder and the recent and pinned
+// files forget it
 path_deleted :: proc(path: string) {
 	recent_forget(&g.recent, path)
+	project_pins_forget(path)
 
 	// Close the files that were inside it
 	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {

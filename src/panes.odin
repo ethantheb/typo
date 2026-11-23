@@ -23,7 +23,9 @@ import "gfx"
 PANE_GAP           :: 6   // between panes, and around them
 PANE_RADIUS        :: 8
 PANE_HEADER_HEIGHT :: 30
+PANE_ICON_SIZE     :: 14  // a pane's icon in its title and on the shelf
 PANE_MIN_SIZE      :: 100 // a divider keeps both sides at least this big
+PANE_HEADER_MIN    :: 140 // a narrower pane cuts its header off at its edge
 DRAG_THRESHOLD     :: 4   // how far a press on a title, shelf row or file moves before it drags
 EDGE_ZONE          :: 32  // a drop this close to the work area's edge takes half of the area
 CENTER_ZONE        :: 0.3 // a drop at least this far into a pane from each edge takes its place
@@ -31,6 +33,8 @@ CENTER_ZONE        :: 0.3 // a drop at least this far into a pane from each edge
 Pane_Content :: union {
 	^Editor,
 	^Terminal,
+	^Git_View,  // the Git pane (git_pane.odin), one at most
+	^Diff_View, // a file's diff (diff_view.odin)
 }
 
 Pane :: struct {
@@ -91,7 +95,7 @@ Drag_Source :: enum {
 	Title,
 	Shelf,  // a click shows the pane
 	Tree,   // a click opens the file
-	Search, // a sidebar search result: a click opens the file and closes the search
+	Recent, // a file under RECENT: a click opens it
 }
 
 Panes :: struct {
@@ -247,6 +251,12 @@ pane_title :: proc(p: ^Pane) -> string {
 			return fmt.tprintf("%s %d", name, p.number)
 		}
 		return name
+
+	case ^Git_View:
+		return "Git"
+
+	case ^Diff_View:
+		return diff_view_title(c)
 	}
 	return ""
 }
@@ -254,14 +264,44 @@ pane_title :: proc(p: ^Pane) -> string {
 
 pane_icon :: proc(p: ^Pane) -> gfx.Icon {
 	switch c in p.content {
-	case ^Editor:   return file_icon(c.path)
-	case ^Terminal: return .Terminal
+	case ^Editor:    return file_icon(c.path)
+	case ^Terminal:  return .Terminal
+	case ^Git_View:  return .Git_Branch
+	case ^Diff_View: return .Git_Compare
 	}
 	return .File_Text
 }
 
 
-@(private = "file")
+// A pinned terminal's pin, on its icon: it runs in herdr-core and keeps running
+// when typo closes
+pane_badge :: proc(p: ^Pane) -> Maybe(gfx.Icon_Badge) {
+	t, is_terminal := p.content.(^Terminal)
+	if !is_terminal || !t.persistent {
+		return nil
+	}
+	return gfx.Icon_Badge{.Pin, gfx.theme.accent}
+}
+
+
+// A pane's icon in its title or on the shelf (`place`), a pinned terminal's
+// with its pin and a tooltip saying what it means
+pane_icon_ui :: proc(p: ^Pane, color: clay.Color, place: Rename_Place) {
+	badge := pane_badge(p)
+	if badge == nil {
+		icon(pane_icon(p), color, PANE_ICON_SIZE)
+		return
+	}
+
+	id := clay.ID("PinnedIcon", u32(p.id) << 2 | u32(place))
+	square := clay.SizingFixed(PANE_ICON_SIZE)
+	if clay.UI(id)({layout = {sizing = {square, square}}}) {
+		icon(pane_icon(p), color, PANE_ICON_SIZE, badge)
+	}
+	tooltip(id, "Pinned: keeps running in herdr-core when typo closes")
+}
+
+
 file_icon :: proc(path: string) -> gfx.Icon {
 	ext := filepath.ext(path)
 	if is_markdown_path(path) || strings.equal_fold(ext, ".txt") || ext == "" {
@@ -391,6 +431,63 @@ pane_for_file :: proc(path: string) -> ^Pane {
 }
 
 
+// The Git pane, not shown yet (taking the view)
+panes_add_git :: proc(gv: ^Git_View) -> ^Pane {
+	return pane_add(gv)
+}
+
+
+// A diff pane, not shown yet (taking the view)
+panes_add_diff :: proc(dv: ^Diff_View) -> ^Pane {
+	return pane_add(dv)
+}
+
+
+// Where the Git pane goes: a column left of the editor in use, else of the
+// pane in use, else the whole work area
+place_for_git :: proc(p: ^Pane) -> Drop {
+	ps := &g.panes
+	if ps.root == nil do return {kind = .Fill}
+
+	for q in ([?]^Pane{ps.last_editor, ps.focused}) {
+		if q != nil && q != p && pane_shown(q) {
+			return {kind = .Split, target = q, side = .Left, share = 0.3}
+		}
+	}
+	return {kind = .Edge, side = .Left, share = 0.3}
+}
+
+
+// Where a new diff pane goes: in place of the editor in use (which closes
+// unless it has unsaved changes), else right of the Git pane, else beside the
+// rest
+place_for_diff :: proc(p: ^Pane) -> Drop {
+	ps := &g.panes
+	if ps.root == nil do return {kind = .Fill}
+
+	if q := ps.last_editor; q != nil && pane_shown(q) {
+		return {kind = .Swap, target = q}
+	}
+	if q := git_pane(); q != nil && pane_shown(q) {
+		return {kind = .Split, target = q, side = .Right, share = 0.7}
+	}
+	return {kind = .Edge, side = .Right, share = 0.6}
+}
+
+
+// Whether a pane closes when it leaves the layout: the Git and diff panes,
+// which have no shelf to wait on, and files without unsaved changes
+@(private = "file")
+closes_when_hidden :: proc(p: ^Pane) -> bool {
+	switch _ in p.content {
+	case ^Editor:               return !pane_modified(p)
+	case ^Git_View, ^Diff_View: return true
+	case ^Terminal:             return false
+	}
+	return false
+}
+
+
 // Starts a terminal on the shelf; its shell starts once it is shown
 panes_add_terminal :: proc() -> ^Pane {
 	t := new(Terminal)
@@ -485,7 +582,7 @@ place_for :: proc(p: ^Pane) -> Drop {
 // Moves a pane where `d` says, in the layout or out of it. A file that loses its
 // place to it closes, unless it has unsaved changes; to a file still loading,
 // once that one has loaded (so a large file the user then doesn't open can give
-// the place back)
+// the place back). A Git or diff pane that loses its place closes
 pane_move :: proc(p: ^Pane, d: Drop) {
 	ps := &g.panes
 	if d.kind == .None do return
@@ -502,18 +599,18 @@ pane_move :: proc(p: ^Pane, d: Drop) {
 	drop_apply(&ps.root, p, d)
 	tree_changed()
 
-	// The file it swapped out, if that left the layout
+	// The pane it swapped out, if that left the layout
 	q := d.target
-	swapped_out := d.kind == .Swap && q != p && is_editor(q) && !pane_shown(q)
+	swapped_out := d.kind == .Swap && q != p && !pane_shown(q)
 	if !swapped_out do return
 
-	// A file loading in its place gives it back if the user cancels
+	// A file loading in a file's place gives it back if the user cancels
 	e, is_file := p.content.(^Editor)
-	if is_file && e.status == .Loading && e.load.replaced == nil {
+	if is_file && is_editor(q) && e.status == .Loading && e.load.replaced == nil {
 		e.load.replaced = q
 		return
 	}
-	if !pane_modified(q) do pane_close(q, ask = false)
+	if closes_when_hidden(q) do pane_close(q, ask = false)
 }
 
 
@@ -539,12 +636,13 @@ pane_focus :: proc(p: ^Pane) {
 }
 
 
-// Closes a pane: a file or a terminal and its shell. A file with unsaved
-// changes is asked about first (unless `ask` is false) and closes once
-// answered; returns false then
+// Closes a pane: a file or a terminal and its shell. Unless `ask` is false, a
+// file with unsaved changes is asked about first, and a terminal whose shell
+// is alive is closed once the programs running in it were looked for (and
+// asked about, if any); returns false then
 pane_close :: proc(p: ^Pane, ask := true) -> bool {
 	ps := &g.panes
-	if ask && pane_modified(p) {
+	if ask && (pane_modified(p) || terminal_alive(p)) {
 		resolve_unsaved({p}, Closing_Pane(p))
 		return false
 	}
@@ -584,6 +682,12 @@ pane_close :: proc(p: ^Pane, ask := true) -> bool {
 	case ^Terminal:
 		terminal_destroy(c)
 		free(c)
+	case ^Git_View:
+		git_view_destroy(c)
+		free(c)
+	case ^Diff_View:
+		diff_view_close(c)
+		free(c)
 	}
 	delete(p.name)
 	free(p)
@@ -591,11 +695,24 @@ pane_close :: proc(p: ^Pane, ask := true) -> bool {
 }
 
 
-panes_destroy :: proc() {
+// Closes every pane without asking (quitting, or leaving the project).
+// Persistent terminals are let go of first, so their shells keep running
+panes_close_all :: proc() {
 	ps := &g.panes
+	for p in ps.open {
+		t, is_terminal := p.content.(^Terminal)
+		if is_terminal do terminal_detach(t)
+	}
 	for len(ps.open) > 0 {
 		pane_close(ps.open[len(ps.open) - 1], ask = false)
 	}
+}
+
+
+// Closes every pane as typo quits
+panes_destroy :: proc() {
+	ps := &g.panes
+	panes_close_all()
 
 	drag_clear()
 	delete(ps.open)
@@ -940,8 +1057,21 @@ panes_frame :: proc() {
 			if p.visible do editor_frame(c, body_id(p), live)
 		case ^Terminal:
 			terminal_frame(c, body_id(p), p.visible, live)
+		case ^Git_View:
+			if p.visible do git_view_frame(p, c)
+		case ^Diff_View:
+			if p.visible {
+				diff_view_frame(c, diff_side_id(p, .Left), diff_side_id(p, .Right), live)
+			}
 		}
 	}
+}
+
+
+// The element of a diff pane's side
+@(private = "file")
+diff_side_id :: proc(p: ^Pane, side: Diff_Pane_Side) -> clay.ElementId {
+	return clay.ID(side == .Left ? "DiffLeft" : "DiffRight", p.id)
 }
 
 
@@ -959,6 +1089,7 @@ panes_busy :: proc() -> bool {
 			}
 		case ^Terminal:
 			if c.busy do return true
+		case ^Git_View, ^Diff_View:
 		}
 	}
 	return false
@@ -1070,13 +1201,12 @@ drag_mouse :: proc(interactive: bool) {
 		case d.source == .Shelf:
 			pane_show(d.pane)
 
-		case d.source == .Tree || d.source == .Search:
+		case d.source == .Tree || d.source == .Recent:
 			if d.pane == &incoming {
 				panes_open_file(d.file)
 			} else {
 				pane_show(d.pane)
 			}
-			if d.source == .Search do sidebar_search_close()
 		}
 		drag_clear()
 		return
@@ -1132,11 +1262,10 @@ drag_press :: proc() {
 		}
 	}
 
-	// A file in the tree, or in the sidebar's search results
-	path, on_file := sidebar_file_under_pointer()
+	// A file in the tree or under RECENT
+	path, source, on_file := sidebar_file_under_pointer()
 	if !on_file do return
 
-	source := sidebar_search_active() ? Drag_Source.Search : Drag_Source.Tree
 	if p := pane_with_file(path); p != nil {
 		d^ = {pane = p, from = g.mouse_pos, source = source}
 	} else {
@@ -1291,6 +1420,13 @@ pane_ease :: proc "c" (args: clay.TransitionCallbackArguments) -> bool {
 }
 
 
+// A pane's floating layer: a maximized pane over the others, with a layer
+// between for what floats on a pane's content (a list's scroll bar thumb)
+pane_layer :: proc(p: ^Pane) -> i16 {
+	return p == g.panes.maximized ? 4 : 2
+}
+
+
 @(private = "file")
 pane_element :: proc(p: ^Pane) {
 	ps := &g.panes
@@ -1298,12 +1434,18 @@ pane_element :: proc(p: ^Pane) {
 	focused := p == ps.focused
 	dragged := ps.drag.active && ps.drag.pane == p
 
-	// The focused pane is outlined, unless it is the only one in view
+	// The focused pane's outline is a lighter grey, unless it is the only one in view
 	border := gfx.theme.border
 	if focused && pane_fill(p) == .Shared {
-		border = gfx.theme.accent
-		border.a = 70
+		border = gfx.mix(gfx.theme.border, gfx.theme.text, 0.22)
 	}
+
+	// The pane clips what it holds: header and body are laid out at least their
+	// minimum width, at most the pane's (a clipping element's children grow to
+	// their content), and a narrower pane cuts them off at its edge
+	inside_w := r.w - 2
+	body_h := max(r.h - 1 - PANE_RADIUS / 2 - PANE_HEADER_HEIGHT, 0)
+	body_min := pane_body_min(p)
 
 	if clay.UI(pane_id(p))({
 		layout = {
@@ -1315,28 +1457,26 @@ pane_element :: proc(p: ^Pane) {
 		overlayColor = window_overlay(dragged ? 150 : 0),
 		cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
 		border = {color = border, width = clay.BorderOutside(1)},
+		clip = {horizontal = true, vertical = true},
 		floating = {
 			attachTo = .Parent,
 			offset = {r.x, r.y},
-			zIndex = p == ps.maximized ? 3 : 2,
+			zIndex = pane_layer(p),
 		},
 		transition = pane_transition(p),
 	}) {
-		pane_header(p, focused)
+		g.in_pane = p
+		pane_header(p, focused, pane_part_width(PANE_HEADER_MIN, inside_w))
 
-		switch c in p.content {
-		case ^Editor:
-			switch c.status {
-			case .Text:   custom_element(body_id(p), c)
-			case .Error:  centered_message("Could not read file")
-			case .Binary: centered_message("Binary file not shown")
-			case .Loading:
-				if editor_loading_shown(c) do centered_message(loading_message(c))
-			case .None:
-			}
-		case ^Terminal:
-			custom_element(body_id(p), c)
+		if clay.UI()({
+			layout = {
+				sizing = {pane_part_width(body_min, inside_w), clay.SizingGrow({max = body_h})},
+				layoutDirection = .TopToBottom,
+			},
+		}) {
+			pane_body(p)
 		}
+		g.in_pane = nil
 
 		find_bar_ui(p)
 		goto_line_ui(p)
@@ -1344,12 +1484,64 @@ pane_element :: proc(p: ^Pane) {
 }
 
 
+// A pane's header or body: at least `least` wide, else as wide as the pane
+@(private = "file")
+pane_part_width :: proc(least, inside_w: f32) -> clay.SizingAxis {
+	return clay.SizingGrow({min = least, max = max(inside_w, least)})
+}
+
+
+// The narrowest a pane's body is laid out: editors and terminals follow the
+// pane, the Git and diff panes' controls need room
+@(private = "file")
+pane_body_min :: proc(p: ^Pane) -> f32 {
+	switch _ in p.content {
+	case ^Editor, ^Terminal: return 0
+	case ^Git_View:          return GIT_MIN_WIDTH
+	case ^Diff_View:         return DIFF_MIN_WIDTH
+	}
+	return 0
+}
+
+
+@(private = "file")
+pane_body :: proc(p: ^Pane) {
+	switch c in p.content {
+	case ^Editor:
+		switch c.status {
+		case .Text:   custom_element(body_id(p), c)
+		case .Error:  centered_message("Could not read file")
+		case .Binary: centered_message("Binary file not shown")
+		case .Loading:
+			if editor_loading_shown(c) do centered_message(loading_message(c))
+		case .None:
+		}
+	case ^Terminal:
+		custom_element(body_id(p), c)
+	case ^Git_View:
+		git_view_ui(p, c)
+	case ^Diff_View:
+		diff_view_ui(p, c, diff_side_id(p, .Left), diff_side_id(p, .Right))
+	}
+}
+
+
+// Whether the pointer is over the pane where it shows: in its rect and not
+// under the maximized pane
+pointer_over_pane :: proc(p: ^Pane) -> bool {
+	if !pointer_in(pane_id(p)) do return false
+
+	top := g.panes.maximized
+	return top == nil || top == p || !pointer_in(pane_id(top))
+}
+
+
 // Icon and title (the handle to drag the pane by), then the pane's buttons
 @(private = "file")
-pane_header :: proc(p: ^Pane, focused: bool) {
+pane_header :: proc(p: ^Pane, focused: bool, width: clay.SizingAxis) {
 	if clay.UI()({
 		layout = {
-			sizing = {clay.SizingGrow(), clay.SizingFixed(PANE_HEADER_HEIGHT)},
+			sizing = {width, clay.SizingFixed(PANE_HEADER_HEIGHT)},
 			padding = {left = 10, right = 4},
 			childGap = 2,
 			childAlignment = {y = .Center},
@@ -1363,19 +1555,23 @@ pane_header :: proc(p: ^Pane, focused: bool) {
 				childGap = 6,
 				childAlignment = {y = .Center},
 			},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
-			icon(pane_icon(p), focused ? gfx.theme.accent : gfx.theme.text_dim, 14)
+			pane_icon_ui(p, focused ? gfx.theme.accent : gfx.theme.text_dim, .Title)
 
 			if renaming(.Title, pane = p) {
 				rename_field(FONT_SIZE_SMALL)
 			} else {
 				label(pane_title(p), focused ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SMALL)
 				if pane_modified(p) do label("•", gfx.theme.text_dim, FONT_SIZE_SMALL)
+				_, is_git := p.content.(^Git_View)
+				if is_git do git_title_note()
 			}
 		}
-		if e, ok := p.content.(^Editor); ok {
-			tooltip(title, relative_to_root(e.path))
+		switch c in p.content {
+		case ^Editor:    tooltip(title, relative_to_root(c.path))
+		case ^Diff_View: tooltip(title, c.rel)
+		case ^Terminal, ^Git_View:
 		}
 
 		// Buttons
@@ -1430,7 +1626,7 @@ maximize_button :: proc(p: ^Pane) {
 }
 
 
-@(private = "file")
+// A line of text in the middle of a pane's body
 centered_message :: proc(s: string) {
 	if clay.UI()({
 		layout = {
@@ -1530,7 +1726,7 @@ drag_ui :: proc() {
 			icon(file_icon(d.file), gfx.theme.accent, 14)
 			label(filepath.base(d.file), gfx.theme.text, FONT_SIZE_SMALL)
 		} else {
-			icon(pane_icon(d.pane), gfx.theme.accent, 14)
+			icon(pane_icon(d.pane), gfx.theme.accent, 14, pane_badge(d.pane))
 			label(pane_title(d.pane), gfx.theme.text, FONT_SIZE_SMALL)
 		}
 	}
@@ -1539,8 +1735,7 @@ drag_ui :: proc() {
 
 // --- Shelf -------------------------------------------------------------------------
 
-@(private = "file")
-SHELF_ROW_HEIGHT :: 24
+SHELF_ROW_HEIGHT :: 24 // the shelf's rows, and RECENT's above it
 
 // The terminals, under the file tree. A click shows one; a drag places it
 shelf :: proc(max_height: f32) {
@@ -1563,8 +1758,10 @@ shelf :: proc(max_height: f32) {
 			label("TERMINALS", gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
 			push_right()
 
+			// Right-click: what new terminals are (context_menu.odin)
 			chord := first_chord_label(.New_Terminal)
-			if icon_button(clay.ID("NewTerminal"), .Plus, 20, 14, "New terminal", chord) {
+			tip := persist_wanted() ? "New pinned terminal" : "New terminal"
+			if icon_button(clay.ID("NewTerminal"), .Plus, 20, 14, tip, chord) {
 				defer_action(Run_Command(.New_Terminal))
 			}
 		}
@@ -1608,13 +1805,13 @@ shelf_row :: proc(p: ^Pane, list: clay.ElementId) {
 
 	if list_row(id, p == g.panes.focused, SHELF_ROW_HEIGHT, 8, 7) {
 		hovered := clay.Hovered()
-		icon(pane_icon(p), shown ? gfx.theme.accent : gfx.theme.text_faint, 14)
+		pane_icon_ui(p, shown ? gfx.theme.accent : gfx.theme.text_faint, .Shelf)
 
 		if renaming(.Shelf, pane = p) {
 			rename_field(FONT_SIZE_SIDEBAR)
 		} else if clay.UI()({
 			layout = {sizing = {width = clay.SizingGrow()}},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
 			label(pane_title(p), shown ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SIDEBAR)
 		}

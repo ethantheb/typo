@@ -7,9 +7,11 @@ import "base:runtime"
 import "core:sync"
 import "core:thread"
 
+import "../process"
+
 
 Connection :: struct {
-	process:   Process,
+	process:   process.Process,
 	running:   bool, // the process started and the threads are running
 	reader:    ^thread.Thread,
 	writer:    ^thread.Thread,
@@ -50,7 +52,7 @@ conn_start :: proc(
 ) {
 	c^ = {allocator = context.allocator, wake = wake, wake_data = wake_data}
 
-	ok, reason = process_spawn(&c.process, command, cwd)
+	ok, reason = process.process_spawn(&c.process, command, cwd)
 	if !ok do return
 
 	// Each thread has its own temp allocator; bodies come from ours
@@ -111,15 +113,15 @@ conn_stop :: proc(c: ^Connection, wait_ms: int) {
 
 	// Ended even if it exited: what it started (e.g. a build it ran) may hold
 	// its pipes open, and then the threads reading them would never finish
-	process_wait(&c.process, wait_ms)
-	process_kill(&c.process)
-	process_wait(&c.process, 1000)
+	process.process_wait(&c.process, wait_ms)
+	process.process_kill(&c.process)
+	process.process_wait(&c.process, 1000)
 
 	// The pipes are broken now, so each thread finishes (destroy joins)
 	thread.destroy(c.reader)
 	thread.destroy(c.writer)
 	thread.destroy(c.logger)
-	process_close(&c.process)
+	process.process_close(&c.process)
 
 	for body in c.incoming do delete(body, c.allocator)
 	delete(c.incoming)
@@ -138,7 +140,7 @@ reader_proc :: proc(c: ^Connection) {
 	defer framer_destroy(&framer)
 
 	for {
-		n := process_read(&c.process, .Stdout, buf)
+		n := process.process_read(&c.process, .Stdout, buf)
 		if n <= 0 do break
 
 		framer_feed(&framer, buf[:n])
@@ -178,7 +180,7 @@ writer_proc :: proc(c: ^Connection) {
 		sync.unlock(&c.mutex)
 		if done do break
 
-		if !process_write(&c.process, pending[:]) do break
+		if !process.process_write(&c.process, pending[:]) do break
 		clear(&pending)
 	}
 }
@@ -191,7 +193,7 @@ logger_proc :: proc(c: ^Connection) {
 	defer delete(buf)
 
 	for {
-		n := process_read(&c.process, .Stderr, buf)
+		n := process.process_read(&c.process, .Stderr, buf)
 		if n <= 0 do break
 
 		if sync.guard(&c.mutex) {

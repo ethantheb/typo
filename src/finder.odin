@@ -1,6 +1,5 @@
 package editor
 
-import "base:runtime"
 import "core:fmt"
 import "core:strings"
 import "core:sync"
@@ -146,6 +145,7 @@ finder_toggle :: proc() {
 finder_open :: proc(source: Finder_Source, what := "") {
 	f := &g.finder
 	if f.open do finder_close()
+	g.sidebar_search.open = false // one list of files at a time
 
 	f.open = true
 	f.opened_at = g.frame
@@ -256,7 +256,7 @@ finder_frame :: proc() {
 	if f.stale && !f.indexing {
 		finder_invalidate()
 		finder_lists_files := f.open && f.source == .Files
-		if finder_lists_files || sidebar_search_active() {
+		if finder_lists_files || g.sidebar_search.open {
 			start_indexer()
 		}
 	}
@@ -433,11 +433,9 @@ start_indexer :: proc() {
 	f.shared.root = strings.clone(g.workspace.root)
 	f.indexing = true
 
-	f.indexer = thread.create_and_start_with_poly_data(
-		f.shared,
-		index_files,
-		init_context = runtime.default_context(),
-	)
+	// The default context: its heap allocator is thread-safe, and the thread's
+	// temp memory is freed as it ends (it is started again whenever files change)
+	f.indexer = thread.create_and_start_with_poly_data(f.shared, index_files)
 }
 
 
@@ -728,19 +726,17 @@ finder_scroll_to_selected :: proc(center := false) {
 	scroll := clay.GetScrollContainerData(clay.ID("FinderResults"))
 	if !scroll.found do return
 
-	top := f32(g.finder.selected) * FINDER_ROW_HEIGHT
-	view := scroll.scrollContainerDimensions.height
+	if !center {
+		list_reveal_row(scroll, g.finder.selected, FINDER_ROW_HEIGHT)
+		return
+	}
 
 	// scrollPosition is negative: content offset upward
-	if center {
-		total := f32(len(g.finder.results)) * FINDER_ROW_HEIGHT
-		lowest := -max(total - view, 0)
-		scroll.scrollPosition.y = clamp(-(top - (view - FINDER_ROW_HEIGHT) / 2), lowest, 0)
-	} else if top < -scroll.scrollPosition.y {
-		scroll.scrollPosition.y = -top
-	} else if top + FINDER_ROW_HEIGHT > -scroll.scrollPosition.y + view {
-		scroll.scrollPosition.y = -(top + FINDER_ROW_HEIGHT - view)
-	}
+	top := f32(g.finder.selected) * FINDER_ROW_HEIGHT
+	view := scroll.scrollContainerDimensions.height
+	total := f32(len(g.finder.results)) * FINDER_ROW_HEIGHT
+	lowest := -max(total - view, 0)
+	scroll.scrollPosition.y = clamp(-(top - (view - FINDER_ROW_HEIGHT) / 2), lowest, 0)
 }
 
 
@@ -967,7 +963,7 @@ item_row :: proc(index: int, item: Finder_Item, query: string, selected: bool) -
 		// The label and detail, cut off before the file
 		if clay.UI()({
 			layout = {sizing = {width = clay.SizingGrow()}, childAlignment = {y = .Center}},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
 			outline := f.source == .File_Symbols && len(query) == 0
 			if outline && item.depth > 0 {

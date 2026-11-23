@@ -3,7 +3,9 @@ package diff
 // Line diffs with Myers' O(ND) algorithm ("An O(ND) Difference Algorithm and
 // Its Variations", 1986), the one git and most editors use by default. A file
 // changed on disk is reloaded as edits of the lines that changed, so carets,
-// undo and incremental parsers see a small change, not a new document
+// undo and incremental parsers see a small change, not a new document. The
+// side-by-side diff view takes the hunks as line numbers (line_hunks, rows.odin)
+// and the words that changed within a changed line (words)
 
 import "core:hash"
 import "core:slice"
@@ -14,6 +16,9 @@ import "core:slice"
 // Keeps the time and the trace's memory (MAX_EDITS² offsets) bounded
 MAX_EDITS :: 1000
 
+// Tokens added or removed beyond which two lines count as wholly different
+MAX_WORD_EDITS :: 64
+
 // Bytes [old_lo, old_hi) of the old text are replaced by [new_lo, new_hi) of the
 // new one. Hunks are sorted and don't overlap; each covers whole lines
 Hunk :: struct {
@@ -21,10 +26,28 @@ Hunk :: struct {
 	new_lo, new_hi: int,
 }
 
+// Lines [old_lo, old_hi) of the old text are replaced by [new_lo, new_hi) of the
+// new one, counting lines as an editor does: split at each '\n', the part
+// after the last one a line too (empty when the text ends with one). A line's
+// ending isn't part of it, "\r\n" or "\n" alike (as git sees a file checked
+// out with other line endings than it stores)
+Line_Hunk :: struct {
+	old_lo, old_hi: int,
+	new_lo, new_hi: int,
+}
+
+// A line of a text, or a token of a line: bytes [start, end) and their hash
 @(private = "file")
 Line :: struct {
-	start, end: int, // bytes, the line break included
+	start, end: int,
 	hash:       u64,
+}
+
+// How a text is split into lines
+@(private = "file")
+Split :: enum {
+	With_Breaks,    // each line with its '\n'; no empty line after a last '\n'
+	Without_Breaks, // as an editor counts lines, without their "\r\n" or "\n"
 }
 
 // One line removed from the old text at x, or inserted from the new one at y
@@ -37,51 +60,87 @@ Step :: struct {
 
 // The hunks that turn `old` into `new`, in `allocator`. Empty when they're equal
 lines :: proc(old, new: []u8, allocator := context.allocator) -> []Hunk {
-	context.allocator = allocator
+	a := split_lines(old, .With_Breaks, context.temp_allocator)
+	b := split_lines(new, .With_Breaks, context.temp_allocator)
+	found := diff_lines(old, new, a, b)
 
-	a := split_lines(old, context.temp_allocator)
-	b := split_lines(new, context.temp_allocator)
+	// Line indexes -> bytes
+	hunks := make([]Hunk, len(found), allocator)
+	for h, i in found {
+		hunks[i] = {
+			old_lo = line_offset(a, h.old_lo, len(old)),
+			old_hi = line_offset(a, h.old_hi, len(old)),
+			new_lo = line_offset(b, h.new_lo, len(new)),
+			new_hi = line_offset(b, h.new_hi, len(new)),
+		}
+	}
+	return hunks
+}
 
-	// The lines both start and end with
-	prefix := 0
-	for prefix < len(a) && prefix < len(b) && same_line(old, new, a[prefix], b[prefix]) {
-		prefix += 1
-	}
-	suffix := 0
-	for suffix < len(a) - prefix && suffix < len(b) - prefix {
-		x, y := a[len(a) - 1 - suffix], b[len(b) - 1 - suffix]
-		if !same_line(old, new, x, y) do break
-		suffix += 1
-	}
-	a_mid := a[prefix:len(a) - suffix]
-	b_mid := b[prefix:len(b) - suffix]
 
-	hunks := make([dynamic]Hunk)
-	if len(a_mid) == 0 && len(b_mid) == 0 {
-		return hunks[:]
+// The hunks that turn `old` into `new` as line numbers, in `allocator`, with
+// each text's line count. Line endings don't count
+line_hunks :: proc(
+	old, new: []u8,
+	allocator := context.allocator,
+) -> (
+	hunks: []Line_Hunk,
+	old_lines, new_lines: int,
+) {
+	a := split_lines(old, .Without_Breaks, context.temp_allocator)
+	b := split_lines(new, .Without_Breaks, context.temp_allocator)
+	found := diff_lines(old, new, a, b)
+	return slice.clone(found, allocator), len(a), len(b)
+}
+
+
+// What differs between two lines, word by word: the ranges of `a` removed and
+// of `b` added, in `allocator`. Not ok when they differ in too many places to
+// say (MAX_WORD_EDITS), or have nothing in common
+words :: proc(
+	a, b: string,
+	allocator := context.allocator,
+) -> (
+	removed, added: [][2]int,
+	ok: bool,
+) {
+	old, new := transmute([]u8)a, transmute([]u8)b
+	x := split_tokens(old, context.temp_allocator)
+	y := split_tokens(new, context.temp_allocator)
+
+	// The tokens both start and end with, then the middle
+	prefix, suffix := common_ends(old, new, x, y)
+	x_mid := x[prefix:len(x) - suffix]
+	y_mid := y[prefix:len(y) - suffix]
+
+	found := make([dynamic]Line_Hunk, context.temp_allocator)
+	if len(x_mid) > 0 || len(y_mid) > 0 {
+		if !myers(old, new, x_mid, y_mid, MAX_WORD_EDITS, &found) do return
 	}
 
-	// The middle, line by line; past MAX_EDITS, as one hunk
-	if !myers(old, new, a_mid, b_mid, &hunks) {
-		clear(&hunks)
-		append(&hunks, span(old, new, a, b, prefix, len(a) - suffix, prefix, len(b) - suffix))
-		return hunks[:]
+	// Nothing in common: the whole line changed, which says nothing more
+	if prefix == 0 && suffix == 0 && len(found) == 1 {
+		h := found[0]
+		whole := h.old_hi - h.old_lo == len(x) && h.new_hi - h.new_lo == len(y)
+		if whole do return
 	}
 
-	// Line indexes in the middle -> bytes of the whole texts
-	for &h in hunks {
-		h = span(
-			old,
-			new,
-			a,
-			b,
-			prefix + h.old_lo,
-			prefix + h.old_hi,
-			prefix + h.new_lo,
-			prefix + h.new_hi,
-		)
+	// Token indexes -> bytes, each side's changes apart
+	out_removed := make([dynamic][2]int, allocator)
+	out_added := make([dynamic][2]int, allocator)
+	for h in found {
+		if h.old_hi > h.old_lo {
+			lo := x_mid[h.old_lo].start
+			hi := x_mid[h.old_hi - 1].end
+			append(&out_removed, [2]int{lo, hi})
+		}
+		if h.new_hi > h.new_lo {
+			lo := y_mid[h.new_lo].start
+			hi := y_mid[h.new_hi - 1].end
+			append(&out_added, [2]int{lo, hi})
+		}
 	}
-	return hunks[:]
+	return out_removed[:], out_added[:], true
 }
 
 
@@ -99,8 +158,53 @@ apply :: proc(old, new: []u8, hunks: []Hunk, allocator := context.allocator) -> 
 }
 
 
+// The hunks between two texts split into lines, as line indexes (temp): the
+// common first and last lines, then the middle line by line, or past MAX_EDITS
+// as one hunk
 @(private = "file")
-split_lines :: proc(text: []u8, allocator := context.allocator) -> []Line {
+diff_lines :: proc(old, new: []u8, a, b: []Line) -> []Line_Hunk {
+	prefix, suffix := common_ends(old, new, a, b)
+	a_mid := a[prefix:len(a) - suffix]
+	b_mid := b[prefix:len(b) - suffix]
+
+	hunks := make([dynamic]Line_Hunk, context.temp_allocator)
+	if len(a_mid) == 0 && len(b_mid) == 0 {
+		return hunks[:]
+	}
+
+	if !myers(old, new, a_mid, b_mid, MAX_EDITS, &hunks) {
+		clear(&hunks)
+		append(&hunks, Line_Hunk{0, len(a_mid), 0, len(b_mid)})
+	}
+
+	// Indexes in the middle -> in the whole texts
+	for &h in hunks {
+		h.old_lo += prefix
+		h.old_hi += prefix
+		h.new_lo += prefix
+		h.new_hi += prefix
+	}
+	return hunks[:]
+}
+
+
+// How many lines (or tokens) a and b both start with, and then end with
+@(private = "file")
+common_ends :: proc(old, new: []u8, a, b: []Line) -> (prefix, suffix: int) {
+	for prefix < len(a) && prefix < len(b) && same_line(old, new, a[prefix], b[prefix]) {
+		prefix += 1
+	}
+	for suffix < len(a) - prefix && suffix < len(b) - prefix {
+		x, y := a[len(a) - 1 - suffix], b[len(b) - 1 - suffix]
+		if !same_line(old, new, x, y) do break
+		suffix += 1
+	}
+	return
+}
+
+
+@(private = "file")
+split_lines :: proc(text: []u8, split: Split, allocator := context.allocator) -> []Line {
 	lines := make([dynamic]Line, 0, len(text) / 32 + 1, allocator)
 
 	start := 0
@@ -109,12 +213,72 @@ split_lines :: proc(text: []u8, allocator := context.allocator) -> []Line {
 		for end < len(text) && text[end] != '\n' {
 			end += 1
 		}
-		end = min(end + 1, len(text))
 
-		append(&lines, Line{start, end, hash.fnv64a(text[start:end])})
-		start = end
+		if split == .With_Breaks {
+			end = min(end + 1, len(text))
+			append(&lines, Line{start, end, hash.fnv64a(text[start:end])})
+			start = end
+			continue
+		}
+
+		// Without the '\r' of a "\r\n"
+		content := end
+		if content > start && text[content - 1] == '\r' && end < len(text) {
+			content -= 1
+		}
+		append(&lines, Line{start, content, hash.fnv64a(text[start:content])})
+		start = end + 1
+	}
+
+	// The line after a last line break, or the only line of an empty text
+	ends_open := len(text) == 0 || text[len(text) - 1] == '\n'
+	if split == .Without_Breaks && ends_open {
+		append(&lines, Line{len(text), len(text), hash.fnv64a(nil)})
 	}
 	return lines[:]
+}
+
+
+// A line's tokens: runs of word characters (letters, digits, '_', and any
+// non-ASCII byte), runs of spaces and tabs, and each other character alone
+@(private = "file")
+split_tokens :: proc(text: []u8, allocator := context.allocator) -> []Line {
+	tokens := make([dynamic]Line, 0, len(text) / 4 + 1, allocator)
+
+	start := 0
+	for start < len(text) {
+		class := token_class(text[start])
+		end := start + 1
+		if class != .Other {
+			for end < len(text) && token_class(text[end]) == class {
+				end += 1
+			}
+		}
+
+		append(&tokens, Line{start, end, hash.fnv64a(text[start:end])})
+		start = end
+	}
+	return tokens[:]
+}
+
+
+@(private = "file")
+Token_Class :: enum {
+	Word,
+	Space,
+	Other,
+}
+
+
+@(private = "file")
+token_class :: proc(c: u8) -> Token_Class {
+	switch c {
+	case 'a' ..= 'z', 'A' ..= 'Z', '0' ..= '9', '_', 0x80 ..= 0xff:
+		return .Word
+	case ' ', '\t':
+		return .Space
+	}
+	return .Other
 }
 
 
@@ -127,18 +291,6 @@ same_line :: proc(old, new: []u8, x, y: Line) -> bool {
 }
 
 
-// The bytes of lines [a_lo, a_hi) of old and [b_lo, b_hi) of new
-@(private = "file")
-span :: proc(old, new: []u8, a, b: []Line, a_lo, a_hi, b_lo, b_hi: int) -> Hunk {
-	return {
-		old_lo = line_offset(a, a_lo, len(old)),
-		old_hi = line_offset(a, a_hi, len(old)),
-		new_lo = line_offset(b, b_lo, len(new)),
-		new_hi = line_offset(b, b_hi, len(new)),
-	}
-}
-
-
 // Where line i starts; the end of the text past the last line
 @(private = "file")
 line_offset :: proc(lines: []Line, i: int, text_len: int) -> int {
@@ -146,12 +298,12 @@ line_offset :: proc(lines: []Line, i: int, text_len: int) -> int {
 }
 
 
-// Appends the hunks between a and b as line indexes into them. Returns false
-// if they differ by more than MAX_EDITS lines
+// Appends the hunks between a and b as indexes into them. Returns false if they
+// differ by more than `limit` lines (or tokens)
 @(private = "file")
-myers :: proc(old, new: []u8, a, b: []Line, hunks: ^[dynamic]Hunk) -> bool {
+myers :: proc(old, new: []u8, a, b: []Line, limit: int, hunks: ^[dynamic]Line_Hunk) -> bool {
 	n, m := len(a), len(b)
-	max_d := min(n + m, MAX_EDITS)
+	max_d := min(n + m, limit)
 	offset := max_d + 1
 
 	// v[k + offset] is the furthest x reached on diagonal k; the trace keeps a
@@ -216,7 +368,7 @@ myers :: proc(old, new: []u8, a, b: []Line, hunks: ^[dynamic]Hunk) -> bool {
 				continue
 			}
 		}
-		append(hunks, Hunk{lo_a, hi_a, lo_b, hi_b})
+		append(hunks, Line_Hunk{lo_a, hi_a, lo_b, hi_b})
 	}
 	return true
 }

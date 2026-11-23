@@ -15,6 +15,7 @@ import "buffer"
 import "langs"
 import "lsp"
 import "textedit"
+import "uitime"
 
 
 // The language features' state; the servers themselves are langs.state
@@ -298,7 +299,7 @@ lsp_installing :: proc(name: string) -> bool {
 // forgets an install once its program is found or its terminal closes
 @(private = "file")
 watch_installs :: proc() {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	l := &g.lsp
 	for i := len(l.installs) - 1; i >= 0; i -= 1 {
 		x := &l.installs[i]
@@ -370,7 +371,7 @@ lsp_open_log :: proc(c: ^langs.Client) -> bool {
 // Asks for hover information at `offset`; 0 and nil if no server of the
 // editor has it
 lsp_request_hover :: proc(e: ^Editor, offset: int) -> (id: int, c: ^langs.Client) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c = langs.client_with(&e.lsp, .Hover)
 	if c == nil do return 0, nil
 	return langs.send_request(&e.lsp, c, .Hover, "textDocument/hover", offset), c
@@ -380,7 +381,7 @@ lsp_request_hover :: proc(e: ^Editor, offset: int) -> (id: int, c: ^langs.Client
 // Asks where the symbol at `offset` is defined, and goes there when the answer
 // comes. False if no server of the editor can say
 lsp_go_to_definition :: proc(e: ^Editor, offset: int) -> bool {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c := langs.client_with(&e.lsp, .Definition)
 	if c == nil do return false
 

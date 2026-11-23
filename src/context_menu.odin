@@ -8,10 +8,11 @@ import "gfx"
 import "langs"
 import "textedit"
 
-// The right-click menu: on a file or folder in the tree, on a pane's title, on
-// a terminal on the shelf, or on an editor's text. A chosen item runs at the
-// start of the next frame (context_menu_frame). A press outside the menu, or
-// Esc, closes it
+// The right-click menu: on a file or folder in the tree, on a file under
+// RECENT, on a pane's title, on a terminal on the shelf, on an editor's text,
+// or on the shelf's + and the status bar's terminal button (what new terminals
+// are). A chosen item runs at the start of the next frame
+// (context_menu_frame). A press outside the menu, or Esc, closes it
 
 
 Menu_Command :: enum {
@@ -19,8 +20,14 @@ Menu_Command :: enum {
 	New_Folder,
 	Rename_File,
 	Delete_File,
+	Pin_File,
+	Unpin_File,
 	Rename_Terminal,
 	Restart_Terminal,
+	Pin_Terminal,   // restarts it in herdr-core
+	Unpin_Terminal, // restarts it here
+	Default_Local,  // new terminals run here
+	Default_Pinned, // new terminals run in herdr-core
 	Close_Pane,
 	Editor_Command, // runs the item's `command` in the editor
 }
@@ -33,6 +40,7 @@ Menu_Item :: struct {
 	command:   Command, // of an Editor_Command item, its shortcut shown beside it
 	disabled:  bool,
 	separator: bool, // a line between groups, not an item
+	checked:   bool, // a check at its right: the choice in effect
 }
 
 Context_Menu :: struct {
@@ -41,6 +49,7 @@ Context_Menu :: struct {
 	items:  [MENU_MAX_ITEMS]Menu_Item,
 	count:  int,
 	path:   string,       // owned; the file or folder it is for
+	title:  string,       // a header in place of the path's name, or "" (static)
 	pane:   ^Pane,        // the pane it is for
 	place:  Rename_Place, // where it was opened, where Rename edits the name
 	chosen: Maybe(Menu_Command),
@@ -54,11 +63,20 @@ MENU_ROW_HEIGHT       :: 28
 MENU_SEPARATOR_HEIGHT :: 9
 MENU_MAX_ITEMS        :: 9
 
+// A file in the tree; its first item pins or unpins it (file_items)
 @(private = "file")
 FILE_ITEMS := [?]Menu_Item {
+	PIN_ITEM,
+	{separator = true},
 	{label = "Rename", icon = .Pencil, cmd = .Rename_File},
 	{label = "Delete", icon = .Trash,  cmd = .Delete_File, danger = true},
 }
+
+@(private = "file")
+PIN_ITEM :: Menu_Item{label = "Pin", icon = .Pin, cmd = .Pin_File}
+
+@(private = "file")
+UNPIN_ITEM :: Menu_Item{label = "Unpin", icon = .Pin_Off, cmd = .Unpin_File}
 
 // A folder; with path the workspace root, the empty space under the tree
 @(private = "file")
@@ -69,11 +87,21 @@ FOLDER_ITEMS := [?]Menu_Item {
 	{label = "Delete",     icon = .Trash,       cmd = .Delete_File, danger = true},
 }
 
+// A terminal's; its third item pins or unpins it (terminal_items)
 @(private = "file")
 TERMINAL_ITEMS := [?]Menu_Item {
 	{label = "Rename",  icon = .Pencil,  cmd = .Rename_Terminal},
 	{label = "Restart", icon = .Restart, cmd = .Restart_Terminal},
+	{label = "Pin",     icon = .Pin,     cmd = .Pin_Terminal},
+	{separator = true},
 	{label = "Close",   icon = .Close,   cmd = .Close_Pane},
+}
+
+// What new terminals are (default_items checks the one in effect)
+@(private = "file")
+DEFAULT_ITEMS := [?]Menu_Item {
+	{label = "Local", icon = .Terminal, cmd = .Default_Local},
+	{label = "Pinned", icon = .Pin, cmd = .Default_Pinned},
 }
 
 @(private = "file")
@@ -143,19 +171,28 @@ context_menu_frame :: proc() {
 		return
 	}
 
+	// What new terminals are: on the shelf's + or the status bar's button
+	on_new := pointer_on_sidebar() && pointer_in(clay.ID("NewTerminal"))
+	if on_new || pointer_in(clay.ID("TerminalToggle")) {
+		menu_open(default_items(), "", nil, .Shelf)
+		g.menu.title = "New terminals"
+		return
+	}
+
 	// A pane's title, or a terminal on the shelf
 	for p in g.panes.open {
 		if pane_live(p) && pointer_in(clay.ID("PaneTitle", p.id)) {
 			switch c in p.content {
-			case ^Editor:   menu_open(FILE_PANE_ITEMS[:], c.path, p, .Title)
-			case ^Terminal: menu_open(TERMINAL_ITEMS[:], "", p, .Title)
+			case ^Editor:               menu_open(FILE_PANE_ITEMS[:], c.path, p, .Title)
+			case ^Terminal:             menu_open(terminal_items(c), "", p, .Title)
+			case ^Git_View, ^Diff_View: // no menu
 			}
 			return
 		}
 
 		on_shelf := pointer_in(clay.ID("ShelfRow", p.id)) && pointer_in(clay.ID("ShelfList"))
 		if pointer_on_sidebar() && on_shelf {
-			menu_open(TERMINAL_ITEMS[:], "", p, .Shelf)
+			menu_open(terminal_items(p.content.(^Terminal)), "", p, .Shelf)
 			return
 		}
 	}
@@ -172,14 +209,60 @@ context_menu_frame :: proc() {
 		}
 	}
 
+	// A file under RECENT: pinning it or not
+	if path, ok := recent_file_under_pointer(); ok {
+		item := project_pinned(path) ? UNPIN_ITEM : PIN_ITEM
+		menu_open({item}, path, nil, .Tree)
+		return
+	}
+
 	// A file or folder in the tree, or the space under it
 	if index, ok := tree_row_under_pointer(); ok {
 		node := g.workspace.nodes[index]
-		items := node.is_dir ? FOLDER_ITEMS[:] : FILE_ITEMS[:]
+		items := node.is_dir ? FOLDER_ITEMS[:] : file_items(node.path)
 		menu_open(items, node.path, nil, .Tree)
 	} else if pointer_on_sidebar() && pointer_in(clay.ID("SidebarFiles")) {
 		menu_open(FOLDER_ITEMS[:2], g.workspace.root, nil, .Tree)
 	}
+}
+
+
+// A file's items in the tree, the first pinning it or, if pinned, unpinning it
+// (temp)
+@(private = "file")
+file_items :: proc(path: string) -> []Menu_Item {
+	items := make([]Menu_Item, len(FILE_ITEMS), context.temp_allocator)
+	copy(items, FILE_ITEMS[:])
+	if project_pinned(path) do items[0] = UNPIN_ITEM
+	return items
+}
+
+
+// A terminal's items, the third pinning it (unless herdr-core isn't there) or,
+// if pinned, unpinning it (temp)
+@(private = "file")
+terminal_items :: proc(t: ^Terminal) -> []Menu_Item {
+	items := make([]Menu_Item, len(TERMINAL_ITEMS), context.temp_allocator)
+	copy(items, TERMINAL_ITEMS[:])
+	if t.persistent {
+		items[2] = {label = "Unpin", icon = .Pin_Off, cmd = .Unpin_Terminal}
+	} else {
+		items[2].disabled = persist_missing()
+	}
+	return items
+}
+
+
+// What new terminals can be, the one in effect checked (temp)
+@(private = "file")
+default_items :: proc() -> []Menu_Item {
+	items := make([]Menu_Item, len(DEFAULT_ITEMS), context.temp_allocator)
+	copy(items, DEFAULT_ITEMS[:])
+	pinned := persist_wanted()
+	items[0].checked = !pinned
+	items[1].checked = pinned
+	items[1].disabled = !pinned && persist_missing()
+	return items
 }
 
 
@@ -234,7 +317,13 @@ run_menu_command :: proc(cmd: Menu_Command) {
 	case .New_Folder:      create_start(m.path, folder = true)
 	case .Rename_File:     rename_start_file(m.path, m.place, m.pane)
 	case .Delete_File:     ask_delete_file(m.path)
+	case .Pin_File:        project_pin(m.path)
+	case .Unpin_File:      project_unpin(m.path)
 	case .Rename_Terminal: rename_start_terminal(m.pane, m.place)
+	case .Pin_Terminal:    terminal_ask_repin(m.pane, pinned = true)
+	case .Unpin_Terminal:  terminal_ask_repin(m.pane, pinned = false)
+	case .Default_Local:   persist_set_wanted(false)
+	case .Default_Pinned:  persist_set_wanted(true)
 	case .Close_Pane:      pane_close(m.pane)
 	case .Restart_Terminal:
 		if t, ok := m.pane.content.(^Terminal); ok {
@@ -269,8 +358,12 @@ context_menu_ui :: proc() {
 	defer g.in_popup = false
 
 	// Wider with shortcuts beside the items
+	header := m.title
+	if header == "" && m.path != "" {
+		header = filepath.base(m.path)
+	}
 	width: f32 = MENU_WIDTH
-	h: f32 = 8 + (m.path != "" ? 26 : 0)
+	h: f32 = 8 + (header != "" ? 26 : 0)
 	for item in m.items[:m.count] {
 		if item.cmd == .Editor_Command do width = MENU_WIDTH_SHORTCUTS
 		h += item.separator ? MENU_SEPARATOR_HEIGHT : MENU_ROW_HEIGHT
@@ -297,7 +390,7 @@ context_menu_ui :: proc() {
 		transition = transition({.OverlayColor}, .Fade, 0.12),
 	}) {
 		// The name of what it is for
-		if m.path != "" {
+		if header != "" {
 			if clay.UI()({
 				layout = {
 					sizing = {width = clay.SizingGrow()},
@@ -305,7 +398,7 @@ context_menu_ui :: proc() {
 				},
 				clip = {horizontal = true},
 			}) {
-				label(filepath.base(m.path), gfx.theme.text_faint, FONT_SIZE_SMALL)
+				label(header, gfx.theme.text_faint, FONT_SIZE_SMALL)
 			}
 		}
 
@@ -338,6 +431,10 @@ context_menu_ui :: proc() {
 				if item.cmd == .Editor_Command {
 					push_right()
 					label(first_chord_label(item.command), gfx.theme.text_faint, FONT_SIZE_SMALL)
+				}
+				if item.checked {
+					push_right()
+					icon(.Check, gfx.theme.accent, 14)
 				}
 			}
 

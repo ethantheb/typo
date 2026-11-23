@@ -15,6 +15,7 @@ import "langs"
 import "lsp"
 import sdl "../vendor/sdl3"
 import "textedit"
+import "uitime"
 
 
 Symbol_Rename :: struct {
@@ -37,7 +38,7 @@ MAX_NAME :: 256 // bytes looked at on each side of the caret for the name
 // Starts renaming the symbol at the caret. False if none of the editor's
 // servers renames
 lsp_rename_start :: proc(e: ^Editor) -> bool {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	c := langs.client_with(&e.lsp, .Rename)
 	if c == nil do return false
 
@@ -66,7 +67,7 @@ lsp_rename_start :: proc(e: ^Editor) -> bool {
 
 // prepareRename's answer opens the field; the rename's is applied
 lsp_rename_response :: proc(r: langs.Request, resp: lsp.Response) {
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	sr := &g.lsp.rename
 	if r.id != sr.request || r.client != sr.client || request_editor(r) != sr.editor {
 		return
@@ -255,7 +256,7 @@ commit :: proc() {
 		return
 	}
 
-	langs.timed()
+	uitime.timed(&langs.ui_share)
 	id := lsp.request_rename(c.client, e.lsp.uri, sr.lo, name)
 	langs.track_request(&e.lsp, c, .Rename, id, sr.lo)
 	sr.request = id

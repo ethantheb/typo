@@ -11,11 +11,13 @@ import "core:thread"
 
 import "buffer"
 import "syntax"
+import "trash"
 
 // Reading files to open and writing files to save, off the UI thread. Loads go
 // to a small pool of loader threads sharing one queue, so one huge file doesn't
-// hold up the small ones opened after it; writes go to one writer thread, in
-// the order they were asked for, so two saves of a file land in that order.
+// hold up the small ones opened after it; writes (saves, patches, deletes) go
+// to one writer thread, in the order they were asked for, so two saves of a
+// file land in that order.
 // Finished results wait for the UI thread (io_take), which wires them up
 // (file_load.odin).
 //
@@ -75,10 +77,49 @@ Write_Result :: struct {
 	problem:    string,     // owned; why it failed
 }
 
+// Asks for bytes [lo, hi) of a file no editor has open to be replaced with
+// `text` (a diff view reverting a hunk), if the file is still as it was read:
+// `size` bytes with hash `hash`
+Patch_Job :: struct {
+	id:     u64,
+	path:   string, // owned
+	size:   int,
+	hash:   u64,
+	lo, hi: int,
+	text:   []u8, // owned
+}
+
+Patch_Result :: struct {
+	id:      u64,
+	path:    string, // owned
+	problem: string, // owned; why it wasn't patched, "" when it was
+}
+
+// Asks for a file or folder to be deleted: to the trash, or permanently
+Delete_Job :: struct {
+	path:      string, // owned
+	permanent: bool,
+}
+
+Delete_Result :: struct {
+	path:    string, // owned
+	outcome: trash.Result,
+}
+
 IO_Result :: union {
 	Load_Result,
 	Load_Sized,
 	Write_Result,
+	Patch_Result,
+	Delete_Result,
+}
+
+// What the writer thread does, in the order asked
+@(private = "file")
+Write_Request :: union {
+	Write_Job,
+	Patch_Job,
+	Delete_Job,
 }
 
 @(private = "file")
@@ -94,9 +135,9 @@ io: struct {
 	stop:       bool,
 	loads:      [dynamic]Load_Job,  // waiting
 	loading:    [dynamic]u64,       // loads under way
-	cancelled:  [dynamic]u64,       // of those, ones nobody waits for anymore
-	writes:     [dynamic]Write_Job, // waiting
-	writing:    int,                // writes waiting or under way
+	cancelled:  [dynamic]u64,           // of those, ones nobody waits for anymore
+	writes:     [dynamic]Write_Request, // waiting
+	writing:    int,                    // writes waiting or under way
 	results:    [dynamic]IO_Result,
 }
 
@@ -139,6 +180,7 @@ io_destroy :: proc() {
 	delete(io.loads)
 	delete(io.loading)
 	delete(io.cancelled)
+	for &w in io.writes do write_request_destroy(&w)
 	delete(io.writes)
 	for r in io.results do io_result_destroy(r)
 	delete(io.results)
@@ -207,6 +249,42 @@ io_post_write :: proc(job: Write_Job) -> (r: Write_Result, done: bool) {
 }
 
 
+// Queues a patch (taking the job), after the writes asked for before it.
+// Without the threads it runs at once: `done`, with its result
+io_post_patch :: proc(job: Patch_Job) -> (r: Patch_Result, done: bool) {
+	if !io.running {
+		job := job
+		r = patch_file(&job)
+		patch_job_destroy(&job)
+		return r, true
+	}
+
+	if sync.guard(&io.mutex) {
+		append(&io.writes, job)
+		io.writing += 1
+	}
+	sync.cond_signal(&io.write_cond)
+	return
+}
+
+
+io_post_delete :: proc(job: Delete_Job) -> (r: Delete_Result, done: bool) {
+	if !io.running {
+		job := job
+		r = delete_item(&job)
+		delete(job.path)
+		return r, true
+	}
+
+	if sync.guard(&io.mutex) {
+		append(&io.writes, job)
+		io.writing += 1
+	}
+	sync.cond_signal(&io.write_cond)
+	return
+}
+
+
 // Whether writes are waiting or under way
 io_writing :: proc() -> bool {
 	if !io.running do return false
@@ -244,6 +322,11 @@ io_result_destroy :: proc(r: IO_Result) {
 	case Write_Result:
 		delete(r.path)
 		delete(r.problem)
+	case Patch_Result:
+		delete(r.path)
+		delete(r.problem)
+	case Delete_Result:
+		delete(r.path)
 	}
 }
 
@@ -396,11 +479,17 @@ post_result :: proc(r: IO_Result) {
 @(private = "file")
 writer_proc :: proc() {
 	for {
-		job, ok := next_write()
+		request, ok := next_write()
 		if !ok do return
 
-		r := write_file(&job)
-		write_job_destroy(&job)
+		r: IO_Result
+		switch &job in request {
+		case Write_Job:  r = write_file(&job)
+		case Patch_Job:  r = patch_file(&job)
+		case Delete_Job: r = delete_item(&job)
+		}
+		write_request_destroy(&request)
+
 		if sync.guard(&io.mutex) {
 			append(&io.results, r)
 			io.writing -= 1
@@ -413,7 +502,7 @@ writer_proc :: proc() {
 
 // Waits for a write to do; false once stopping with none left
 @(private = "file")
-next_write :: proc() -> (job: Write_Job, ok: bool) {
+next_write :: proc() -> (job: Write_Request, ok: bool) {
 	sync.guard(&io.mutex)
 	for !io.stop && len(io.writes) == 0 {
 		sync.cond_wait(&io.write_cond, &io.mutex)
@@ -477,4 +566,83 @@ write_job_destroy :: proc(job: ^Write_Job) {
 	delete(job.path)
 	buffer.snapshot_release(&job.text)
 	job^ = {}
+}
+
+
+@(private = "file")
+patch_job_destroy :: proc(job: ^Patch_Job) {
+	delete(job.path)
+	delete(job.text)
+	job^ = {}
+}
+
+
+@(private = "file")
+write_request_destroy :: proc(r: ^Write_Request) {
+	switch &job in r {
+	case Write_Job:  write_job_destroy(&job)
+	case Patch_Job:  patch_job_destroy(&job)
+	case Delete_Job: delete(job.path)
+	}
+}
+
+
+// Replaces bytes of a file that must still be as it was read, writing a
+// temporary file and renaming it over the original as a save does
+@(private = "file")
+patch_file :: proc(job: ^Patch_Job) -> (r: Patch_Result) {
+	r.id = job.id
+	r.path = strings.clone(job.path)
+
+	data, err := read_file_shared(job.path)
+	defer delete(data)
+	if err != .None {
+		r.problem = strings.clone("it can't be read")
+		return
+	}
+	changed := len(data) != job.size || file_hash(data) != job.hash
+	if changed || job.lo < 0 || job.hi > len(data) || job.lo > job.hi {
+		r.problem = strings.clone("it changed on disk meanwhile")
+		return
+	}
+
+	// The temporary file: the text around the patch, and the patch
+	tmp := strings.concatenate({job.path, ".typo.tmp"}, context.temp_allocator)
+	f, cerr := os.create(tmp)
+	if cerr != nil {
+		r.problem = fmt.aprintf("it can't be written (%s)", os.error_string(cerr))
+		return
+	}
+	parts := [3][]u8{data[:job.lo], job.text, data[job.hi:]}
+	for part in parts {
+		if _, werr := os.write(f, part); werr != nil {
+			os.close(f)
+			os.remove(tmp)
+			r.problem = fmt.aprintf("writing it failed (%s)", os.error_string(werr))
+			return
+		}
+	}
+	os.close(f)
+
+	if rerr := os.rename(tmp, job.path); rerr != nil {
+		os.remove(tmp)
+		r.problem = fmt.aprintf("it can't be replaced (%s)", os.error_string(rerr))
+	}
+	return
+}
+
+
+// Moves a file or folder to the trash, or deletes it for good
+@(private = "file")
+delete_item :: proc(job: ^Delete_Job) -> Delete_Result {
+	r := Delete_Result{path = strings.clone(job.path)}
+	switch {
+	case !job.permanent:
+		r.outcome = trash.move(job.path)
+	case os.remove_all(job.path) != nil:
+		r.outcome = .Failed
+	case:
+		r.outcome = .Done
+	}
+	return r
 }

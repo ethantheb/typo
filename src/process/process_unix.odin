@@ -1,7 +1,7 @@
 #+build !windows
-package lsp
+package process
 
-// A language server process with its stdin, stdout and stderr on pipes
+// A process with its stdin, stdout and stderr on pipes
 
 import "core:fmt"
 import "core:os"
@@ -22,7 +22,15 @@ Process :: struct {
 
 // Starts `command` (program and arguments) in `cwd`, looking the program up on
 // PATH. Returns a reason on failure
-process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool, reason: string) {
+process_spawn :: proc(
+	p: ^Process,
+	command: []string,
+	cwd: string,
+	options: Spawn_Options = {},
+) -> (
+	ok: bool,
+	reason: string,
+) {
 	p^ = {}
 	if len(command) == 0 do return false, "no command"
 
@@ -44,7 +52,11 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 		close_files(child_in, p.stdin)
 		return false, "could not create pipes"
 	}
-	p.stderr, child_err, err = os.pipe()
+	if options.discard_stderr {
+		child_err, err = os.open("/dev/null", {.Write})
+	} else {
+		p.stderr, child_err, err = os.pipe()
+	}
 	if err != nil {
 		close_files(child_in, p.stdin, p.stdout, child_out)
 		return false, "could not create pipes"
@@ -61,6 +73,10 @@ process_spawn :: proc(p: ^Process, command: []string, cwd: string) -> (ok: bool,
 		stdin       = child_in,
 		stdout      = child_out,
 		stderr      = child_err,
+	}
+	if len(options.env) > 0 {
+		inherited, _ := os.environ(context.temp_allocator)
+		desc.env = merged_env(inherited, options.env)
 	}
 	p.process, err = os.process_start(desc)
 	if err != nil {

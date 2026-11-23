@@ -50,6 +50,17 @@ App :: struct {
 	sidebar_visible: bool,
 	sidebar_search:  Sidebar_Search,
 	in_sidebar:      bool, // building the sidebar (see ui_interactive)
+	in_search_popup: bool, // building the sidebar search's popup (see ui_interactive)
+	project_picker:  Project_Picker,
+	in_project_picker: bool, // building the recent projects popup (see ui_interactive)
+	row_clips:       int,    // row_clip's taken this frame
+	frame_clips:     int,    // clipping elements the last frame drew (perf)
+	clay_errors:     struct {
+		count:    int,              // errors Clay reported, ever
+		kind:     clay.ErrorType,   // the last one's
+		last:     [160]u8,          // the last one's text (cut short)
+		last_len: int,
+	},
 	dialog:          Dialog,
 	unsaved:         Unsaved_Flow,
 	menu:            Context_Menu,
@@ -59,10 +70,12 @@ App :: struct {
 	in_popup:        bool, // building the dialog's or context menu's UI (see ui_interactive)
 	in_find_bar:     bool, // building the find bar (see ui_interactive)
 	in_goto_bar:     bool, // building the go to line bar (see ui_interactive)
+	in_pane:         ^Pane, // building this pane's header or body (see ui_interactive)
 	right_pressed:   bool, // the right button went down this frame
 	quit:            bool, // set once quitting was confirmed
 	finder:          Finder,
 	lsp:             Lsp_State,
+	git:             Git_State,
 	zoom_popup:      Zoom_Popup,
 	settings:        Settings,
 	fonts:           gfx.System_Fonts,
@@ -76,7 +89,8 @@ App :: struct {
 	open_heading:    string, // owned; where the caret goes in the file `pending` opens
 	open_target:     Maybe(Open_Target), // or this: a place in it
 	jumps:           Jumps,              // Go back and Go forward
-	recent:          Recent_Files,       // recently used files, per folder
+	project:         Project,            // the folder open, its settings and state
+	recent:          Recent_Files,       // the project's recently used files
 	perf:            ^Perf,  // set by --perf
 }
 
@@ -103,9 +117,28 @@ main :: proc() {
 
 	// This window's children never see another window's endpoint
 	os.unset_env(ipc.ENV_NAME)
+	for name in AGENT_SESSION_ENV do os.unset_env(name)
 
 	result := sdl.EnterAppMainCallbacks(0, nil, app_init, app_iterate, app_event, app_quit)
 	os.exit(int(result))
+}
+
+
+// What a coding agent (Claude Code) marks its own processes with. A typo started
+// by one would hand them to its shells and herdr-core, and an agent started in
+// those would take itself for that agent's child
+@(private = "file")
+AGENT_SESSION_ENV := [?]string {
+	"CLAUDECODE",
+	"CLAUDE_PID",
+	"CLAUDE_AGENT_SDK_VERSION",
+	"CLAUDE_CODE_ENTRYPOINT",
+	"CLAUDE_CODE_CHILD_SESSION",
+	"CLAUDE_CODE_CHILD_NOTES_DIR",
+	"CLAUDE_CODE_SESSION_ID",
+	"CLAUDE_CODE_SESSION_ATTENDED",
+	"CLAUDE_CODE_MESSAGING_SOCKET",
+	"CLAUDE_CODE_MESSAGING_TOKEN",
 }
 
 
@@ -164,10 +197,14 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		return .FAILURE
 	}
 
-	// Settings, then the renderer (its backend is a setting) and text
+	// Settings, then the renderer (its backend is a setting) and text. The
+	// config thread reads and writes settings files and projects' state from
+	// here on (config_io.odin)
 	gfx.wake = wake_main_loop
 	md_env_init()
+	config_init()
 	settings_init(&g.settings)
+	state_init()
 	if !create_renderer(g.settings.renderer) do return .FAILURE
 	update_window_metrics()
 	if !gfx.text_init(&gfx.text_system) do return .FAILURE
@@ -179,6 +216,9 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	// `typo <file>` from this window's terminals
 	ipc_init()
 
+	// Terminals that keep running in herdr-core (terminal_persist.odin)
+	persist_init()
+
 	// Changes other programs make to files (fs_watch.odin)
 	watch_init()
 
@@ -188,6 +228,11 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	// The words of files, for word completions
 	words_init()
 
+	// The workspace's repository, and the diff views' loader (git_state.odin,
+	// diff_load.odin)
+	git_init()
+	diff_load_init()
+
 	// Clay
 	min_memory := uint(clay.MinMemorySize())
 	g.clay_memory = make([]u8, min_memory)
@@ -195,17 +240,14 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	clay.Initialize(arena, {f32(g.window_w), f32(g.window_h)}, {handler = clay_error_handler})
 	clay.SetMeasureTextFunction(measure_text, nil)
 
-	// The recent files, and with no arguments the last session if there is one
-	// (session.odin)
-	saved, has_session := session_read()
-	recent_load(&g.recent, saved.recent)
-	restored :=
-		has_session &&
-		len(os.args) == 1 &&
-		g.perf == nil &&
-		g.settings.restore_session &&
-		session_restore(saved)
-	if !restored {
+	// With no arguments the last project, else what the arguments name. Its
+	// state is restored once its files are read (project.odin)
+	last := state_last_project()
+	reopen := len(os.args) == 1 && g.perf == nil && g.settings.restore_session
+	if reopen && last != "" && os.is_dir(last) {
+		open_folder(last)
+		g.sidebar_visible = true
+	} else {
 		open_paths(args.paths, args.terminal)
 	}
 
@@ -242,7 +284,9 @@ create_renderer :: proc(name: string) -> bool {
 // Opens the startup paths: a folder (with the sidebar), or a file in its
 // folder's workspace, then any further files (further folders are ignored). A
 // first path ending in a separator that doesn't exist is created as a folder;
-// any other missing path opens as a new file, created on first save
+// any other missing path opens as a new file, created on first save. The
+// files, and with `terminal` a terminal, open once the project's state is
+// restored
 @(private = "file")
 open_paths :: proc(paths: []string, terminal: bool) {
 	cwd := os.get_working_directory(context.temp_allocator) or_else "."
@@ -252,19 +296,19 @@ open_paths :: proc(paths: []string, terminal: bool) {
 		_ = os.make_directory_all(root)
 	}
 
-	// The workspace: a folder, or a file's folder
+	// The workspace: a folder, or a file's folder (a project only if it is one)
 	files := paths
-	if os.is_dir(root) {
+	is_folder := os.is_dir(root)
+	if is_folder {
 		open_folder(root)
 		g.sidebar_visible = true
-		if terminal do panes_new_terminal()
 
 		// The folder was the first path, unless none was given (the working directory)
 		files = len(paths) > 0 ? paths[1:] : nil
 	} else {
 		file := os.get_absolute_path(root, context.temp_allocator) or_else root
 		dir := filepath.dir(file)
-		open_folder(os.is_dir(dir) ? dir : cwd)
+		open_folder(os.is_dir(dir) ? dir : cwd, as_folder = false)
 	}
 
 	// The files
@@ -276,8 +320,9 @@ open_paths :: proc(paths: []string, terminal: bool) {
 		append(&opening, strings.clone(file))
 	}
 
-	if len(opening) > 0 {
-		g.pending = Open_Files{paths = opening[:]}
+	start_terminal := terminal && is_folder
+	if len(opening) > 0 || start_terminal {
+		g.pending = Open_Files{paths = opening[:], terminal = start_terminal}
 	} else {
 		delete(opening)
 	}
@@ -325,7 +370,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_scroll_containers()
 
 	// Update
-	settings_poll(&g.settings)
+	config_frame()
 	if gfx.fonts_poll(&g.fonts) {
 		apply_ui_font()
 		apply_editor_font()
@@ -337,6 +382,8 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	file_load_frame()
 	unsaved_frame()
 	file_sync_frame()
+	git_frame()
+	diff_views_frame()
 	context_menu_frame()
 	zoom_popup_frame()
 	settings_window_frame()
@@ -348,6 +395,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	update_focus()
 	button_chord_frame()
 	finder_frame()
+	project_picker_frame()
 	sidebar_frame()
 	find_frame()
 	goto_line_frame()
@@ -379,14 +427,15 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	gfx.flush_text()
 	if g.perf != nil do perf_mark(.Render)
 	_ = sdl.RenderPresent(gfx.renderer)
-	if !g.window_shown && panes_ready() {
+	if !g.window_shown && !project_loading() && panes_ready() {
 		_ = sdl.ShowWindow(g.window)
 		g.window_shown = true
 		if g.perf != nil do send_window_to_back(window_handle())
 	}
 	if g.perf != nil do perf_mark(.Present)
 
-	// End of the frame
+	// End of the frame: the state it left saved, if it changed
+	session_save_frame()
 	g.wheel = {}
 	g.over_text_field = false
 	g.mouse_pressed = false
@@ -410,6 +459,7 @@ needs_continuous_frames :: proc() -> bool {
 	     sidebar_search_busy(),
 	     find_busy(),
 	     panes_busy(),
+	     diff_views_busy(),
 	     langs.busy(),
 	     lsp_hover_busy(),
 	     lsp_completion_busy(),
@@ -465,8 +515,9 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 
 	#partial switch event.type {
 	case .QUIT:
-		// Writes under way finish first
-		if !panes_unsaved() && !saves_pending() {
+		// Writes under way finish first, and running programs are asked about
+		ends_shells := len(terminals_ended_by(Quit{})) > 0
+		if !panes_unsaved() && !saves_pending() && !ends_shells {
 			return .SUCCESS
 		}
 		resolve_unsaved(g.panes.open[:], Quit{})
@@ -573,6 +624,7 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	}
 	if settings_window_handle_event(event) do return
 	if finder_handle_event(event) do return
+	if project_picker_handle_event(event) do return
 	if sidebar_search_handle_event(event) do return
 	if goto_line_handle_event(event) do return
 	if find_handle_event(event) do return
@@ -582,6 +634,14 @@ handle_key_event :: proc(event: ^sdl.Event) {
 	t := focused_terminal()
 	if t != nil && t.initialized && terminal_handle_event(t, event) {
 		return
+	}
+	if p := g.panes.focused; p != nil {
+		#partial switch c in p.content {
+		case ^Git_View:
+			if git_view_handle_event(p, c, event) do return
+		case ^Diff_View:
+			if diff_view_handle_key(c, event) do return
+		}
 	}
 	e := focused_editor()
 	if event.type == .TEXT_INPUT {
@@ -621,21 +681,28 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	// The writer tells the watcher what it wrote: stopped first, its writes done
 	io_destroy()
+	config_destroy() // its writes done too
+	diff_load_destroy()
+	git_destroy()
 	ipc_destroy()
 	watch_destroy()
 	finder_destroy()
 	sidebar_search_destroy()
+	project_picker_destroy()
 	find_destroy()
 	goto_line_destroy()
 	menu_close()
 	rename_destroy()
 	dialog_destroy()
 	panes_destroy()
+	persist_destroy()
 	file_load_destroy()
 	words_destroy()
 	lsp_destroy()
 	jumps_destroy()
 	recent_destroy(&g.recent)
+	project_destroy()
+	state_destroy()
 	settings_window_destroy()
 	settings_destroy(&g.settings)
 	gfx.fonts_destroy(&g.fonts)
@@ -667,9 +734,17 @@ update_window_metrics :: proc() {
 }
 
 
+// Clay reports what it couldn't lay out: logged, and counted with the last
+// one's text kept, so the perf suite fails a phase that causes one
 clay_error_handler :: proc "c" (error: clay.ErrorData) {
 	context = g.ctx
-	sdl.Log("Clay error: %.*s", error.errorText.length, error.errorText.chars)
+	text := string(error.errorText.chars[:error.errorText.length])
+	sdl.Log("Clay error: %.*s", i32(len(text)), raw_data(text))
+
+	g.clay_errors.count += 1
+	g.clay_errors.kind = error.errorType
+	n := copy(g.clay_errors.last[:], text)
+	g.clay_errors.last_len = n
 }
 
 
@@ -738,14 +813,16 @@ Toggle_Node  :: distinct int
 Open_File    :: distinct string // owned, full path
 Open_Beside  :: distinct string // owned, full path; in a new pane beside the one in use
 Open_Folder  :: distinct string // owned
+Open_Window  :: distinct string // owned; a folder, in another typo window
 Run_Command  :: distinct Command
 
 // Files from the command line or a typo started in a terminal, each in a new
 // pane: the first beside the editor in use, the others each beside the one
 // before. No open file loses its place
 Open_Files :: struct {
-	paths: []string, // owned, full paths
-	raise: bool,     // bring the window to the front
+	paths:    []string, // owned, full paths
+	raise:    bool,     // bring the window to the front
+	terminal: bool,     // a new terminal first (typo -t)
 }
 
 Pane_Op :: struct {
@@ -763,6 +840,7 @@ Action :: union {
 	Open_Beside,
 	Open_Files,
 	Open_Folder,
+	Open_Window,
 	Run_Command,
 	Pane_Op,
 }
@@ -776,10 +854,14 @@ defer_action :: proc(a: Action) {
 
 @(private = "file")
 apply_pending_action :: proc() {
-	// A folder picked in the dialog
-	if path, ok := take_picked_folder(); ok {
+	// Until the project's files are read: its restored panes come first
+	if project_loading() do return
+
+	// A folder picked in the dialog, for this window or another
+	if path, new_window, ok := take_picked_folder(); ok {
+		picked: Action = new_window ? Open_Window(path) : Open_Folder(path)
 		if g.pending == nil {
-			g.pending = Open_Folder(path)
+			g.pending = picked
 		} else {
 			delete(path)
 		}
@@ -806,17 +888,19 @@ apply_pending_action :: proc() {
 		delete(string(a))
 
 	case Open_Files:
+		if a.terminal do panes_new_terminal()
+
 		beside: ^Pane
 		for path in a.paths do beside = panes_open_file_beside(path, beside)
 		if a.raise do raise_window()
 		delete_paths(a.paths)
 
 	case Open_Folder:
-		files := make([dynamic]^Pane, context.temp_allocator)
-		for p in g.panes.open {
-			if is_editor(p) do append(&files, p)
-		}
-		resolve_unsaved(files[:], a) // takes the string
+		resolve_unsaved(g.panes.open[:], a) // takes the string
+
+	case Open_Window:
+		launch_window(string(a))
+		delete(string(a))
 
 	case Run_Command:
 		run_command(Command(a))
@@ -834,13 +918,16 @@ apply_pending_action :: proc() {
 }
 
 
-open_folder :: proc(path: string) {
+// Opens a folder as the workspace and the project (see project_open)
+open_folder :: proc(path: string, as_folder := true) {
 	path := os.get_absolute_path(path, context.temp_allocator) or_else path
 	if len(path) > 3 do path = strings.trim_right(path, "/\\") // keep "C:\"
 
 	langs.stop_all()
 	workspace_open(&g.workspace, path)
+	project_open(path, as_folder)
 	watch_set_root(path)
+	git_open_folder(path)
 	title := fmt.ctprintf("%s - typo", folder_name(path))
 	_ = sdl.SetWindowTitle(g.window, title)
 	finder_invalidate()

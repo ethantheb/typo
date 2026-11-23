@@ -10,6 +10,7 @@ import "core:strings"
 
 import "../buffer"
 import "../lsp"
+import "../uitime"
 import "../textedit"
 
 
@@ -52,7 +53,7 @@ MAX_DOC_EDITS :: 256
 // document to the servers of its language it doesn't use yet, starting them if
 // needed. Servers whose program or root is still being looked up come later
 doc_open :: proc(d: ^Doc) {
-	timed()
+	uitime.timed(&ui_share)
 
 	if !state.active || !env.config().enabled || d.view == nil {
 		return
@@ -119,7 +120,7 @@ server_rank :: proc(name: string) -> int {
 
 // Before a file closes (or is renamed): closes its document on its servers
 doc_close :: proc(d: ^Doc) {
-	timed()
+	uitime.timed(&ui_share)
 	env.doc_closing(d)
 	for dc in d.clients {
 		if dc.opened do lsp.client_close(dc.client.client, d.uri)
@@ -142,7 +143,7 @@ doc_changed :: proc(d: ^Doc, changes: []buffer.Change) {
 		return
 	}
 
-	timed()
+	uitime.timed(&ui_share)
 	buf := &d.view.buf
 
 	// Each with the version it made
@@ -164,7 +165,7 @@ doc_changed :: proc(d: ^Doc, changes: []buffer.Change) {
 
 
 doc_saved :: proc(d: ^Doc) {
-	timed()
+	uitime.timed(&ui_share)
 	for dc in d.clients {
 		if dc.opened do lsp.client_save(dc.client.client, d.uri)
 	}
@@ -202,7 +203,7 @@ docs_detach :: proc(c: ^Client) {
 // Opens the document on its clients that don't have it yet. The client's
 // thread keeps it until its server is ready
 doc_open_pending :: proc(d: ^Doc) {
-	timed()
+	uitime.timed(&ui_share)
 
 	for &dc in d.clients {
 		if dc.opened do continue

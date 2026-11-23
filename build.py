@@ -92,8 +92,12 @@ TEST_PACKAGES = [
     "src/fuzzy",
     "src/words",
     "src/diff",
+    "src/git",
     "src/langs",
     "src/ipc",
+    "src/herdr",
+    "src/process",
+    "src/trash",
     "src",
 ]
 
@@ -155,6 +159,15 @@ if IS_WINDOWS:
     SDL_LIBS = [SDL_OUT / "lib" / "SDL3-static.lib", SDL_OUT / "lib" / "SDL3_ttf-static.lib"]
 else:
     SDL_LIBS = [SDL_OUT / "lib" / "libSDL3.a", SDL_OUT / "lib" / "libSDL3_ttf.a"]
+
+# libgit2, built with CMake as a static library with nothing that reaches the
+# network (the git CLI pushes, pulls and fetches): no HTTPS, no SSH, with the
+# bundled zlib, regex and http parser. vendor/libgit2 links LIBGIT2_LIB
+LIBGIT2_VERSION = "1.9.7"
+LIBGIT2_REPO    = "https://github.com/libgit2/libgit2.git"
+LIBGIT2_SRC     = OUT / "deps" / "libgit2"
+LIBGIT2_OUT     = OBJ / "libgit2"  # install prefix
+LIBGIT2_LIB     = LIBGIT2_OUT / "lib" / ("git2.lib" if IS_WINDOWS else "libgit2.a")
 
 # Microsoft's ConPTY package, embedded by src/term/pty_windows.odin
 CONPTY_VERSION = "1.24.260710001"
@@ -362,21 +375,23 @@ def fetch_ghostty_prebuilt():
         GHOSTTY_LIB.write_bytes(z.read(member))
 
 
-def cmake_build(src, build_dir, options):
-    """Configures, builds and installs a CMake project into SDL_OUT as static
-    release libraries, with the static C runtime on Windows like Odin uses."""
-    prefix = SDL_OUT.as_posix()
+def cmake_build(src, build_dir, options, prefix=SDL_OUT, config="Release"):
+    """Configures, builds and installs a CMake project into `prefix` as static
+    libraries of build type `config` (Release, unless the project's Release
+    flags don't suit), with the static C runtime on Windows like Odin uses."""
+    prefix = prefix.as_posix()
     check([
         "cmake", "-S", src, "-B", build_dir,
         f"-DCMAKE_INSTALL_PREFIX={prefix}",
         f"-DCMAKE_PREFIX_PATH={prefix}",
-        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_BUILD_TYPE={config}",
+        f"-DCMAKE_CONFIGURATION_TYPES={config}",
         "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
         "-DCMAKE_POSITION_INDEPENDENT_CODE=ON",
         *options,
     ])
-    check(["cmake", "--build", build_dir, "--config", "Release", "--parallel"])
-    check(["cmake", "--install", build_dir, "--config", "Release"])
+    check(["cmake", "--build", build_dir, "--config", config, "--parallel"])
+    check(["cmake", "--install", build_dir, "--config", config])
 
 
 def build_sdl():
@@ -419,6 +434,41 @@ def build_sdl():
     ])
 
     stamp.write_text(versions)
+
+
+def build_libgit2():
+    stamp = LIBGIT2_OUT / "version.txt"
+    if LIBGIT2_LIB.exists() and stamp.exists() and stamp.read_text().strip() == LIBGIT2_VERSION:
+        return
+
+    print("Building libgit2...", flush=True)
+    shutil.rmtree(LIBGIT2_OUT, ignore_errors=True)
+    git_checkout(LIBGIT2_SRC, LIBGIT2_REPO, f"refs/tags/v{LIBGIT2_VERSION}")
+
+    # A build type of our own: libgit2's Release flags on MSVC include /GL,
+    # whose objects make every link of typo redo link-time code generation
+    optimized = "/DNDEBUG /O2 /Gy" if IS_WINDOWS else "-DNDEBUG -O2"
+    build_dir = OBJ / "libgit2-build"
+    shutil.rmtree(build_dir, ignore_errors=True)
+    cmake_build(LIBGIT2_SRC, build_dir, [
+        f"-DCMAKE_C_FLAGS_OPTIMIZED={optimized}",
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DBUILD_TESTS=OFF",
+        "-DBUILD_CLI=OFF",
+        "-DBUILD_EXAMPLES=OFF",
+        "-DUSE_SSH=OFF",
+        "-DUSE_HTTPS=OFF",
+        "-DUSE_GSSAPI=OFF",
+        "-DUSE_NTLMCLIENT=OFF",
+        "-DUSE_SHA1=CollisionDetection",
+        "-DUSE_SHA256=Builtin",
+        "-DUSE_BUNDLED_ZLIB=ON",
+        "-DUSE_HTTP_PARSER=builtin",
+        "-DREGEX_BACKEND=builtin",
+        "-DSTATIC_CRT=ON",
+    ], prefix=LIBGIT2_OUT, config="Optimized")
+
+    stamp.write_text(LIBGIT2_VERSION)
 
 
 def fetch_conpty():
@@ -626,6 +676,7 @@ def main():
     build_tree_sitter()
     build_ghostty()
     build_sdl()
+    build_libgit2()
     fetch_conpty()
 
     if args.test or args.perf:

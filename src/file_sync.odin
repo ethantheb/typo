@@ -227,6 +227,7 @@ editor_watching :: proc(path: string) -> ^Editor {
 apply_batch :: proc(r: Watch_Batch) {
 	workspace_apply_listings(&g.workspace, r.listings)
 	if r.structure do finder_files_changed()
+	git_workspace_changed()
 	watch_result_destroy(r)
 }
 

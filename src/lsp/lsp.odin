@@ -15,8 +15,3 @@ package lsp
 
 // Called from another thread when there is something for the UI thread
 Notify_Proc :: #type proc "contextless" (userdata: rawptr)
-
-Stream :: enum {
-	Stdout,
-	Stderr,
-}

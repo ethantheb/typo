@@ -15,6 +15,13 @@ import "langs"
 // into sections, which collapse (kept in collapsed_sections). Every change is
 // applied immediately and written to settings.toml.
 //
+// A switch by the title shows the user's settings or the project's (scope).
+// In Project scope a change is written to the project's .typo/settings.toml,
+// a setting it doesn't set shows the user's value it follows, Delete makes a
+// set one follow the user's again, and what is the user's only (keybindings,
+// language servers, user_only settings) isn't listed. In User scope a
+// setting the project sets says so.
+//
 // A setting chosen from a list (theme, font) opens the list in the same panel,
 // which moves to the right edge so the editor shows (a Clay transition) while
 // the list fades in. Each option is applied as the selection moves onto it;
@@ -30,6 +37,7 @@ PICKER_ROW_HEIGHT :: 32
 Settings_Window :: struct {
 	open:            bool,
 	opened_at:       u64, // frame it was opened on
+	scope:           Settings_Scope, // the settings shown and changed
 	search:          Line_Edit,
 
 	// Keybindings: each binding is a chip. A focused keybinding row's chips
@@ -56,6 +64,7 @@ Settings_Window :: struct {
 	picker:          Setting,      // the list shown
 	original:        string,       // its value when the list opened, restored on cancel
 	original_extras: [Setting]f64, // likewise for picker_extras
+	original_set:    bit_set[Setting], // the settings the project set then
 	filter:          Line_Edit,
 	picker_reveal:   bool,         // scroll the current option into view
 	extra_focus:     int,          // keyboard focus: -1 = the list, else a picker_extras index
@@ -121,6 +130,132 @@ MISSING_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_FAMILY
 @(private = "file")
 MISSING_SANS_FONT_TIP :: "Not installed; showing " + gfx.BUNDLED_MD_FAMILY
 
+// segmented's ids for the scope switch: past the settings', before the servers'
+@(private = "file")
+SCOPE_SWITCH_ID :: 4000
+
+
+// The element id of a side of the scope switch
+scope_switch_side :: proc(scope: Settings_Scope) -> clay.ElementId {
+	return clay.ID("SettingOption", SCOPE_SWITCH_ID * 64 + u32(scope))
+}
+
+
+// --- Scope -------------------------------------------------------------------------
+
+// The values the window shows for a setting: the scope's, or the user's for
+// one the project doesn't set (it follows them)
+@(private = "file")
+shown_values :: proc(x: Setting) -> ^Setting_Values {
+	s := &g.settings
+	if g.settings_window.scope == .Project && x in s.project.set {
+		return &s.project.values
+	}
+	return &s.user
+}
+
+
+// The values a change to a setting goes to: the user's, or the project's,
+// which then sets it, starting from the value it followed. Called only for a
+// change
+@(private = "file")
+edit_values :: proc(x: Setting) -> ^Setting_Values {
+	s := &g.settings
+	if g.settings_window.scope == .User do return &s.user
+
+	if x not_in s.project.set {
+		setting_copy(&s.project.values, &s.user, x)
+		s.project.set += {x}
+	}
+	return &s.project.values
+}
+
+
+// A change made in the window: the values in effect are worked out again, the
+// scope's file saved, and the change applied
+@(private = "file")
+scope_changed :: proc() {
+	if g.settings_window.scope == .Project {
+		project_settings_changed()
+	} else {
+		settings_changed()
+	}
+}
+
+
+// A change shown but not saved yet (a picker's preview)
+@(private = "file")
+scope_previewed :: proc() {
+	settings_resolve(&g.settings)
+	apply_settings()
+}
+
+
+// Shows the user's settings or the project's
+@(private = "file")
+set_scope :: proc(scope: Settings_Scope) {
+	w := &g.settings_window
+	if w.scope == scope do return
+
+	finish_text_edit(commit = true)
+	w.scope = scope
+	w.recording = nil
+	w.focus = -1
+	w.refocus = nil
+	set_string(&w.bind_note, "")
+}
+
+
+// Whether a row is listed in the scope shown
+@(private = "file")
+in_scope :: proc(x: Setting) -> bool {
+	return g.settings_window.scope == .User || !SETTINGS[x].user_only
+}
+
+
+// The line under a setting's name, and its color, that says how the layers
+// stand where the project sets a value: in Project scope, the user's value it
+// replaces (in the accent); in User scope, the project's in its place. A
+// setting it doesn't set has none
+@(private = "file")
+scope_note :: proc(x: Setting) -> (note: string, color: clay.Color) {
+	s := &g.settings
+	if x not_in s.project.set do return "", {}
+
+	switch g.settings_window.scope {
+	case .Project:
+		yours := setting_display(&s.user, x)
+		return fmt.tprintf("Set for this project · yours is %s", yours), gfx.theme.accent
+
+	case .User:
+		theirs := setting_display(&s.project.values, x)
+		return fmt.tprintf("This project uses %s", theirs), gfx.theme.text_dim
+	}
+	return "", {}
+}
+
+
+// A setting's value as the window says it in a sentence (temp)
+@(private = "file")
+setting_display :: proc(s: ^Setting_Values, x: Setting) -> string {
+	switch v in setting_value(s, x) {
+	case ^bool:
+		return v^ ? "On" : "Off"
+	case ^int:
+		return fmt.tprintf("%d", v^)
+	case ^f64:
+		return format_decimal(v^)
+	case ^string:
+		i, is_theme := gfx.theme_index(v^)
+		if x == .Theme && is_theme {
+			return gfx.THEMES[i].name
+		}
+		if v^ == "" do return "the default"
+		return v^
+	}
+	return ""
+}
+
 
 settings_window_toggle :: proc() {
 	w := &g.settings_window
@@ -141,6 +276,7 @@ settings_window_toggle :: proc() {
 	if w.open {
 		g.finder.open = false
 		langs.recheck_programs() // servers and installers may have been installed since
+		persist_look_again()
 	}
 }
 
@@ -259,8 +395,8 @@ settings_window_handle_event :: proc(event: ^sdl.Event) -> bool {
 		#partial switch x in focused {
 		case Setting:
 			if !SETTINGS[x].picker {
-				setting_step(&g.settings, x, dir)
-				settings_changed()
+				setting_step(edit_values(x), x, dir)
+				scope_changed()
 			}
 		case Server_Item:
 			server_item_step(x, dir)
@@ -309,7 +445,7 @@ start_text_edit :: proc(x: Setting) {
 	w := &g.settings_window
 	w.editing = x
 
-	value := setting_value(&g.settings, x).(^string)^
+	value := setting_value(shown_values(x), x).(^string)^
 	line_edit_set(&w.edit, value, len(value), len(value))
 }
 
@@ -321,10 +457,12 @@ finish_text_edit :: proc(commit: bool) {
 	if !editing do return
 
 	w.editing = nil
-	if commit {
-		value := strings.trim_space(line_edit_string(&w.edit))
-		set_string(setting_value(&g.settings, x).(^string), value)
-		settings_changed()
+	if !commit do return
+
+	value := strings.trim_space(line_edit_string(&w.edit))
+	if value != setting_value(shown_values(x), x).(^string)^ {
+		set_string(setting_value(edit_values(x), x).(^string), value)
+		scope_changed()
 	}
 }
 
@@ -388,9 +526,10 @@ activate_item :: proc(item: Setting_Item) {
 	switch x in item {
 	case Setting:
 		info := SETTINGS[x]
-		switch v in setting_value(&g.settings, x) {
+		switch v in setting_value(shown_values(x), x) {
 		case ^bool:
-			v^ = !v^
+			on := !v^
+			setting_value(edit_values(x), x).(^bool)^ = on
 
 		case ^int, ^f64:
 			return
@@ -410,9 +549,10 @@ activate_item :: proc(item: Setting_Item) {
 			for c, j in info.choices {
 				if c == v^ do i = j
 			}
-			set_string(v, info.choices[(i + 1) % len(info.choices)])
+			next := info.choices[(i + 1) % len(info.choices)]
+			set_string(setting_value(edit_values(x), x).(^string), next)
 		}
-		settings_changed()
+		scope_changed()
 
 	case Command:
 		start_recording(x)
@@ -426,15 +566,24 @@ activate_item :: proc(item: Setting_Item) {
 }
 
 
-// Delete on a row: put it back to its default
+// Delete on a row: put it back to its default, or in Project scope have it
+// follow the user's setting again
 @(private = "file")
 reset_item :: proc(item: Setting_Item) {
 	switch x in item {
 	case Setting:
-		setting_reset(&g.settings, x)
-		settings_changed()
+		s := &g.settings
+		if g.settings_window.scope == .User {
+			setting_reset(&s.user, x)
+			settings_changed()
+		} else if x in s.project.set {
+			s.project.set -= {x}
+			project_settings_changed()
+		}
 	case Command:
 		g.settings.bindings[x] = default_bindings(x)
+		g.settings.terminal_commands -= {x}
+		g.settings.terminal_commands += DEFAULT_TERMINAL_COMMANDS & {x}
 		settings_changed()
 		set_bind_note(x, "")
 	case Server_Item:
@@ -446,7 +595,7 @@ reset_item :: proc(item: Setting_Item) {
 
 @(private = "file")
 confirm_reset_all :: proc() {
-	ask_reset_settings()
+	ask_reset_settings(g.settings_window.scope)
 }
 
 
@@ -673,7 +822,8 @@ set_collapsed_sections :: proc(set: bit_set[Section], clicked: bool) {
 		append(&keys, SECTION_KEYS[section])
 	}
 	joined := strings.join(keys[:], ", ", context.temp_allocator)
-	set_string(&g.settings.collapsed_sections, joined)
+	set_string(&g.settings.user.collapsed_sections, joined)
+	settings_resolve(&g.settings)
 	settings_save_later(&g.settings)
 }
 
@@ -704,12 +854,13 @@ open_picker :: proc(x: Setting) {
 	w.picker = x
 	set_string(&w.original, current_value(x))
 	for e in picker_extras(x) do w.original_extras[e] = number_value(e)
+	w.original_set = g.settings.project.set
 
 	line_edit_clear(&w.filter)
 	w.picker_reveal = true
 	w.extra_focus = -1
 
-	if i, ok := gfx.theme_index(g.settings.theme); ok {
+	if i, ok := gfx.theme_index(current_value(.Theme)); ok {
 		w.dark_themes = gfx.THEMES[i].dark
 	}
 	if is_font_setting(x) do gfx.fonts_scan(&g.fonts, walk_files, again = true)
@@ -732,12 +883,21 @@ close_picker :: proc(commit: bool) {
 	w.picking = false
 	drop_picker_click()
 	if commit {
-		settings_changed()
-	} else {
-		set_string(setting_value(&g.settings, w.picker).(^string), w.original)
-		for e in picker_extras(w.picker) do set_number_value(e, w.original_extras[e])
-		apply_settings()
+		scope_changed()
+		return
 	}
+
+	// The values as they were, and in Project scope which of them it set
+	set_string(setting_value(shown_values(w.picker), w.picker).(^string), w.original)
+	for e in picker_extras(w.picker) do set_number_value(e, w.original_extras[e])
+	if w.scope == .Project {
+		changed := bit_set[Setting]{w.picker}
+		for e in picker_extras(w.picker) do changed += {e}
+
+		project := &g.settings.project
+		project.set = (project.set - changed) + (w.original_set & changed)
+	}
+	scope_previewed()
 }
 
 
@@ -805,10 +965,10 @@ picker_extras :: proc(x: Setting) -> []Setting {
 }
 
 
-// A number setting's value, as f64 whether it is an int or not
+// A number setting's value as shown, as f64 whether it is an int or not
 @(private = "file")
 number_value :: proc(x: Setting) -> f64 {
-	#partial switch v in setting_value(&g.settings, x) {
+	#partial switch v in setting_value(shown_values(x), x) {
 	case ^int: return f64(v^)
 	case ^f64: return v^
 	}
@@ -816,9 +976,10 @@ number_value :: proc(x: Setting) -> f64 {
 }
 
 
+// Puts back a number setting's value as shown (a picker cancelled)
 @(private = "file")
 set_number_value :: proc(x: Setting, n: f64) {
-	#partial switch v in setting_value(&g.settings, x) {
+	#partial switch v in setting_value(shown_values(x), x) {
 	case ^int: v^ = int(n)
 	case ^f64: v^ = n
 	}
@@ -828,8 +989,8 @@ set_number_value :: proc(x: Setting, n: f64) {
 // Steps one of the picker's extra settings, applied without saving
 @(private = "file")
 step_extra :: proc(x: Setting, dir: int) {
-	setting_step(&g.settings, x, dir)
-	apply_settings()
+	setting_step(edit_values(x), x, dir)
+	scope_previewed()
 }
 
 
@@ -841,7 +1002,7 @@ show_dark_themes :: proc(dark: bool) {
 	if w.dark_themes == dark do return
 
 	w.dark_themes = dark
-	i, _ := gfx.theme_index(g.settings.theme)
+	i, _ := gfx.theme_index(current_value(.Theme))
 
 	next := -1
 	for spec, j in gfx.THEMES {
@@ -984,9 +1145,10 @@ picker_options :: proc(x: Setting, filter: string) -> []Picker_Option {
 }
 
 
+// A string setting's value as shown
 @(private = "file")
 current_value :: proc(x: Setting) -> string {
-	return setting_value(&g.settings, x).(^string)^
+	return setting_value(shown_values(x), x).(^string)^
 }
 
 
@@ -1002,8 +1164,9 @@ option_index :: proc(options: []Picker_Option, value: string) -> int {
 // Applies an option without saving it
 @(private = "file")
 preview_option :: proc(value: string) {
-	set_string(setting_value(&g.settings, g.settings_window.picker).(^string), value)
-	apply_settings()
+	x := g.settings_window.picker
+	set_string(setting_value(edit_values(x), x).(^string), value)
+	scope_previewed()
 }
 
 
@@ -1115,14 +1278,16 @@ settings_page :: proc(width, height: f32) {
 			childGap = 14,
 		},
 	}) {
-		// Title and close button
+		// Title, the scope switch and the close button
 		if clay.UI()({
 			layout = {
 				sizing = {width = clay.SizingGrow()},
 				childAlignment = {y = .Center},
+				childGap = 14,
 			},
 		}) {
 			label("Settings", gfx.theme.text_bright, 16, .SemiBold)
+			scope_switch()
 			push_right()
 			if len(w.search.text) == 0 do collapse_all_button() // a search shows every section
 			close_id := clay.ID("SettingsClose")
@@ -1132,10 +1297,24 @@ settings_page :: proc(width, height: f32) {
 		}
 
 		search_field()
-		if g.settings.error != "" do error_banner(g.settings.error)
+		problem := w.scope == .User ? g.settings.error : g.settings.project_error
+		if problem != "" do error_banner(problem)
 		settings_list()
 		footer()
 	}
+}
+
+
+// User or Project: whose settings the window shows. The project's name is in
+// the tooltip of its side
+@(private = "file")
+scope_switch :: proc() {
+	w := &g.settings_window
+	choice, changed := segmented(SCOPE_SWITCH_ID, {"User", "Project"}, int(w.scope))
+	if changed do set_scope(Settings_Scope(choice))
+
+	name := folder_name(g.project.root)
+	tooltip(scope_switch_side(.Project), fmt.tprintf("Settings for %s only, over yours", name))
 }
 
 
@@ -1197,27 +1376,29 @@ settings_list :: proc() {
 		},
 		clip = {vertical = true, childOffset = clay.GetScrollOffset()},
 	}) {
-		search := line_edit_string(&g.settings_window.search)
+		w := &g.settings_window
+		search := line_edit_string(&w.search)
 		query := strings.to_lower(search, context.temp_allocator)
 		collapsed := query == "" ? collapsed_set() : {} // a search shows what it finds
+		user := w.scope == .User
 		shown := 0
 		for key, section in SECTION_KEYS {
-			// The section's rows that match the search
+			// The section's rows that match the search, of those in the scope
 			rows := make([dynamic]Setting_Item, context.temp_allocator)
-			if section == .Keybindings {
+			if section == .Keybindings && user {
 				for info, cmd in COMMANDS {
 					bound := bindings_label(g.settings.bindings[cmd], " ")
 					if matches(query, key, info.name, bound) do append(&rows, cmd)
 				}
-			} else {
+			} else if section != .Keybindings {
 				for info, x in SETTINGS {
-					in_window := info.section == section && info.name != ""
+					in_window := info.section == section && info.name != "" && in_scope(x)
 					if in_window && matches(query, key, info.name, info.keywords) {
 						append(&rows, x)
 					}
 				}
 			}
-			servers := section == .Language_Servers && servers_match(query)
+			servers := user && section == .Language_Servers && servers_match(query)
 			if len(rows) == 0 && !servers {
 				continue
 			}
@@ -1238,12 +1419,19 @@ settings_list :: proc() {
 					#partial switch x in item {
 					case Setting:
 						info := SETTINGS[x]
-						if setting_row(x, info.name, info.description, list) {
+						detail, color := setting_detail(x)
+						if setting_row(
+							x,
+							info.name,
+							info.description,
+							list,
+							detail = detail,
+							detail_color = color,
+						) {
 							setting_control(x)
 						}
 					case Command:
 						// The note copied: a click in the row may replace it
-						w := &g.settings_window
 						note := ""
 						if w.bind_note_for == x {
 							note = strings.clone(w.bind_note, context.temp_allocator)
@@ -1263,7 +1451,7 @@ settings_list :: proc() {
 			}
 		}
 	}
-	list_scrollbar(list, &g.settings_window.scrollbar_drag)
+	list_scrollbar(list, &g.settings_window.scrollbar_drag, POPUP_LAYER)
 }
 
 
@@ -1349,8 +1537,8 @@ section_header :: proc(h: Section_Header, list: clay.ElementId) -> bool {
 
 // One row: name and description on the left (after a dot of `mark`'s color,
 // if any), its control on the right. `detail` is one more line, cut off where
-// the row ends (it may hold a path, which can't wrap). Use as:
-// if setting_row(...) { control }
+// the row ends (it may hold a path, which can't wrap), dim unless given a
+// color. Use as: if setting_row(...) { control }
 @(private, deferred_none = close_element)
 setting_row :: proc(
 	item: Setting_Item,
@@ -1358,6 +1546,7 @@ setting_row :: proc(
 	list: clay.ElementId,
 	mark := clay.Color{},
 	detail := "",
+	detail_color := clay.Color{},
 ) -> bool {
 	w := &g.settings_window
 	index := add_item(item)
@@ -1393,20 +1582,38 @@ setting_row :: proc(
 	}) {
 		label(name, gfx.theme.text)
 		if description != "" do paragraph(description, gfx.theme.text_dim)
-		if detail != "" do clipped_line(detail)
+		if detail != "" {
+			color := detail_color.a > 0 ? detail_color : gfx.theme.text_dim
+			clipped_line(detail, color)
+		}
 	}
 	return true
 }
 
 
-// A line of dim text, clipped: its width doesn't widen what holds it
+// A line under a setting, or "" (temp): where the project sets it, else how
+// things stand for it. No color is the row's default
 @(private = "file")
-clipped_line :: proc(text: string) {
+setting_detail :: proc(x: Setting) -> (detail: string, color: clay.Color) {
+	if note, note_color := scope_note(x); note != "" {
+		return note, note_color
+	}
+
+	#partial switch x {
+	case .Terminal_Backend: return persist_status_note(), {}
+	}
+	return "", {}
+}
+
+
+// A line of small text, clipped: its width doesn't widen what holds it
+@(private = "file")
+clipped_line :: proc(text: string, color: clay.Color) {
 	if clay.UI()({
 		layout = {sizing = {width = clay.SizingGrow()}},
-		clip = {horizontal = true},
+		clip = row_clip(),
 	}) {
-		label(text, gfx.theme.text_dim, FONT_SIZE_SMALL)
+		label(text, color, FONT_SIZE_SMALL)
 	}
 }
 
@@ -1428,24 +1635,26 @@ row_fill :: proc(selected: bool) -> clay.Color {
 
 // --- Controls ----------------------------------------------------------------------
 
+// A setting's control, showing its value in the scope; a change goes to the
+// scope's values
 @(private = "file")
 setting_control :: proc(x: Setting) {
 	info := SETTINGS[x]
 	list := clay.ID("SettingsList")
 
-	switch v in setting_value(&g.settings, x) {
+	switch v in setting_value(shown_values(x), x) {
 	case ^bool:
 		choice, changed := segmented(u32(x), {"Off", "On"}, int(v^), list)
 		if changed {
-			v^ = choice == 1
-			settings_changed()
+			setting_value(edit_values(x), x).(^bool)^ = choice == 1
+			scope_changed()
 		}
 
 	case ^int, ^f64:
 		dir := stepper(x, list)
 		if dir != 0 {
-			setting_step(&g.settings, x, dir)
-			settings_changed()
+			setting_step(edit_values(x), x, dir)
+			scope_changed()
 		}
 
 	case ^string:
@@ -1463,8 +1672,8 @@ setting_control :: proc(x: Setting) {
 
 			choice, changed := segmented(u32(x), names, current, list)
 			if changed {
-				set_string(v, info.choices[choice])
-				settings_changed()
+				set_string(setting_value(edit_values(x), x).(^string), info.choices[choice])
+				scope_changed()
 			}
 		} else {
 			text_setting_field(x, v^)
@@ -1526,7 +1735,7 @@ segmented :: proc(
 @(private = "file")
 stepper :: proc(x: Setting, within: clay.ElementId) -> (dir: int) {
 	value: string
-	#partial switch v in setting_value(&g.settings, x) {
+	#partial switch v in setting_value(shown_values(x), x) {
 	case ^int: value = fmt.tprintf("%d", v^)
 	case ^f64: value = format_decimal(v^)
 	}
@@ -1596,7 +1805,7 @@ picker_button :: proc(x: Setting, value: string) {
 	}) {
 		if clay.UI()({
 			layout = {sizing = {width = clay.SizingGrow()}},
-			clip = {horizontal = true},
+			clip = row_clip(),
 		}) {
 			label(text, missing ? gfx.theme.error : gfx.theme.text_bright, 13)
 		}
@@ -1641,16 +1850,20 @@ RECORDING_PROMPT :: "Press a key or side button…  (Esc cancels)"
 
 
 // A command's bindings, each a chip with an x on hover that removes it, then
-// Add (the prompt while recording) and, when they aren't the defaults, Reset
+// Add (the prompt while recording), whether it works in terminals and, when
+// any of it isn't the default, Reset
 @(private = "file")
 keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 	w := &g.settings_window
 	recording := w.recording == cmd
 	chords := g.settings.bindings[cmd] // a copy: a click below may change them
+	in_terminals := cmd in g.settings.terminal_commands
+	changed := chords != default_bindings(cmd) ||
+	           in_terminals != (cmd in DEFAULT_TERMINAL_COMMANDS)
 
 	if clay.UI()({layout = {childGap = 6, childAlignment = {y = .Center}}}) {
 		// Reset, when changed
-		if !recording && chords != default_bindings(cmd) {
+		if !recording && changed {
 			reset_id := clay.ID("BindingReset", u32(cmd))
 			if button(reset_id, "Reset", "Reset to default", "Del", list) {
 				reset_item(cmd)
@@ -1667,7 +1880,55 @@ keybinding_control :: proc(cmd: Command, list: clay.ElementId) {
 		if count < MAX_CHORDS || recording {
 			add_binding_button(cmd, count, recording, list)
 		}
+
+		terminal_toggle(cmd, in_terminals, list)
 	}
+}
+
+
+// Whether the command works while a terminal has focus: a terminal icon, lit
+// while it does. Editor commands always go to the shell: an empty slot keeps
+// the other rows' toggles in a column
+@(private = "file")
+terminal_toggle :: proc(cmd: Command, on: bool, list: clay.ElementId) {
+	slot := clay.SizingFixed(BINDING_CHIP_HEIGHT)
+	if cmd in EDITOR_COMMANDS {
+		if clay.UI()({layout = {sizing = {slot, slot}}}) {}
+		return
+	}
+
+	id := clay.ID("BindingTerminal", u32(cmd))
+	hovered := pointer_in(id) && pointer_in(list)
+	color := gfx.theme.text_faint
+	switch {
+	case on:      color = gfx.theme.accent
+	case hovered: color = gfx.theme.text_dim
+	}
+
+	if clay.UI(id)({
+		layout = {sizing = {slot, slot}, childAlignment = {x = .Center, y = .Center}},
+		backgroundColor = hovered ? gfx.theme.hover : {},
+		cornerRadius = clay.CornerRadiusAll(5),
+	}) {
+		icon(.Terminal, color, 14)
+	}
+
+	tip := on ? "Works while a terminal has focus" : "Goes to the shell while a terminal has focus"
+	tooltip(id, tip)
+	if clicked(id, list) {
+		set_terminal_command(cmd, !on)
+	}
+}
+
+
+// Makes a command work while a terminal has focus, or go to the shell
+set_terminal_command :: proc(cmd: Command, on: bool) {
+	if on {
+		g.settings.terminal_commands += {cmd}
+	} else {
+		g.settings.terminal_commands -= {cmd}
+	}
+	settings_changed()
 }
 
 
@@ -1818,13 +2079,20 @@ footer_hint :: proc() -> string {
 		}
 		return "↑↓ select  Enter add a binding  → choose one  Del reset"
 	case Setting:
+		// In Project scope Delete makes a set value follow the user's
+		reset := "  Del reset"
+		if w.scope == .Project {
+			reset = x in g.settings.project.set ? "  Del use yours" : ""
+		}
+
 		info := SETTINGS[x]
 		switch _ in setting_value(&g.settings, x) {
 		case ^string:
-			if info.picker do return "↑↓ select  Enter choose  Del reset"
-			if info.choices == nil do return "↑↓ select  Enter edit  Del reset"
+			if info.picker do return fmt.tprintf("↑↓ select  Enter choose%s", reset)
+			if info.choices == nil do return fmt.tprintf("↑↓ select  Enter edit%s", reset)
 		case ^bool, ^int, ^f64:
 		}
+		return fmt.tprintf("↑↓ select  ←→ change%s", reset)
 	}
 	return "↑↓ select  ←→ change  Del reset"
 }
@@ -1847,14 +2115,29 @@ footer :: proc() {
 			label(footer_hint(), gfx.theme.text_dim, FONT_SIZE_SMALL)
 		}
 
-		// Buttons
+		// Buttons: the scope's reset and file
+		w := &g.settings_window
 		reset_id := clay.ID("SettingsResetAll")
-		if button(reset_id, "Reset all", "Reset every setting to its default") {
-			confirm_reset_all()
-		}
-		if g.settings.path != "" {
-			if button(clay.ID("SettingsEditFile"), "Edit settings.toml", g.settings.path) {
-				g.pending = Open_File(strings.clone(g.settings.path))
+		edit_id := clay.ID("SettingsEditFile")
+		switch w.scope {
+		case .User:
+			if button(reset_id, "Reset all", "Reset every setting to its default") {
+				confirm_reset_all()
+			}
+			if g.settings.path != "" {
+				if button(edit_id, "Edit settings.toml", g.settings.path) {
+					g.pending = Open_File(strings.clone(g.settings.path))
+					settings_window_toggle()
+				}
+			}
+
+		case .Project:
+			if button(reset_id, "Reset all", "Have every setting follow yours") {
+				confirm_reset_all()
+			}
+			path := project_file(g.project.root, PROJECT_SETTINGS)
+			if button(edit_id, "Edit .typo/settings.toml", path) {
+				project_edit_settings()
 				settings_window_toggle()
 			}
 		}
@@ -1943,7 +2226,7 @@ picker_page :: proc(width, height: f32) {
 				}
 			}
 		}
-		list_scrollbar(list, &w.scrollbar_drag)
+		list_scrollbar(list, &w.scrollbar_drag, POPUP_LAYER)
 
 		// The settings adjusted along with the list
 		extras := picker_extras(x)

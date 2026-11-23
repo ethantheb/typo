@@ -1,5 +1,5 @@
 #+build windows
-package lsp
+package process
 
 import "core:os"
 import "core:path/filepath"

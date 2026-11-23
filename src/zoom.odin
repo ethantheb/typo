@@ -28,21 +28,27 @@ pane_zoom :: proc(p: ^Pane) -> (step: int, ok: bool) {
 	if p == nil do return
 
 	switch c in p.content {
-	case ^Editor:   return c.zoom, c.status == .Text
-	case ^Terminal: return c.zoom, true
+	case ^Editor:    return c.zoom, c.status == .Text
+	case ^Terminal:  return c.zoom, true
+	case ^Diff_View: return c.zoom, true
+	case ^Git_View:
 	}
 	return
 }
 
 
 // Zooms a pane's text to a step. An editor keeps its caret's line where it is
-// on screen; a terminal's grid resizes to its new cells
+// on screen; a terminal's grid resizes to its new cells; a diff keeps its top
+// row
 pane_set_zoom :: proc(p: ^Pane, step: int) {
 	switch c in p.content {
 	case ^Editor:
 		if c.status == .Text do textedit.set_zoom(c, step)
 	case ^Terminal:
 		c.zoom = textedit.clamp_zoom(step)
+	case ^Diff_View:
+		diff_view_set_zoom(c, step)
+	case ^Git_View:
 	}
 }
 
@@ -50,8 +56,10 @@ pane_set_zoom :: proc(p: ^Pane, step: int) {
 // Sets the zoom of a pane not drawn yet, which has nothing to keep in place
 pane_init_zoom :: proc(p: ^Pane, step: int) {
 	switch c in p.content {
-	case ^Editor:   c.zoom = textedit.clamp_zoom(step)
-	case ^Terminal: c.zoom = textedit.clamp_zoom(step)
+	case ^Editor:    c.zoom = textedit.clamp_zoom(step)
+	case ^Terminal:  c.zoom = textedit.clamp_zoom(step)
+	case ^Diff_View: c.zoom = textedit.clamp_zoom(step)
+	case ^Git_View:
 	}
 }
 
