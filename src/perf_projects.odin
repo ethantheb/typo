@@ -4,16 +4,16 @@ import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
 
 // Perf phase: the recent projects popup (project_picker.odin). Open project
-// shows it under the sidebar's open folder button, the project open here first
-// among the recent ones; Esc closes it; the button opens it again, and a press
+// shows it under the folder's name, the project open here first among the
+// recent ones; Esc closes it; a press on the name opens it again, and a press
 // outside closes it
 
 
 @(private = "file")
 Picker_Step :: enum {
-	Shown,  // Open project ran: laid out under the button, this project listed
-	Closed, // Esc closed it; the button is pressed
-	Button, // the button opened it; a press outside
+	Shown,  // Open project ran: laid out under the name, this project listed
+	Closed, // Esc closed it; the name is pressed
+	Name,   // the name opened it; a press outside
 	Done,   // the press outside closed it
 }
 
@@ -41,9 +41,9 @@ phase_project_picker :: proc(p: ^Perf, frame: int) -> bool {
 	switch ps.step {
 	case .Shown:
 		popup, shown := element_rect(clay.ID("ProjectPicker"))
-		button, _ := element_rect(clay.ID("OpenButton"))
+		name, _ := element_rect(clay.ID("FolderName"))
 		check(p, "Open project shows the recent projects", g.project_picker.open && shown)
-		check(p, "under the open folder button", shown && popup.y >= button.y + button.h)
+		check(p, "under the folder's name", shown && popup.y >= name.y + name.h)
 
 		recent := state_recent_projects()
 		first := len(recent) > 0 && same_path(recent[0], g.workspace.root)
@@ -56,16 +56,16 @@ phase_project_picker :: proc(p: ^Perf, frame: int) -> bool {
 		project_picker_handle_event(&escape)
 		check(p, "Esc closes it", !g.project_picker.open)
 
-		g.mouse_pos = {button.x + button.w / 2, button.y + button.h / 2}
+		g.mouse_pos = {name.x + name.w / 2, name.y + name.h / 2}
 		g.mouse_pressed, g.mouse_down, g.mouse_clicks = true, true, 1
 		next_step(.Closed, frame)
 
 	case .Closed:
 		g.mouse_down = false
-		next_step(.Button, frame)
+		next_step(.Name, frame)
 
-	case .Button:
-		check(p, "the open folder button opens it", g.project_picker.open)
+	case .Name:
+		check(p, "a press on the folder's name opens it", g.project_picker.open)
 
 		// A press in the middle of the window, outside it
 		g.mouse_pos = {f32(g.window_w) * 0.7, f32(g.window_h) * 0.7}

@@ -274,6 +274,7 @@ Custom_Data :: union {
 	Field_Draw,
 	^Text_Area,
 	Diff_Draw,
+	Caption_Glyph,
 }
 
 

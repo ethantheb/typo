@@ -234,8 +234,9 @@ launch_proc :: proc(l: ^Launch) {
 
 // --- UI ----------------------------------------------------------------------------
 
-// The popup, declared with the popups: under the open folder button while the
-// sidebar shows, else at the top of the window
+// The popup, declared with the popups: under the folder's name while it shows
+// (in the sidebar, or always in typo's caption strip), else at the top of the
+// window
 project_picker_ui :: proc() {
 	pp := &g.project_picker
 	if !pp.open do return
@@ -250,10 +251,11 @@ project_picker_ui :: proc() {
 		offset   = {(f32(g.window_w) - width) / 2, 60},
 		zIndex   = POPUP_LAYER,
 	}
-	button, has_button := element_rect(clay.ID("OpenButton"))
-	if g.sidebar_visible && has_button {
-		x := clamp(button.x, PANE_GAP, f32(g.window_w) - width - PANE_GAP)
-		floating.offset = {x, button.y + button.h + 4}
+	name, has_name := element_rect(clay.ID("FolderName"))
+	name_shown := g.sidebar_visible || window_frame.on
+	if name_shown && has_name {
+		x := clamp(name.x, PANE_GAP, f32(g.window_w) - width - PANE_GAP)
+		floating.offset = {x, name.y + name.h + 4}
 	}
 
 	if clay.UI(clay.ID("ProjectPicker"))({

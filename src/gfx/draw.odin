@@ -144,6 +144,48 @@ fill_rect :: proc(x, y, w, h: f32, c: clay.Color) {
 }
 
 
+// A straight line `width` pixels thick, its sides fading out over a pixel
+fill_line :: proc(from, to: [2]f32, width: f32, c: clay.Color) {
+	d := to - from
+	length := math.sqrt(d.x * d.x + d.y * d.y)
+	if length <= 0 || width <= 0 {
+		return
+	}
+
+	flush_text()
+
+	normal := [2]f32{-d.y, d.x} / length
+	fc := to_fcolor(c)
+	clear := fc
+	clear.a = 0
+
+	// Across the line: outside it, one edge, the other edge, outside it. A line
+	// a pixel thin or less peaks in its middle
+	half := width / 2
+	offsets := [4]f32{-half - 0.5, -half + 0.5, half - 0.5, half + 0.5}
+	if width <= 1 {
+		offsets[1] = 0
+		offsets[2] = 0
+	}
+	colors := [4]sdl.FColor{clear, fc, fc, clear}
+
+	verts: [8]sdl.Vertex
+	for k in 0 ..< 4 {
+		verts[k] = {position = sdl.FPoint(from + normal * offsets[k]), color = colors[k]}
+		verts[4 + k] = {position = sdl.FPoint(to + normal * offsets[k]), color = colors[k]}
+	}
+
+	// Two triangles between each pair of neighboring strips
+	indices: [18]i32
+	for k in 0 ..< 3 {
+		a, b := i32(k), i32(4 + k)
+		copy(indices[k * 6:], []i32{a, a + 1, b, a + 1, b + 1, b})
+	}
+
+	_ = sdl.RenderGeometry(renderer, nil, &verts[0], len(verts), &indices[0], len(indices))
+}
+
+
 // Rounded rectangles are convex, so a triangle fan from the centre covers them,
 // inset half a pixel; a ring fading out to half a pixel outside smooths the edge
 fill_rounded_rect :: proc(b: clay.BoundingBox, r: clay.CornerRadius, c: clay.Color) {

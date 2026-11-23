@@ -218,6 +218,7 @@ PHASES := [?]Phase {
 		herdr_limit = 1,
 	},
 	{name = "recent projects popup", step = phase_project_picker},
+	{name = "typo's window frame", step = phase_window_frame},
 	{name = "go to line", step = phase_goto_line},
 	{name = "text fields with the mouse and keys", step = phase_text_fields},
 	{name = "zooming panes", step = phase_zoom_panes},
@@ -2736,9 +2737,7 @@ phase_sidebar :: proc(p: ^Perf, frame: int) -> bool {
 		closed := !popup && !s.open && len(s.field.text) == 0
 		check(p, "Escape empties the field and closes the popup", closed)
 
-		// The empty field shows Find file's key, which opens the popup
-		_, hint := element_rect(clay.ID("SidebarSearchHint"))
-		check(p, "the empty field shows Find file's key", hint)
+		// Find file opens the popup
 		run_command(.Find_File)
 		check(p, "Find file opens the popup", s.open && !g.finder.open)
 		sidebar_search_close()

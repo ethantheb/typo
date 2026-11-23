@@ -1032,9 +1032,10 @@ work_rect :: proc() -> gfx.Rect {
 	x: f32 = PANE_GAP
 	if g.sidebar_visible do x += SIDEBAR_WIDTH + PANE_GAP
 
+	top := frame_top()
 	w := f32(g.window_w) - x - PANE_GAP
-	h := f32(g.window_h) - STATUSBAR_HEIGHT - 2 * PANE_GAP
-	return {x, PANE_GAP, max(w, 0), max(h, 0)}
+	h := f32(g.window_h) - top - STATUSBAR_HEIGHT - 2 * PANE_GAP
+	return {x, top + PANE_GAP, max(w, 0), max(h, 0)}
 }
 
 
@@ -1459,7 +1460,7 @@ pane_element :: proc(p: ^Pane) {
 		border = {color = border, width = clay.BorderOutside(1)},
 		clip = {horizontal = true, vertical = true},
 		floating = {
-			attachTo = .Parent,
+			attachTo = .Root, // work_rect is in the window's coordinates
 			offset = {r.x, r.y},
 			zIndex = pane_layer(p),
 		},
@@ -1646,7 +1647,7 @@ work_area :: proc(r: gfx.Rect) {
 	if clay.UI(clay.ID("WorkArea"))({
 		layout = {sizing = {clay.SizingFixed(r.w), clay.SizingFixed(r.h)}},
 		floating = {
-			attachTo = .Parent,
+			attachTo = .Root,
 			offset = {r.x, r.y},
 			zIndex = 1,
 			pointerCaptureMode = .Passthrough,
@@ -1667,7 +1668,7 @@ leaving_pane :: proc(l: Leaving) {
 		cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
 		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 		floating = {
-			attachTo = .Parent,
+			attachTo = .Root,
 			offset = {r.x, r.y},
 			zIndex = 1,
 			pointerCaptureMode = .Passthrough,
@@ -1696,7 +1697,7 @@ drag_ui :: proc() {
 			cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
 			border = {color = edge, width = clay.BorderOutside(2)},
 			floating = {
-				attachTo = .Parent,
+				attachTo = .Root,
 				offset = {r.x, r.y},
 				zIndex = 40,
 				pointerCaptureMode = .Passthrough,

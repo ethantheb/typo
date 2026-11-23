@@ -33,7 +33,7 @@ Text_Area :: struct {
 
 // How a text area looks
 TEXT_AREA_SIZE      :: FONT_SIZE_UI
-TEXT_AREA_PADDING   :: 8 // around the text
+TEXT_AREA_PADDING   :: 8 // above and below the text (beside it: area_inset_x)
 TEXT_AREA_MIN_LINES :: 3
 TEXT_AREA_MAX_LINES :: 10
 
@@ -97,6 +97,17 @@ text_area_height :: proc(ta: ^Text_Area) -> f32 {
 }
 
 
+// The text's inset from the box's sides: as far as its capitals are from the
+// box's top (the padding, half the row's extra height and the font's own space
+// above its capitals), so the gaps beside and above the text look the same
+@(private = "file")
+area_inset_x :: proc() -> f32 {
+	m := gfx.font_metrics(&gfx.text_system, .Body, TEXT_AREA_SIZE)
+	above := (text_area_line_height() - m.height) / 2 + m.ascent - m.cap_height
+	return math.round(TEXT_AREA_PADDING + max(above, 0))
+}
+
+
 // --- Keys --------------------------------------------------------------------------
 
 // Typing, editing keys and the field commands (select all, clipboard, undo).
@@ -146,9 +157,10 @@ text_area :: proc(id: clay.ElementId, ta: ^Text_Area, placeholder: string, focus
 	textedit.take_changes(ta)
 
 	// The text's place from last frame's layout, then the mouse and the scroll
+	inset := area_inset_x()
 	if r, ok := element_rect(id); ok {
 		pad := f32(TEXT_AREA_PADDING)
-		ta.view = {r.x + pad, r.y + pad, max(r.w - 2 * pad, 0), max(r.h - 2 * pad, 0)}
+		ta.view = {r.x + inset, r.y + pad, max(r.w - 2 * inset, 0), max(r.h - 2 * pad, 0)}
 	}
 	if focused do area_mouse(id, ta)
 	if ta.reveal {
@@ -162,7 +174,12 @@ text_area :: proc(id: clay.ElementId, ta: ^Text_Area, placeholder: string, focus
 	if clay.UI(id)({
 		layout = {
 			sizing = {clay.SizingGrow(), clay.SizingFixed(text_area_height(ta))},
-			padding = clay.PaddingAll(TEXT_AREA_PADDING),
+			padding = {
+				left = u16(inset),
+				right = u16(inset),
+				top = TEXT_AREA_PADDING,
+				bottom = TEXT_AREA_PADDING,
+			},
 		},
 		backgroundColor = gfx.theme.bg,
 		cornerRadius = clay.CornerRadiusAll(6),

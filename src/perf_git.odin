@@ -184,8 +184,6 @@ phase_git_pane :: proc(p: ^Perf, frame: int) -> bool {
 		_, bar := element_rect(clay.ID("GitStatus"))
 		_, list := element_rect(clay.ID("GitFiles", gp_pane.id))
 		check(p, "the status bar shows the branch, the pane its files", bar && list)
-		_, hint := element_rect(clay.ID("GitCommitHint"))
-		check(p, "the Commit button shows its key", hint)
 		check(p, "nothing to commit without a message", !git_can_commit(""))
 
 		// A message typed, then the list's keys

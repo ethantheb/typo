@@ -29,12 +29,6 @@ GIT_PADDING    :: 10
 GIT_MIN_WIDTH  :: 240          // a narrower pane cuts the Git pane off at its edge
 COMMIT_CHORD   :: "Ctrl+Enter" // in the message box
 
-// The commit key in the Commit button: as the sidebar search's key hint
-@(private = "file")
-COMMIT_HINT_SIZE :: FONT_SIZE_SMALL - 1
-@(private = "file")
-COMMIT_HINT_INSET :: 8
-
 // The rows' insets and gaps: a section's chevron and name, then its files
 // indented to line up with the name past the chevron
 @(private = "file")
@@ -442,66 +436,31 @@ commit_button :: proc(gv: ^Git_View) {
 	if !enabled do bg, fg = gfx.theme.hover, gfx.theme.text_faint
 	if hovered do bg = gfx.mix(bg, gfx.theme.text_bright, 0.12)
 
-	// The commit key at the right while it fits; the label centered in the rest
-	show_hint := commit_hint_fits(id)
-	padding := show_hint ? u16(COMMIT_HINT_INSET) : 0
-
 	if clay.UI(id)({
 		layout = {
 			sizing = {clay.SizingGrow(), clay.SizingGrow()},
-			padding = {right = padding},
-			childAlignment = {y = .Center},
+			childGap = 6,
+			childAlignment = {x = .Center, y = .Center},
 		},
 		backgroundColor = bg,
 		cornerRadius = clay.CornerRadiusAll(6),
 		transition = transition({.BackgroundColor}),
 	}) {
-		if clay.UI()({
-			layout = {
-				sizing = {clay.SizingGrow(), clay.SizingGrow()},
-				childAlignment = {x = .Center, y = .Center},
-			},
-		}) {
-			if clay.UI(clay.ID("GitCommitLabel"))({
-				layout = {childGap = 6, childAlignment = {y = .Center}},
-			}) {
-				icon(.Check, fg, 14)
-				label(commit_label(gs.status.counts[.Staged]), fg, FONT_SIZE_UI, .SemiBold)
-			}
-		}
-
-		if show_hint {
-			hint := fg
-			hint.a *= 0.6
-			if clay.UI(clay.ID("GitCommitHint"))({}) {
-				label(COMMIT_CHORD, hint, COMMIT_HINT_SIZE)
-			}
-		}
+		icon(.Check, fg, 14)
+		label(commit_label(gs.status.counts[.Staged]), fg, FONT_SIZE_UI, .SemiBold)
 	}
 
+	// Its key in the tooltip, whether it can commit now or not
 	tip := "Commit the staged changes"
 	switch {
 	case gs.remote != nil:                  tip = "A git command is running"
 	case gs.status.counts[.Staged] == 0:    tip = "Stage changes to commit them"
 	case strings.trim_space(message) == "": tip = "Write a message to commit"
 	}
-	tooltip(id, tip, enabled ? COMMIT_CHORD : "")
+	tooltip(id, tip, COMMIT_CHORD)
 	if enabled && clicked(id) {
 		commit_message(gv)
 	}
-}
-
-
-// Whether the commit key fits at the button's right beside its label, as last
-// laid out, with an inset on each side and between them
-@(private = "file")
-commit_hint_fits :: proc(button: clay.ElementId) -> bool {
-	box, laid_out := element_rect(button)
-	content, _ := element_rect(clay.ID("GitCommitLabel"))
-	if !laid_out do return false
-
-	hint := gfx.text_width(&gfx.text_system, .Body, COMMIT_HINT_SIZE, COMMIT_CHORD)
-	return box.w >= content.w + hint + 4 * COMMIT_HINT_INSET
 }
 
 

@@ -1,5 +1,6 @@
 package gfx
 
+import "core:c"
 import "core:hash"
 import "core:math"
 import "core:os"
@@ -694,14 +695,15 @@ Width_Key :: struct {
 @(private = "file")
 WIDTH_CACHE_MAX :: 1 << 16
 
-// Ascent, descent and height of a font, in logical pixels
+// Ascent, descent, height and capitals' height (an H's) of a font, in logical
+// pixels
 Font_Metrics :: struct {
-	ascent, descent, height: f32,
+	ascent, descent, height, cap_height: f32,
 }
 
 
 font_metrics :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> Font_Metrics {
-	if ts.engine == nil do return {f32(size) * 0.8, f32(size) * 0.25, f32(size) * 1.05}
+	if ts.engine == nil do return metrics_guess(size)
 
 	key := Font_Key{id, size}
 	if m, ok := ts.metrics[key]; ok {
@@ -709,15 +711,31 @@ font_metrics :: proc(ts: ^Text_System, id: Font_Id, size: u16) -> Font_Metrics {
 	}
 
 	font := text_get_font(ts, id, size)
-	if font == nil do return {f32(size) * 0.8, f32(size) * 0.25, f32(size) * 1.05}
+	if font == nil do return metrics_guess(size)
 
 	m := Font_Metrics {
-		ascent  = f32(ttf.GetFontAscent(font)) / scale,
-		descent = f32(-ttf.GetFontDescent(font)) / scale,
-		height  = f32(ttf.GetFontHeight(font)) / scale,
+		ascent     = f32(ttf.GetFontAscent(font)) / scale,
+		descent    = f32(-ttf.GetFontDescent(font)) / scale,
+		height     = f32(ttf.GetFontHeight(font)) / scale,
+		cap_height = metrics_guess(size).cap_height,
 	}
+
+	// The capitals' height from an H, when the font has one
+	minx, maxx, miny, maxy, advance: c.int
+	if ttf.GetGlyphMetrics(font, 'H', &minx, &maxx, &miny, &maxy, &advance) {
+		m.cap_height = f32(maxy) / scale
+	}
+
 	ts.metrics[key] = m
 	return m
+}
+
+
+// Metrics for a font that isn't loaded, from its size
+@(private = "file")
+metrics_guess :: proc(size: u16) -> Font_Metrics {
+	s := f32(size)
+	return {ascent = s * 0.8, descent = s * 0.25, height = s * 1.05, cap_height = s * 0.7}
 }
 
 

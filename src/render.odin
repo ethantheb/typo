@@ -74,6 +74,8 @@ render_clay_commands :: proc(commands: ^clay.ClayArray(clay.RenderCommand), scal
 				draw_text_area(c, b, scale)
 			case Diff_Draw:
 				draw_diff_side(c, b, scale)
+			case Caption_Glyph:
+				draw_caption_glyph(c, b, scale)
 			}
 
 		case .Image:

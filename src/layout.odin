@@ -28,6 +28,7 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 		},
 		backgroundColor = gfx.theme.panel,
 	}) {
+		window_frame_ui()
 		if clay.UI(clay.ID("Main"))({layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}}}) {
 			sidebar()
 			panes_ui()
@@ -53,12 +54,14 @@ build_ui :: proc() -> clay.ClayArray(clay.RenderCommand) {
 
 // --- Status bar --------------------------------------------------------------------
 
+// Flat on the window's color, the bar seems to start at the panes' bottom edge,
+// PANE_GAP above it: its items are centered in that
 @(private = "file")
 status_bar :: proc() {
 	if clay.UI(clay.ID("StatusBar"))({
 		layout = {
 			sizing = {clay.SizingGrow(), clay.SizingFixed(STATUSBAR_HEIGHT)},
-			padding = {left = 3, right = 12, bottom = 2},
+			padding = {left = 3, right = 12, bottom = PANE_GAP},
 			childGap = 16,
 			childAlignment = {y = .Center},
 		},

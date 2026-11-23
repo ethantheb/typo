@@ -138,7 +138,9 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   read back from the terminal and an editor, panes, zoom, `typo <file>` in the
   terminal, a persistent terminal shown again from a private herdr-core session
   (perf_persist.odin; skipped without hc), closing a terminal that runs a program
-  (perf_terminal_close.odin), go to line, text fields, idle CPU/GPU) and
+  (perf_terminal_close.odin), the window's caption strip and what the system's
+  hit test answers at each kind of place (perf_frame.odin), go to line, text
+  fields, idle CPU/GPU) and
   exits
   non-zero if a check fails or a result exceeds its limit. Phases drive the UI by
   setting `g.mouse_pos`, `g.mouse_pressed`, `g.right_pressed`, sending other mouse
@@ -272,14 +274,34 @@ other processes send) runs on other threads, which hand over finished results.
   a press matched against last frame's layout finds the same file after the tree
   re-sorts. Whatever holds a `^Pane` (menu, rename, drag, pending `Pane_Op`) is
   cleared in `pane_close`.
+- **Window frame** (window_frame*.odin, `CUSTOM_FRAME`, on for Windows): the window
+  is SDL's borderless one, which on Windows keeps the caption and sizing styles, so
+  snapping, animations, rounded corners and the system menu stay native. typo
+  draws a caption strip (`TITLE_BAR_HEIGHT`, "TitleBar") above "Main": the
+  sidebar's header (the folder's name, a button for the recent projects) over the
+  sidebar's column,
+  and minimize, maximize and close at the right (`Caption_Glyph`, drawn as
+  shapes). `work_rect` starts below it (`frame_top`), and panes and what floats at
+  their rects attach to the root. A subclass of SDL's window procedure answers
+  the hit test (`window_frame_hit`: edges resize, the strip and the window's
+  background drag, `BACKGROUND_IDS` naming the elements whose empty space counts,
+  the maximize button is the system's for Snap Layouts, so its pointer comes as
+  system messages), draws each new size during the system's size loop, sets
+  DWM's border to the theme's and leaves an auto-hide taskbar reachable when
+  maximized. The system takes a press that drags, so typo never sees it: while
+  something is open that a press outside closes (`closes_on_press_outside`:
+  menus, popups, the finder, a rename; not a dialog) the background is typo's
+  and only the strip drags. A caption button pressed acts next frame
+  (`window_frame_frame`). Elsewhere, or if the platform side can't set up, the
+  system's frame stays.
 - **Sidebar** (sidebar.odin): the window's background at its left edge, flat on
   the window's color (no panel or border), always laid out (a flow child of "Main",
   its own width). The panes sit beside it on the window's color, the only raised
   elements. Toggle sidebar only moves `work_rect`'s left edge: the panes ease over
   the sidebar or away from it, and the sidebar fades into the window as they cover
   it and back as they leave (`sidebar_fade`: an overlay of the window's color,
-  transitioned with the panes' duration and easing; its floating parts, the search
-  field's clear button and key hint, take it too, as Clay's overlays don't reach
+  transitioned with the panes' duration and easing; its floating part, the search
+  field's clear button, takes it too, as Clay's overlays don't reach
   floating children), so nothing of it shows between the panes while hidden. Hiding
   it drops a rename in the tree or shelf. "WorkArea" (`work_area` in panes.odin:
   floating at the work area under the panes, easing as they do, passthrough) marks
@@ -300,7 +322,7 @@ other processes send) runs on other threads, which hand over finished results.
   not, with a dot (`unsaved_marks`: each modified file's ancestors below the root,
   by `path_key_ascii`, per frame from the open editors).
 - **Sidebar search** (sidebar.odin, `g.sidebar_search`): a `Line_Edit` above the
-  tree, showing Find file's key at its right while empty, that opens a popup as a
+  tree, Find file's key in its tooltip, that opens a popup as a
   browser's address bar does. Find file (Ctrl+E, `find_file`) opens it with the
   query selected while the sidebar shows, else opens the finder; so does a press
   on the field (`sidebar_search_open`). The popup (`sidebar_search_popup`, declared
@@ -601,9 +623,10 @@ other processes send) runs on other threads, which hand over finished results.
 - **Recent projects** (project_picker.odin, `g.project_picker`): state.json keeps
   the projects opened, most recent first (`state_project_opened` from
   `project_open`, at most `RECENT_PROJECTS_MAX`; folders gone are dropped when it is
-  read at startup). Open project (Ctrl+R) or the sidebar's open folder button shows
+  read at startup). Open project (Ctrl+R) or a press on the folder's name shows
   a popup of them, filtered as typed (fuzzy, the folder's name counting more),
-  under that button while the sidebar shows, else at the top of the window, at the
+  under the name while it shows (the sidebar's header, or always in typo's
+  caption strip), else at the top of the window, at the
   popups' layer (`project_picker_covers_pointer`, `g.in_project_picker`). Enter or a
   click opens one in this window (`Open_Folder`); Ctrl+Enter or a row's window
   button in another typo window (`Open_Window`: `launch_window` starts typo on the
@@ -760,8 +783,9 @@ other processes send) runs on other threads, which hand over finished results.
   limits (`git_limit`).
 - **Git pane** (git_pane.odin, `Git_View`, one at most): beside its title, faded, the
   upstream (else the branch) and a merge or rebase under way (`git_title_note`); a
-  commit message box (`Text_Area`, Ctrl+Enter commits), Commit (the key small at its
-  right while it fits, `commit_hint_fits`) and the push, pull and fetch group with the
+  commit message box (`Text_Area`, its text as far from the box's sides as its
+  capitals are from the top; Ctrl+Enter commits), Commit (the key in its tooltip)
+  and the push, pull and fetch group with the
   commits to push and pull, how the last command went, and the files in collapsible
   sections, each
   row with its icon, name, folder and a letter colored by its change (`git_*` theme
@@ -848,7 +872,10 @@ src/                 package editor: the app
                      hit tests (clicked, pointer_in), transition, element_at
   scrollbar.odin     Scroll bars (either axis, on gfx/scrollbar.odin), list_scrollbar,
                      wheel routing
-  layout.odin        Window layout: "Main" (sidebar, panes), status bar, mouse cursor
+  layout.odin        Window layout: caption strip, "Main" (sidebar, panes), status
+                     bar, mouse cursor
+  window_frame*.odin  typo's own caption strip and its buttons; the system's hit
+                     test and size loop (window_frame_windows.odin)
   sidebar.odin       The sidebar behind the panes (folder name, search field and its
                      popup, file tree with unsaved dots, RECENT, shelf), fading as
                      they cover it
@@ -892,7 +919,7 @@ src/                 package editor: the app
                      files) in its .typo/session.json; state.json (the project to
                      reopen), taking over an older typo's session.json
   recent.odin        The project's recently used files, for RECENT and the finder
-  project_picker.odin  Recent projects: the popup (Ctrl+R, the open folder button),
+  project_picker.odin  Recent projects: the popup (Ctrl+R, the folder's name),
                      opening one here or in another window
   ipc_open.odin      `typo <file>` from typo's terminals: the listener, its queue, the
                      shells' TYPO_IPC, and the command line's side (forward_to_window)

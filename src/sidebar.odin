@@ -24,13 +24,14 @@ import "gfx"
 FONT_SIZE_SIDEBAR :: 13
 SIDEBAR_WIDTH     :: 240 // its content, right of a PANE_GAP margin
 
-// The key hint at the search field's right: a size under the placeholder, whose
-// lower-case letters look smaller than the hint's capitals at the same size
-@(private = "file")
-SEARCH_HINT_SIZE :: FONT_SIZE_SMALL - 1
-
 @(private = "file")
 TREE_ROW_HEIGHT :: 22
+
+// The folder's name, a button whose highlight reaches NAME_PAD past its text
+@(private = "file")
+NAME_PAD :: 6
+@(private = "file")
+NAME_HEIGHT :: 22
 
 // The search field, inset from the sidebar's sides
 @(private = "file")
@@ -351,7 +352,8 @@ sidebar :: proc() {
 		overlayColor = sidebar_fade(),
 		transition = sidebar_fade_transition(),
 	}) {
-		sidebar_header()
+		// With typo's own frame the folder's name is in its caption strip
+		if !window_frame.on do sidebar_header()
 		search_field()
 		tree()
 		recent_section(work_rect().h * 0.3)
@@ -360,31 +362,51 @@ sidebar :: proc() {
 }
 
 
-// The folder's name and the open folder button, laid out like a pane's header,
-// level with the panes' titles
-@(private = "file")
-sidebar_header :: proc() {
+// The folder's name, laid out like a pane's header, level with the panes'
+// titles (or in the caption strip, window_frame.odin). A press on it shows the
+// recent projects
+sidebar_header :: proc(height: f32 = PANE_HEADER_HEIGHT) {
 	if clay.UI()({
 		layout = {
-			sizing = {clay.SizingGrow(), clay.SizingFixed(PANE_HEADER_HEIGHT)},
-			padding = {left = 12, right = 4},
-			childGap = 2,
+			sizing = {clay.SizingGrow(), clay.SizingFixed(height)},
+			padding = {left = 12 - NAME_PAD, right = 4},
 			childAlignment = {y = .Center},
 		},
 	}) {
-		name_id := clay.ID("FolderName")
-		if clay.UI(name_id)({}) {
-			name := strings.to_upper(folder_name(g.workspace.root), context.temp_allocator)
-			label(name, gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
-		}
-		tooltip(name_id, g.workspace.root)
-
-		push_right()
-		chord := first_chord_label(.Open_Project)
-		if icon_button(clay.ID("OpenButton"), .Folder_Open, 22, 14, "Open project", chord) {
-			project_picker_toggle()
-		}
+		folder_name_button()
 	}
+}
+
+
+// The folder's name as a button, lit while hovered or while the recent projects
+// it opened show
+@(private = "file")
+folder_name_button :: proc() {
+	id := clay.ID("FolderName")
+	hovered := ui_interactive() && pointer_in(id)
+	lit := hovered || g.project_picker.open
+
+	background: clay.Color
+	switch {
+	case g.project_picker.open: background = gfx.theme.selected
+	case hovered:               background = gfx.theme.hover
+	}
+
+	if clay.UI(id)({
+		layout = {
+			sizing = {height = clay.SizingFixed(NAME_HEIGHT)},
+			padding = {left = NAME_PAD, right = NAME_PAD},
+			childAlignment = {y = .Center},
+		},
+		backgroundColor = background,
+		cornerRadius = clay.CornerRadiusAll(5),
+	}) {
+		name := strings.to_upper(folder_name(g.workspace.root), context.temp_allocator)
+		label(name, lit ? gfx.theme.text : gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
+	}
+
+	tooltip(id, g.workspace.root, first_chord_label(.Open_Project))
+	if clicked(id) do project_picker_toggle()
 }
 
 
@@ -411,44 +433,27 @@ search_field :: proc() {
 }
 
 
-// The field, with a button that empties it over its right end, or while empty
-// in the sidebar, the key that opens it
+// The field, with a button that empties it over its right end. In the sidebar
+// its tooltip has the key that opens it (Find file's)
 @(private = "file")
 search_box :: proc(in_popup: bool) {
 	s := &g.sidebar_search
-	look := Field_Look{height = FIELD_HEIGHT, size = FONT_SIZE_SMALL, padding = 8}
+	id := clay.ID("SidebarSearch")
+
+	// Rounded as the panes are
+	look := Field_Look {
+		height  = FIELD_HEIGHT,
+		size    = FONT_SIZE_SMALL,
+		padding = 8,
+		radius  = PANE_RADIUS,
+	}
 
 	if clay.UI()({layout = {sizing = {width = clay.SizingGrow()}}}) {
-		text_field(clay.ID("SidebarSearch"), &s.field, "Search files", s.open, look)
-
-		if len(s.field.text) > 0 {
-			clear_button(in_popup)
-		} else if !in_popup {
-			key_hint()
-		}
+		text_field(id, &s.field, "Search files", s.open, look)
+		if len(s.field.text) > 0 do clear_button(in_popup)
 	}
-}
 
-
-// The first key bound to Find file, dim at the right of the empty field, which
-// that key opens. Floating, so it fades with the sidebar on its own
-@(private = "file")
-key_hint :: proc() {
-	chord := first_chord_label(.Find_File)
-	if chord == "" do return
-
-	if clay.UI(clay.ID("SidebarSearchHint"))({
-		floating = {
-			attachTo = .Parent,
-			attachment = {element = .RightCenter, parent = .RightCenter},
-			offset = {-8, 0},
-			pointerCaptureMode = .Passthrough,
-		},
-		overlayColor = sidebar_fade(),
-		transition = sidebar_fade_transition(),
-	}) {
-		label(chord, gfx.theme.text_faint, SEARCH_HINT_SIZE)
-	}
+	if !in_popup do tooltip(id, "Search files", first_chord_label(.Find_File))
 }
 
 
@@ -611,7 +616,7 @@ sidebar_search_popup :: proc() {
 			padding = clay.PaddingAll(POPUP_PAD),
 		},
 		backgroundColor = gfx.theme.panel,
-		cornerRadius = clay.CornerRadiusAll(8),
+		cornerRadius = clay.CornerRadiusAll(PANE_RADIUS),
 		border = {color = gfx.theme.border, width = clay.BorderOutside(1)},
 		clip = {horizontal = true, vertical = true},
 		floating = {

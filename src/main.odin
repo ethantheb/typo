@@ -190,12 +190,14 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 
 	// The window, shown after the first frame drawn with the editor ready (see
 	// app_iterate), so it never appears half drawn
-	g.window = sdl.CreateWindow("typo", 1280, 800, {.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN})
+	window_flags := sdl.WindowFlags{.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN}
+	g.window = sdl.CreateWindow("typo", 1280, 800, window_flags + window_frame_flags())
 	set_window_icon()
 	if g.window == nil {
 		sdl.Log("SDL_CreateWindow failed: %s", sdl.GetError())
 		return .FAILURE
 	}
+	window_frame_init()
 
 	// Settings, then the renderer (its backend is a setting) and text. The
 	// config thread reads and writes settings files and projects' state from
@@ -377,6 +379,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		apply_markdown_font()
 	}
 	ipc_frame()
+	window_frame_frame()
 	apply_pending_action()
 	dialog_frame()
 	file_load_frame()
