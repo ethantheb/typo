@@ -551,17 +551,35 @@ remote_button :: proc(
 }
 
 
-// How the last command went
+// How the last command went. While one runs: for how long, and Cancel for a
+// push, pull or fetch
 @(private = "file")
 note_line :: proc() {
 	note := &g.git.note
 	if note.text == "" do return
 
+	text := note.text
+	seconds := git_remote_seconds()
+	if seconds > 0 do text = fmt.tprintf("%s %d s", note.text, seconds)
+
 	if clay.UI()({
-		layout = {sizing = {width = clay.SizingGrow()}},
-		clip = {horizontal = true},
+		layout = {
+			sizing = {width = clay.SizingGrow()},
+			childGap = 6,
+			childAlignment = {y = .Center},
+		},
 	}) {
-		label(note.text, note.error ? gfx.theme.error : gfx.theme.text_dim, FONT_SIZE_SMALL)
+		if clay.UI()({
+			layout = {sizing = {width = clay.SizingGrow()}},
+			clip = {horizontal = true},
+		}) {
+			label(text, note.error ? gfx.theme.error : gfx.theme.text_dim, FONT_SIZE_SMALL)
+		}
+
+		if git_can_cancel() {
+			tip := "End git and what it started"
+			if button(clay.ID("GitCancel"), "Cancel", tip) do git_remote_cancel()
+		}
 	}
 }
 

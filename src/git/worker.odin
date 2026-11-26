@@ -91,11 +91,12 @@ Op_Failed :: struct {
 	message: string, // owned
 }
 Remote_Done :: struct {
-	op:     Remote_Op,
-	ok:     bool,
-	output: string, // owned
-	auth:   bool,   // failed for want of credentials
-	line:   string, // owned; the command line it ran
+	op:        Remote_Op,
+	ok:        bool,
+	output:    string, // owned
+	auth:      bool,   // failed for want of credentials
+	line:      string, // owned; the command line it ran
+	cancelled: bool,   // ended by worker_cancel
 }
 
 Event :: union {
@@ -183,6 +184,17 @@ worker_run :: proc(w: ^Worker, op: Remote_Op, args: []string, input := "") -> bo
 	sync.guard(&w.mutex)
 	if w.workdir == "" do return false
 	return cli_start(w, op, args, input, w.workdir)
+}
+
+
+// Ends the git command under way, if any, with what it started (a credential
+// window included). Its Remote_Done comes as cancelled
+worker_cancel :: proc(w: ^Worker) {
+	sync.guard(&w.mutex)
+	if !w.cli.busy do return
+
+	w.cli.cancelled = true
+	running_end(&w.cli.running)
 }
 
 

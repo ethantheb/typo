@@ -13,6 +13,7 @@ import "core:fmt"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
+import sdl "../vendor/sdl3"
 import "git"
 import "gfx"
 import "uitime"
@@ -26,6 +27,8 @@ Git_State :: struct {
 	loaded:  bool,          // a status of this repository arrived
 	problem: string,        // owned; why the folder's repository couldn't open
 	remote:  Maybe(git.Remote_Op), // a command under way
+	since:   u64,           // when it started (SDL ticks, ns)
+	ticker:  sdl.TimerID,   // wakes the loop each second while it runs, for its time
 	note:    Git_Note,      // how the last command went, shown in the pane
 }
 
@@ -53,6 +56,7 @@ git_init :: proc() {
 git_destroy :: proc() {
 	gs := &g.git
 	if gs.running do git.worker_stop(&gs.worker)
+	remote_ended()
 	git.repo_info_destroy(&gs.info)
 	git.status_destroy(&gs.status)
 	delete(gs.problem)
@@ -71,6 +75,9 @@ git_open_folder :: proc(folder: string) {
 	gs.loaded = false
 	git_set_note("", false)
 	git.worker_set_folder(&gs.worker, folder)
+
+	// A command under way is the old repository's: its result is dropped
+	remote_ended()
 
 	// Diffs of the repository before close
 	for i := len(g.panes.open) - 1; i >= 0; i -= 1 {
@@ -256,8 +263,7 @@ git_commit :: proc(message: string) -> bool {
 	args := git.op_args(.Commit, &gs.status)
 	if !git.worker_run(&gs.worker, .Commit, args, message) do return false
 
-	gs.remote = .Commit
-	git_set_note("Committing…", false)
+	remote_started(.Commit)
 	return true
 }
 
@@ -282,9 +288,60 @@ git_remote :: proc(op: git.Remote_Op) -> bool {
 	args := git.op_args(op, &gs.status)
 	if !git.worker_run(&gs.worker, op, args) do return false
 
-	gs.remote = op
-	git_set_note(remote_doing(op), false)
+	remote_started(op)
 	return true
+}
+
+
+// Ends the push, pull or fetch under way. A commit isn't ended: killed in its
+// middle, git can leave the index locked
+git_remote_cancel :: proc() {
+	if !git_can_cancel() do return
+	git.worker_cancel(&g.git.worker)
+}
+
+
+// Whether the command under way can be cancelled
+git_can_cancel :: proc() -> bool {
+	op, running := g.git.remote.?
+	return running && op != .Commit
+}
+
+
+// How long the command under way has run, in whole seconds
+git_remote_seconds :: proc() -> int {
+	if g.git.remote == nil do return 0
+	return int((sdl.GetTicksNS() - g.git.since) / 1_000_000_000)
+}
+
+
+// A command started: the note says so, and counts its seconds
+@(private = "file")
+remote_started :: proc(op: git.Remote_Op) {
+	gs := &g.git
+	gs.remote = op
+	gs.since = sdl.GetTicksNS()
+	gs.ticker = sdl.AddTimer(1000, remote_tick, nil)
+	git_set_note(remote_doing(op), false)
+}
+
+
+@(private = "file")
+remote_tick :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) -> u32 {
+	wake_main_loop(nil)
+	return interval
+}
+
+
+// The command under way ended, or the folder changed under it
+@(private = "file")
+remote_ended :: proc() {
+	gs := &g.git
+	gs.remote = nil
+	if gs.ticker != 0 {
+		_ = sdl.RemoveTimer(gs.ticker)
+		gs.ticker = 0
+	}
 }
 
 
@@ -292,8 +349,12 @@ git_remote :: proc(op: git.Remote_Op) -> bool {
 // push, pull or fetch that failed can run in a terminal instead
 @(private = "file")
 remote_done :: proc(d: ^git.Remote_Done) {
-	gs := &g.git
-	gs.remote = nil
+	remote_ended()
+
+	if d.cancelled {
+		git_set_note(fmt.tprintf("%s cancelled", remote_name(d.op)), false)
+		return
+	}
 
 	if d.ok {
 		git_set_note(remote_did(d.op), false)

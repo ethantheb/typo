@@ -439,6 +439,50 @@ test_worker_reports_failures :: proc(t: ^testing.T) {
 }
 
 
+@(test)
+test_worker_cancels_a_command :: proc(t: ^testing.T) {
+	dir, ok := temp_repo(t, "cancel")
+	if !ok do return
+	defer os.remove_all(dir)
+
+	w: Worker
+	worker_start(&w, test_wake, nil)
+	defer worker_stop(&w)
+
+	last: Status
+	defer status_destroy(&last)
+	worker_set_folder(&w, dir)
+	wait_for(&w, &last, is_status)
+
+	// Commands carry the stall limit
+	testing.expect(t, worker_run(&w, .Fetch, {"git", "config", "http.lowSpeedTime"}))
+	limited := proc(e: ^Event) -> bool {
+		d, ok := e.(Remote_Done)
+		return ok && d.ok && d.output == "60"
+	}
+	got, _ := wait_for(&w, &last, limited)
+	testing.expect(t, got)
+
+	// A command that would wait half a minute (a shell alias, so git runs a
+	// process of its own) ends at once, cancelled, not failed
+	for worker_running(&w) do time.sleep(5 * time.Millisecond)
+	waiting := []string{"git", "-c", "alias.wait=!sleep 30", "wait"}
+	testing.expect(t, worker_run(&w, .Fetch, waiting))
+	time.sleep(300 * time.Millisecond)
+	start := time.tick_now()
+	worker_cancel(&w)
+
+	cancelled := proc(e: ^Event) -> bool {
+		d, ok := e.(Remote_Done)
+		return ok && d.cancelled && !d.auth
+	}
+	got, _ = wait_for(&w, &last, cancelled)
+	testing.expect(t, got)
+	testing.expect(t, time.tick_since(start) < 5 * time.Second)
+	testing.expect(t, !worker_running(&w))
+}
+
+
 @(private = "file")
 clone_paths :: proc(paths: []string) -> []string {
 	out := make([]string, len(paths))

@@ -28,9 +28,19 @@ MAX_OUTPUT :: 64 * 1024
 @(private = "file")
 READ_CHUNK :: 16 * 1024
 
-// Environment for every git command typo runs
+// Environment for every git command typo runs. A connection that moves less
+// than 1000 bytes a second for a minute fails (curl's low speed limit), so a
+// stalled push, pull or fetch ends with git's error; waiting on a credential
+// window isn't a stalled connection
 @(private = "file")
-GIT_ENV := []string{"GIT_TERMINAL_PROMPT=0"}
+GIT_ENV := []string{
+	"GIT_TERMINAL_PROMPT=0",
+	"GIT_CONFIG_COUNT=2",
+	"GIT_CONFIG_KEY_0=http.lowSpeedLimit",
+	"GIT_CONFIG_VALUE_0=1000",
+	"GIT_CONFIG_KEY_1=http.lowSpeedTime",
+	"GIT_CONFIG_VALUE_1=60",
+}
 
 // What git prints when it would have asked for credentials or a passphrase
 @(private = "file")
@@ -76,8 +86,8 @@ op_args :: proc(op: Remote_Op, s: ^Status) -> []string {
 }
 
 
-// A command another thread may end (quitting while a push waits on the
-// network or a credential window)
+// A command another thread may end (Cancel, or quitting while a push waits on
+// the network or a credential window)
 Running :: struct {
 	mutex:   sync.Mutex,
 	process: ^process.Process, // while it runs
@@ -197,7 +207,8 @@ Cli :: struct {
 	cwd:        string,   // owned
 	worker:     ^Worker,
 	folder_gen: int,     // the worker's when it started: a later folder drops its result
-	running:    Running, // cli_stop ends it
+	running:    Running, // cli_stop and worker_cancel end it
+	cancelled:  bool,    // under the worker's mutex: worker_cancel ended it
 }
 
 
@@ -266,6 +277,8 @@ cli_proc :: proc(c: ^Cli) {
 	w := c.worker
 	if sync.guard(&w.mutex) {
 		c.busy = false
+		done.cancelled = c.cancelled
+		if done.cancelled do done.auth = false
 		if c.folder_gen == w.folder_gen {
 			append(&w.events, done)
 		} else {
