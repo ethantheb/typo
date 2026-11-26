@@ -61,6 +61,7 @@ Window_Frame :: struct {
 	// at once (window_frame_windows.odin)
 	size_move: bool,
 	drawing:   bool,
+	drawn_at:  u64, // when a new size was last drawn (SDL ticks, ns)
 
 	pending: Caption_Button, // clicked, applied next frame
 	border:  clay.Color,     // the border color last given to the system
@@ -93,6 +94,23 @@ Caption_Glyph :: struct {
 }
 
 window_frame: Window_Frame
+
+// How long the size loop's own frames wait after a new size was drawn
+@(private = "file")
+SIZE_LOOP_REST :: 100 * 1_000_000
+
+
+// Whether this frame is left out: while the system's size loop runs, each new
+// size is drawn at once, and SDL's timer frames between them would only draw
+// the same again (each costs a swap chain present at the new size)
+window_frame_skips_frame :: proc() -> bool {
+	f := &window_frame
+	if !f.size_move || f.drawing {
+		return false
+	}
+
+	return sdl.GetTicksNS() - f.drawn_at < SIZE_LOOP_REST
+}
 
 
 // The window flags for the frame typo draws

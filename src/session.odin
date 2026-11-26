@@ -407,19 +407,11 @@ session_restore :: proc(s: Session, window: bool) {
 }
 
 
-// Sizes the window, no larger than the display it opens on
+// Sizes the window (in the layout's units), no larger than the display it
+// opens on
 @(private = "file")
 restore_window :: proc(w, h: i32, maximized: bool) {
-	w, h := w, h
-	bounds: sdl.Rect
-	if sdl.GetDisplayUsableBounds(sdl.GetDisplayForWindow(g.window), &bounds) {
-		w = min(w, bounds.w)
-		h = min(h, bounds.h)
-	}
-
-	if w > 0 && h > 0 {
-		_ = sdl.SetWindowSize(g.window, w, h)
-	}
+	window_set_size({w, h})
 	if maximized {
 		_ = sdl.MaximizeWindow(g.window)
 	}

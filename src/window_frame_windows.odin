@@ -4,6 +4,7 @@ package editor
 import win "core:sys/windows"
 
 import clay "../vendor/clay-odin"
+import "gfx"
 import sdl "../vendor/sdl3"
 
 // SDL's borderless window keeps WS_CAPTION, WS_THICKFRAME, WS_SYSMENU and the
@@ -91,13 +92,16 @@ frame_subclass :: proc "system" (
 		}
 
 	// Each new size is drawn while the system's size loop runs: SDL draws only
-	// on a timer then, which leaves the new edges unpainted for a frame or more
+	// on a timer then, which leaves the new edges unpainted for a frame or more.
+	// Presents don't wait for vsync meanwhile: the system's compositor syncs a
+	// window anyway, and each new size should show as soon as it is drawn
 	case win.WM_ENTERSIZEMOVE:
 		f.size_move = true
+		_ = sdl.SetRenderVSync(gfx.renderer, 0)
 
 	case win.WM_EXITSIZEMOVE:
 		f.size_move = false
-
+		_ = sdl.SetRenderVSync(gfx.renderer, 1)
 	case win.WM_WINDOWPOSCHANGED:
 		result := win.DefSubclassProc(hwnd, msg, wparam, lparam)
 		pos := (^win.WINDOWPOS)(rawptr(uintptr(lparam)))
@@ -106,6 +110,7 @@ frame_subclass :: proc "system" (
 			f.drawing = true
 			app_iterate(nil)
 			f.drawing = false
+			f.drawn_at = sdl.GetTicksNS()
 		}
 		return result
 
@@ -187,8 +192,9 @@ client_point :: proc(hwnd: win.HWND, lparam: win.LPARAM) -> (p: [2]f32, inside: 
 		return {}, false
 	}
 
-	pixels_per_unit := f32(client.right) / f32(w)
-	return [2]f32{f32(point.x), f32(point.y)} / pixels_per_unit, true
+	pixels_per_coord := f32(client.right) / f32(w)
+	p = [2]f32{f32(point.x), f32(point.y)} / pixels_per_coord
+	return window_to_layout(p.x, p.y), true
 }
 
 
@@ -201,7 +207,8 @@ frame_hit_test :: proc(hwnd: win.HWND, lparam: win.LPARAM) -> (win.LRESULT, bool
 
 	w, h: i32
 	_ = sdl.GetWindowSize(g.window, &w, &h)
-	hit := window_frame_hit(p, {f32(w), f32(h)}, bool(win.IsZoomed(hwnd)))
+	size := window_to_layout(f32(w), f32(h))
+	hit := window_frame_hit(p, size, bool(win.IsZoomed(hwnd)))
 
 	switch hit {
 	case .Client:       return win.HTCLIENT, true

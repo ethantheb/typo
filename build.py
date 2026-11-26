@@ -19,11 +19,12 @@ Steps:
      release as it is: on Windows x64, its prebuilt static library, downloaded.
      Redone only when the release, the patch or GHOSTTY_PATCH changes.
   3. Build SDL3 and SDL3_ttf (with FreeType, HarfBuzz and plutosvg) with CMake
-     from pinned releases, downloaded into build/ on first use, SDL3_ttf with
-     patches/sdl_ttf.patch applied (glyphs at quarter-pixel positions, and a
-     glyph coverage table for gamma and contrast). Rebuilt only when
-     SDL_VERSION, SDL_TTF_VERSION or the patch changes; these must match the
-     bindings in vendor/sdl3.
+     from pinned releases, downloaded into build/ on first use, SDL3 with
+     patches/sdl.patch applied (a blit-model swap chain for Direct3D 11 on
+     request) and SDL3_ttf with patches/sdl_ttf.patch (glyphs at quarter-pixel
+     positions, and a glyph coverage table for gamma and contrast). Rebuilt
+     only when SDL_VERSION, SDL_TTF_VERSION or a patch changes; these must
+     match the bindings in vendor/sdl3.
   4. On Windows, fetch Microsoft's ConPTY package (conpty.dll + OpenConsole.exe,
      the pseudo console host Windows Terminal ships). It is newer and faster
      than the one built into Windows. The executable embeds both files and
@@ -152,8 +153,9 @@ SDL_TTF_SUBMODULES = [
 ]
 SDL_SRC       = OUT / "deps" / "SDL"
 SDL_TTF_SRC   = OUT / "deps" / "SDL_ttf"
+SDL_PATCH     = ROOT / "patches" / "sdl.patch"
 SDL_TTF_PATCH = ROOT / "patches" / "sdl_ttf.patch"
-SDL_OUT       = OBJ / "sdl"  # install prefix; vendor/sdl3 links the libraries in lib/
+SDL_OUT      = OBJ / "sdl"  # install prefix; vendor/sdl3 links the libraries in lib/
 
 if IS_WINDOWS:
     SDL_LIBS = [SDL_OUT / "lib" / "SDL3-static.lib", SDL_OUT / "lib" / "SDL3_ttf-static.lib"]
@@ -396,7 +398,8 @@ def cmake_build(src, build_dir, options, prefix=SDL_OUT, config="Release"):
 
 def build_sdl():
     stamp = SDL_OUT / "versions.txt"
-    versions = f"{SDL_VERSION} {SDL_TTF_VERSION} {patch_hash(SDL_TTF_PATCH)}"
+    patches = f"{patch_hash(SDL_PATCH)} {patch_hash(SDL_TTF_PATCH)}"
+    versions = f"{SDL_VERSION} {SDL_TTF_VERSION} {patches}"
     built = all(lib.exists() for lib in SDL_LIBS)
     if built and stamp.exists() and stamp.read_text().strip() == versions:
         return
@@ -404,8 +407,9 @@ def build_sdl():
     print("Building SDL3 and SDL3_ttf...", flush=True)
     shutil.rmtree(SDL_OUT, ignore_errors=True)
 
-    # Sources, with SDL_ttf patched
+    # Sources, patched
     git_checkout(SDL_SRC, SDL_REPO, f"refs/tags/release-{SDL_VERSION}")
+    check(["git", "-C", SDL_SRC, "apply", SDL_PATCH])
     git_checkout(
         SDL_TTF_SRC,
         SDL_TTF_REPO,

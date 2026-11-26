@@ -2,6 +2,7 @@ package editor
 
 import "base:runtime"
 import "core:fmt"
+import "core:math"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -22,6 +23,7 @@ App :: struct {
 	window_w:        i32,
 	window_h:        i32,
 	window_size:     [2]i32, // the size while not maximized, for the session
+	coord_scale:     f32,    // window coordinates per layout unit
 
 	// Input collected from events, consumed once per frame
 	mouse_pos:       [2]f32,
@@ -191,7 +193,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	// The window, shown after the first frame drawn with the editor ready (see
 	// app_iterate), so it never appears half drawn
 	window_flags := sdl.WindowFlags{.RESIZABLE, .HIGH_PIXEL_DENSITY, .HIDDEN}
-	g.window = sdl.CreateWindow("typo", 1280, 800, window_flags + window_frame_flags())
+	size := WINDOW_SIZE
+	g.window = sdl.CreateWindow("typo", size.x, size.y, window_flags + window_frame_flags())
 	set_window_icon()
 	if g.window == nil {
 		sdl.Log("SDL_CreateWindow failed: %s", sdl.GetError())
@@ -209,6 +212,7 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	state_init()
 	if !create_renderer(g.settings.renderer) do return .FAILURE
 	update_window_metrics()
+	window_set_size(WINDOW_SIZE, center = true)
 	if !gfx.text_init(&gfx.text_system) do return .FAILURE
 	apply_settings()
 
@@ -259,11 +263,16 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	return .CONTINUE
 }
 
-// The named SDL backend, or SDL's default (Direct3D 11 on Windows) for "auto"
-// or when the named one can't be created
+// The named SDL backend, or SDL's default when it can't be created
 @(private = "file")
 create_renderer :: proc(name: string) -> bool {
-	if name != "auto" {
+	// Direct3D 11 presents through a blit-model swap chain (patches/sdl.patch): a
+	// flip-model present isn't synchronized with the window's size, so on an
+	// integrated GPU the content trails the edges while the window is resized
+	_ = sdl.SetHint("SDL_RENDER_DIRECT3D11_BLIT_MODEL", "1")
+
+	name := name == "auto" ? "" : name
+	if name != "" {
 		cname := strings.clone_to_cstring(name, context.temp_allocator)
 		gfx.renderer = sdl.CreateRenderer(g.window, cname)
 		if gfx.renderer == nil {
@@ -363,6 +372,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 		}
 	}
 	if g.quit do return .SUCCESS
+	if window_frame_skips_frame() do return .CONTINUE
 
 	// Window and input
 	update_window_metrics()
@@ -529,7 +539,7 @@ app_event :: proc "c" (appstate: rawptr, event: ^sdl.Event) -> sdl.AppResult {
 		handle_key_event(event)
 
 	case .MOUSE_MOTION:
-		g.mouse_pos = {event.motion.x, event.motion.y}
+		g.mouse_pos = window_to_layout(event.motion.x, event.motion.y)
 
 	case .MOUSE_BUTTON_DOWN, .MOUSE_BUTTON_UP:
 		mouse_button_event(event)
@@ -561,7 +571,7 @@ mouse_button_event :: proc(event: ^sdl.Event) {
 
 			// SDL times double/triple clicks, but its distance tolerance spans
 			// more than a line of text; only chain clicks on the same spot
-			p := [2]f32{event.button.x, event.button.y}
+			p := window_to_layout(event.button.x, event.button.y)
 			d := p - g.last_press_pos
 			same_spot := abs(d.x) <= MULTI_CLICK_DISTANCE && abs(d.y) <= MULTI_CLICK_DISTANCE
 			chained := event.button.clicks > 1 && same_spot
@@ -570,7 +580,42 @@ mouse_button_event :: proc(event: ^sdl.Event) {
 		}
 	}
 
-	g.mouse_pos = {event.button.x, event.button.y}
+	g.mouse_pos = window_to_layout(event.button.x, event.button.y)
+}
+
+
+// A point in window coordinates, in the layout's units
+window_to_layout :: proc(x, y: f32) -> [2]f32 {
+	s := g.coord_scale > 0 ? g.coord_scale : 1
+	return {x, y} / s
+}
+
+
+// The window's size before a session gives one, in the layout's units
+WINDOW_SIZE :: [2]i32{1280, 800}
+
+
+// Sizes the window to `size` in the layout's units, no larger than the display
+// it is on
+window_set_size :: proc(size: [2]i32, center := false) {
+	s := g.coord_scale > 0 ? g.coord_scale : 1
+	w := i32(math.round(f32(size.x) * s))
+	h := i32(math.round(f32(size.y) * s))
+
+	bounds: sdl.Rect
+	if sdl.GetDisplayUsableBounds(sdl.GetDisplayForWindow(g.window), &bounds) {
+		w = min(w, bounds.w)
+		h = min(h, bounds.h)
+	}
+	if w <= 0 || h <= 0 {
+		return
+	}
+
+	_ = sdl.SetWindowSize(g.window, w, h)
+	if center {
+		_ = sdl.SetWindowPosition(g.window, sdl.WINDOWPOS_CENTERED, sdl.WINDOWPOS_CENTERED)
+	}
+	update_window_metrics()
 }
 
 
@@ -682,6 +727,9 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 
 	session_save()
 
+	// Gone at once, as the threads below may still be finishing their work
+	_ = sdl.HideWindow(g.window)
+
 	// The writer tells the watcher what it wrote: stopped first, its writes done
 	io_destroy()
 	config_destroy() // its writes done too
@@ -724,12 +772,22 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 }
 
 
-// Refreshes the logical size and display scale; a new scale re-rasterizes text
+// Refreshes the logical size and display scale; a new scale re-rasterizes text.
+// Window coordinates are points where the system scales (macOS) and pixels
+// where it doesn't (Windows): the layout's units are the display scale's
 update_window_metrics :: proc() {
-	_ = sdl.GetWindowSize(g.window, &g.window_w, &g.window_h)
-
 	scale := sdl.GetWindowDisplayScale(g.window)
 	if scale <= 0 do scale = 1
+
+	density := sdl.GetWindowPixelDensity(g.window)
+	if density <= 0 do density = 1
+	g.coord_scale = scale / density
+
+	w, h: i32
+	_ = sdl.GetWindowSize(g.window, &w, &h)
+	g.window_w = i32(math.round(f32(w) / g.coord_scale))
+	g.window_h = i32(math.round(f32(h) / g.coord_scale))
+
 	if scale == gfx.scale do return
 
 	gfx.set_scale(&gfx.text_system, scale)

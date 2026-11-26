@@ -509,7 +509,9 @@ unsaved_next :: proc() {
 		open_folder(string(t))
 
 	case Quit:
+		// Seen at the start of a frame: the loop may be about to sleep
 		g.quit = true
+		wake_main_loop(nil)
 
 	case Repinning:
 		terminal_repin(t.pane, t.pinned)

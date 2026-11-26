@@ -1,0 +1,67 @@
+diff --git a/include/SDL3/SDL_hints.h b/include/SDL3/SDL_hints.h
+index 857dfce..bcbed94 100644
+--- a/include/SDL3/SDL_hints.h
++++ b/include/SDL3/SDL_hints.h
+@@ -3187,6 +3187,24 @@ extern "C" {
+  */
+ #define SDL_HINT_RENDER_DIRECT3D11_WARP "SDL_RENDER_DIRECT3D11_WARP"
+ 
++/**
++ * A variable controlling whether the Direct3D 11 renderer presents with a
++ * blit-model swap chain (DXGI_SWAP_EFFECT_DISCARD) instead of a flip-model one.
++ *
++ * Flip-model presents aren't synchronized with the window's size, so during a
++ * live resize the content can trail the window's edges, notably on integrated
++ * GPUs. A blit-model present lands with the new size. Transparent windows
++ * always use the blit model.
++ *
++ * The variable can be set to the following values:
++ *
++ * - "0": Use the flip model. (default)
++ * - "1": Use the blit model.
++ *
++ * This hint should be set before creating a renderer.
++ */
++#define SDL_HINT_RENDER_DIRECT3D11_BLIT_MODEL "SDL_RENDER_DIRECT3D11_BLIT_MODEL"
++
+ /**
+  * A variable controlling whether to enable Vulkan Validation Layers.
+  *
+diff --git a/src/render/direct3d11/SDL_render_d3d11.c b/src/render/direct3d11/SDL_render_d3d11.c
+index 14d4f1e..c1de1f4 100644
+--- a/src/render/direct3d11/SDL_render_d3d11.c
++++ b/src/render/direct3d11/SDL_render_d3d11.c
+@@ -516,6 +516,15 @@ static ID3D11BlendState *D3D11_CreateBlendState(SDL_Renderer *renderer, SDL_Blen
+     return blendState;
+ }
+ 
++// Whether the swap chain uses the blit model (transparent windows, or asked for)
++static bool D3D11_UseBlitModel(SDL_Renderer *renderer)
++{
++    if (SDL_GetWindowFlags(renderer->window) & SDL_WINDOW_TRANSPARENT) {
++        return true;
++    }
++    return SDL_GetHintBoolean(SDL_HINT_RENDER_DIRECT3D11_BLIT_MODEL, false);
++}
++
+ // Create resources that depend on the device.
+ static HRESULT D3D11_CreateDeviceResources(SDL_Renderer *renderer)
+ {
+@@ -624,7 +633,7 @@ static HRESULT D3D11_CreateDeviceResources(SDL_Renderer *renderer)
+ #ifdef HAVE_DXGI1_5_H
+     // Check for tearing support, which requires the IDXGIFactory5 interface.
+     data->swapChainFlags = 0;
+-    if (!(SDL_GetWindowFlags(renderer->window) & SDL_WINDOW_TRANSPARENT)) {
++    if (!D3D11_UseBlitModel(renderer)) {
+         result = IDXGIFactory2_QueryInterface(data->dxgiFactory, &SDL_IID_IDXGIFactory5, (void **)&dxgiFactory5);
+         if (SUCCEEDED(result)) {
+             BOOL allowTearing = FALSE;
+@@ -884,7 +893,7 @@ static HRESULT D3D11_CreateSwapChain(SDL_Renderer *renderer, int w, int h)
+     } else {
+         swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
+     }
+-    if (SDL_GetWindowFlags(renderer->window) & SDL_WINDOW_TRANSPARENT) {
++    if (D3D11_UseBlitModel(renderer)) {
+         swapChainDesc.Scaling = DXGI_SCALING_STRETCH;
+         swapChainDesc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+     } else {

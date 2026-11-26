@@ -79,6 +79,10 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   lsp tests, the app's lsp_test and the perf suite's language server phase.
 - Patched dependencies (patches made with `git diff` in `build/deps/<name>`; `build.py`
   rebuilds the library when its patch changes; keep `patches/*.patch` LF):
+  - `patches/sdl.patch`: `SDL_RENDER_DIRECT3D11_BLIT_MODEL`, a blit-model swap chain
+    for Direct3D 11 (set in `create_renderer`). Flip-model presents aren't synchronized
+    with the window's size, so on an integrated GPU the content trailed the edges
+    during a live resize.
   - `patches/sdl_ttf.patch`: glyphs at quarter-pixel positions with text measured as
     it is drawn (`Glyph_Pixel_X`); `TTF_SetFontHinting` really enabling subpixel
     rendering and `TTF_SetFontSubpixelPositioning` working whatever the hinting

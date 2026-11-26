@@ -1852,7 +1852,7 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 	@(static) theme_before: string // owned
 	@(static) clicked_rows: int
 	if frame == 0 {
-		_ = sdl.GetWindowSize(g.window, &p.window_size.x, &p.window_size.y)
+		p.window_size = {g.window_w, g.window_h}
 		resize_for_check({p.window_size.x | 1, p.window_size.y})
 		step = 1
 		p.mark_frame = frame
@@ -1954,7 +1954,7 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 		theme_before = ""
 		press(sdl.K_ESCAPE)
 		settings_window_toggle()
-		_ = sdl.SetWindowSize(g.window, p.window_size.x, p.window_size.y)
+		resize_for_check(p.window_size)
 		return true
 	}
 	return false
@@ -1966,11 +1966,15 @@ phase_settings_scrolls :: proc(p: ^Perf, frame: int) -> bool {
 wanted_size: [2]i32
 
 
-// Asks for a window size for a check (applied on a later frame)
+// Asks for a window size in the layout's units for a check (applied on a
+// later frame)
 @(private = "file")
 resize_for_check :: proc(size: [2]i32) {
 	wanted_size = size
-	_ = sdl.SetWindowSize(g.window, size.x, size.y)
+
+	w := i32(math.round(f32(size.x) * g.coord_scale))
+	h := i32(math.round(f32(size.y) * g.coord_scale))
+	_ = sdl.SetWindowSize(g.window, w, h)
 }
 
 
@@ -4365,7 +4369,8 @@ phase_text_fields :: proc(p: ^Perf, frame: int) -> bool {
 }
 
 
-// Presses and releases a mouse button at a point, as SDL's events would
+// Presses and releases a mouse button at a point in the layout, as SDL's
+// events would (in window coordinates)
 @(private = "file")
 press_mouse_button :: proc(button: u8, at: [2]f32) {
 	event: sdl.Event
@@ -4373,8 +4378,8 @@ press_mouse_button :: proc(button: u8, at: [2]f32) {
 	event.button.button = button
 	event.button.down = true
 	event.button.clicks = 1
-	event.button.x = at.x
-	event.button.y = at.y
+	event.button.x = at.x * g.coord_scale
+	event.button.y = at.y * g.coord_scale
 	mouse_button_event(&event)
 
 	event.button.type = .MOUSE_BUTTON_UP
