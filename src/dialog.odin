@@ -98,6 +98,7 @@ dialog_show :: proc(
 ) {
 	dialog_close()
 	menu_close()
+	control_log(fmt.tprintf("dialog: %s: %s", title, message))
 
 	d := &g.dialog
 	d.open = true
@@ -351,11 +352,15 @@ Repinning :: struct {
 	pinned: bool,
 }
 
+// typo restarting for a control request (control.odin), which the flow answers
+Restarting :: distinct ^Control_Job
+
 After_Unsaved :: union {
 	Closing_Pane,
 	Open_Folder, // owned
 	Quit,
 	Repinning,
+	Restarting,  // owned
 }
 
 Unsaved_Flow :: struct {
@@ -402,8 +407,11 @@ panes_unsaved :: proc() -> bool {
 @(private = "file")
 unsaved_reset :: proc() {
 	u := &g.unsaved
-	if path, is_folder := u.then.(Open_Folder); is_folder {
-		delete(string(path))
+	#partial switch t in u.then {
+	case Open_Folder:
+		delete(string(t))
+	case Restarting:
+		restart_declined((^Control_Job)(t))
 	}
 	u.then = nil
 	u.waiting = false
@@ -515,6 +523,10 @@ unsaved_next :: proc() {
 
 	case Repinning:
 		terminal_repin(t.pane, t.pinned)
+
+	case Restarting:
+		u.then = nil // answered here, not declined by the reset
+		restart_go((^Control_Job)(t))
 	}
 
 	unsaved_reset()
@@ -581,6 +593,8 @@ ask_ending_programs :: proc(running: []^Pane, names: []string) {
 		title, button, doing = "Open another folder?", "Open folder", "Opening another folder"
 	case Quit:
 		title, button, doing = "Quit typo?", "Quit", "Quitting"
+	case Restarting:
+		title, button, doing = "Restart typo?", "Restart", "Restarting typo"
 	case Repinning:
 		if t.pinned {
 			title, button = "Pin the terminal?", "Pin"

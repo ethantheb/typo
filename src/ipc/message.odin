@@ -71,7 +71,7 @@ frame_length :: proc(header: [FRAME_HEADER]u8) -> (n: int, ok: bool) {
 
 
 // The fields as one frame, header included; false if they don't fit
-@(private = "file")
+@(private)
 encode_frame :: proc(fields: []string, allocator := context.allocator) -> ([]u8, bool) {
 	size := 0
 	for f in fields do size += len(f) + 1
@@ -90,11 +90,26 @@ encode_frame :: proc(fields: []string, allocator := context.allocator) -> ([]u8,
 }
 
 
+// The protocol a payload names in its first field, or "" if it has none
+payload_protocol :: proc(payload: []u8) -> string {
+	end := -1
+	for b, i in payload {
+		if b == 0 {
+			end = i
+			break
+		}
+	}
+	return end >= 0 ? string(payload[:end]) : ""
+}
+
+
 // Splits a payload into its NUL-ended fields, which point into it: the
-// protocol (checked), the command or status, and the rest (the list allocated)
-@(private = "file")
+// protocol (checked against `protocol`), the command or status, and the rest
+// (the list allocated)
+@(private)
 decode_fields :: proc(
 	payload: []u8,
+	protocol := PROTOCOL,
 	allocator := context.allocator,
 ) -> (
 	word: string,
@@ -112,8 +127,7 @@ decode_fields :: proc(
 	}
 
 	text := string(payload)
-	protocol := next_field(&text)
-	if protocol != PROTOCOL do return "", nil, .Wrong_Version
+	if next_field(&text) != protocol do return "", nil, .Wrong_Version
 	if count < 2 do return "", nil, .None
 
 	word = next_field(&text)
@@ -157,7 +171,7 @@ decode_request :: proc(
 	req: Request,
 	err: Decode_Error,
 ) {
-	word, paths := decode_fields(payload, allocator) or_return
+	word, paths := decode_fields(payload, allocator = allocator) or_return
 	defer if err != .None do delete(paths, allocator)
 
 	// The command
@@ -225,7 +239,7 @@ decode_reply :: proc(
 	reply: Reply,
 	err: Decode_Error,
 ) {
-	word, messages := decode_fields(payload, allocator) or_return
+	word, messages := decode_fields(payload, allocator = allocator) or_return
 	defer if err != .None do delete(messages, allocator)
 
 	// The status

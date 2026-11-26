@@ -45,9 +45,13 @@ Developed on Windows.
   hc from your own shell without a private `HC_SESSION` (it starts their core with
   your environment if it is down). Experiments and tests use a private session
   (`herdr.sandbox_begin`: `HC_SESSION` and scratch `XDG_STATE_HOME`/`XDG_CONFIG_HOME`),
-  stopped at the end. The user's settings use `[terminal] backend = "herdr"`: a test
-  instance on a copy of them sets `backend = "local"`, or it opens terminals in their
-  core.
+  stopped at the end. From a pinned terminal (`HC_TERMINAL_ID` set, the core already
+  up) Claude may start its own children in the user's core (`hc run --bg`, always
+  named, ended with `hc kill` + `hc rm` once done) for slow work or helpers the user
+  can watch; it never reads or sends to terminals it didn't start unless asked, and
+  tests still use a private session. The user's settings use `[terminal] backend =
+  "herdr"`: a test instance on a copy of them sets `backend = "local"`, or it opens
+  terminals in their core.
 - Real language servers on the dev machine: clangd and gopls on PATH; ols, rust-analyzer,
   ty, ruff, pyright, basedpyright in Zed's folders (%LOCALAPPDATA%\Zed\languages\<name>\...,
   ols in Zed\extensions\work\odin\ols-dev-*\). ols takes about 4 s to initialize on
@@ -119,6 +123,8 @@ odin check src -vet-unused -vet-unused-imports    quick type check (after one bu
   `Perf.read_back` for the next step). Every phase checks Clay reported no error and
   no frame drew `CLIP_LIMIT` clipping elements. A feature with a per-frame or
   per-keystroke cost gets a result; a UI behavior gets a check.
+  `TYPO_PERF_PHASES=<text>` runs only the phases whose names contain it (a phase
+  may depend on those before it).
 - `TYPO_SETTINGS` points typo at another settings.toml (the perf suite uses a temp one);
   state.json (the project to reopen) is kept beside it. Tests and perf phases use temp
   folders as projects.
@@ -415,6 +421,26 @@ imports `process` and `uitime`; `term` imports `herdr`; `words` imports `buffer`
   (`ipc.project_name`): each window lists its endpoint under the project it shows
   (ipc/projects.odin, a file per process in %LOCALAPPDATA%\typo\ipc\<hash> or a private
   runtime folder), tried newest first.
+- **Agent control** (control.odin, control_cli.odin, ipc/control.odin,
+  docs/agent_control.md): `typo ctl <command>` from a program in one of the window's
+  terminals controls that window: `ls`, pane commands (control_panes.odin: `do`,
+  `open`, `terminal`, `move`, `focus`, `maximize`, `close`, `rename`, `diff`, `git`),
+  testing commands (control_input.odin: `wait idle`, `screenshot`, `click`, `keys`,
+  `type`, `ui`, `log`) and `restart`. Requests are `typo-ipc/2`
+  frames (a JSON object each way) on the same endpoint as `typo <file>`; the server
+  answers each connection on its own thread. A request is refused (`not_mine`)
+  unless the client's process (`GetNamedPipeClientProcessId`) runs under one of the
+  window's terminal shells (`term.process_ancestors`, against the pids the UI thread
+  publishes); that terminal is `self`. It is then decoded on the connection's thread
+  and queued with an `ipc.Slot`, applied in `control_frame` (from `ipc_frame`; while
+  a dialog or the unsaved-changes flow is up queued requests are turned away, so none
+  answers it for the user) and answered through the slot; `slot_wait` notices a
+  client that goes away. `restart` (pinned terminals only)
+  runs the unsaved-changes flow (`Restarting`), saves the session, and the
+  connection's thread starts the new typo (`--after <pid>`: it waits for this one to
+  end and restores the session whatever `restore_session` says; `--exe` runs a copy
+  from %LOCALAPPDATA%\typo\run so build/typo.exe stays free). `typo ctl --skill` is
+  the agents' manual (`CONTROL_SKILL`).
 - **The finder** (finder.odin) lists a `Finder_Source`: the workspace's files (Ctrl+E
   with the sidebar hidden), or a server's `Finder_Item`s (lsp_symbols.odin): a file's
   outline (Ctrl+Shift+O), the project's symbols (Ctrl+T, asked again once the query
@@ -552,6 +578,7 @@ src/                 package editor: the app
   workspace.odin     Lazy file tree, folder dialog
   recent.odin        Recent files; project_picker.odin recent projects
   ipc_open.odin      `typo <file>` from typo's terminals, both sides
+  control*.odin      `typo ctl`: the window's side and the command line's
   lsp*.odin          Language servers in the app: responses, symbols, completion,
                      rename, workspace edits, hover, the status bar item
   word_completion.odin  Each editor's words for completion

@@ -73,6 +73,48 @@ programs_under :: proc(pid: int, allocator := context.allocator) -> []string {
 }
 
 
+// The process `pid` and those it runs under: its parent, the parent's parent,
+// up to `limit` of them. The chain ends where a parent can't be asked or
+// started after its child (its id was reused). Takes a snapshot of every
+// process, so call it off the UI thread
+process_ancestors :: proc(pid: int, limit: int, allocator := context.allocator) -> []int {
+	if pid <= 0 do return nil
+
+	snapshot := win.CreateToolhelp32Snapshot(win.TH32CS_SNAPPROCESS, 0)
+	if snapshot == win.INVALID_HANDLE_VALUE do return nil
+	defer win.CloseHandle(snapshot)
+
+	// Every process's parent
+	parents := make(map[u32]u32, context.temp_allocator)
+	entry := win.PROCESSENTRY32W{dwSize = size_of(win.PROCESSENTRY32W)}
+	more := win.Process32FirstW(snapshot, &entry)
+	for more {
+		parents[entry.th32ProcessID] = entry.th32ParentProcessID
+		more = win.Process32NextW(snapshot, &entry)
+	}
+
+	// Up from the process, each parent started before its child
+	chain := make([dynamic]int, allocator)
+	child := u32(pid)
+	born, known := started_at(child)
+	if !known do return chain[:]
+
+	append(&chain, pid)
+	for len(chain) < limit {
+		parent, listed := parents[child]
+		if !listed || parent == 0 || parent == child {
+			break
+		}
+		at, ok := started_at(parent)
+		if !ok || at > born do break
+
+		append(&chain, int(parent))
+		child, born = parent, at
+	}
+	return chain[:]
+}
+
+
 // When a process started (FILETIME ticks), if it can be asked
 @(private = "file")
 started_at :: proc(pid: u32) -> (at: u64, ok: bool) {

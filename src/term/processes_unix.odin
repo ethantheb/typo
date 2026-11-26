@@ -10,3 +10,9 @@ package term
 programs_under :: proc(pid: int, allocator := context.allocator) -> []string {
 	return nil
 }
+
+
+// The process `pid` and those it runs under: not looked up here yet
+process_ancestors :: proc(pid: int, limit: int, allocator := context.allocator) -> []int {
+	return nil
+}

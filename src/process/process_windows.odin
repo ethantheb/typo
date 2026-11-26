@@ -408,3 +408,14 @@ process_close :: proc(p: ^Process) {
 	close_handles(p.stdout, p.stderr, p.handle, p.job)
 	p^ = {}
 }
+
+
+// Waits up to `ms` milliseconds for any process `pid` (not one started here)
+// to end; true if it has or there is none
+wait_for_exit :: proc(pid: int, ms: int) -> bool {
+	handle := win.OpenProcess(win.SYNCHRONIZE, false, win.DWORD(pid))
+	if handle == nil do return true
+	defer win.CloseHandle(handle)
+
+	return win.WaitForSingleObject(handle, win.DWORD(ms)) == win.WAIT_OBJECT_0
+}

@@ -5,11 +5,13 @@ import "core:fmt"
 import "core:math"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 
 import clay "../vendor/clay-odin"
 import "gfx"
 import "ipc"
+import "process"
 import sdl "../vendor/sdl3"
 import "langs"
 import "mdview"
@@ -110,7 +112,16 @@ WAKE_FRAMES :: 3
 
 main :: proc() {
 	g.ctx = context
+
+	// `typo ctl <command>`: a control request to the window this runs in, never
+	// a window of its own (control_cli.odin)
+	if len(os.args) > 1 && os.args[1] == CONTROL_WORD {
+		os.exit(control_main(os.args[2:]))
+	}
 	startup = parse_args()
+
+	// A restart: the window that started this one ends first (control.odin)
+	if startup.after > 0 do _ = process.wait_for_exit(startup.after, AFTER_WAIT_MS)
 
 	// In one of typo's terminals, files open in that window
 	if code, forwarded := forward_to_window(startup); forwarded {
@@ -149,22 +160,35 @@ Args :: struct {
 	terminal:   bool,     // start with a terminal filling the window (folders only)
 	new_window: bool,     // in a typo terminal, open a new window instead of using that one
 	perf:       bool,     // run the performance suite (perf.odin) and exit
+	after:      int,      // a restart: the typo to wait for, whose session is restored
 }
 
 @(private = "file")
 startup: Args
 
+// How long a restarted typo waits for the one it replaces to end (quitting
+// waits for writes and threads to finish)
+@(private = "file")
+AFTER_WAIT_MS :: 60_000
 
-// typo [--terminal | -t] [--new | -n] [--perf] [folder | file] [file...]
+
+// typo [--terminal | -t] [--new | -n] [--perf] [--after <pid>] [folder | file] [file...]
 @(private = "file")
 parse_args :: proc() -> (args: Args) {
 	paths := make([dynamic]string)
-	for arg in os.args[1:] {
+	for i := 1; i < len(os.args); i += 1 {
+		arg := os.args[i]
 		switch arg {
 		case "--terminal", "-t": args.terminal = true
 		case "--new", "-n":      args.new_window = true
 		case "--perf":           args.perf = true
-		case:                    append(&paths, arg)
+		case "--after":
+			if i + 1 < len(os.args) {
+				i += 1
+				args.after = strconv.parse_int(os.args[i], 10) or_else 0
+			}
+		case:
+			append(&paths, arg)
 		}
 	}
 
@@ -179,7 +203,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 	args := startup
 	if args.perf do args.paths = []string{perf_begin()}
 
-	// SDL
+	// SDL, its log kept for `typo ctl log` (control_input.odin)
+	control_log_init()
 	_ = sdl.SetAppMetadata("typo", "0.1", "dev.typo")
 	// Without this, the click that focuses the window is swallowed
 	_ = sdl.SetHint(sdl.HINT_MOUSE_FOCUS_CLICKTHROUGH, "1")
@@ -254,6 +279,8 @@ app_init :: proc "c" (appstate: ^rawptr, argc: i32, argv: [^]cstring) -> sdl.App
 		open_folder(last)
 		g.sidebar_visible = true
 	} else {
+		// A restart brings its session back whatever restore_session says
+		g.project.restore_forced = args.after > 0
 		open_paths(args.paths, args.terminal)
 	}
 
@@ -439,6 +466,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	render_clay_commands(&commands, gfx.scale)
 	gfx.flush_text()
 	if g.perf != nil do perf_mark(.Render)
+	control_capture()
 	_ = sdl.RenderPresent(gfx.renderer)
 	if !g.window_shown && !project_loading() && panes_ready() {
 		_ = sdl.ShowWindow(g.window)
@@ -456,6 +484,7 @@ app_iterate :: proc "c" (appstate: rawptr) -> sdl.AppResult {
 	g.button_chord = nil
 	g.frame += 1
 	gfx.text_end_frame(&gfx.text_system)
+	control_frame_end()
 	schedule_next_frame()
 	free_all(context.temp_allocator)
 	return .CONTINUE
@@ -768,6 +797,7 @@ app_quit :: proc "c" (appstate: rawptr, result: sdl.AppResult) {
 	delete(g.clay_memory)
 
 	if g.perf != nil do perf_end()
+	control_log_destroy()
 	// SDL destroys the window and renderer and calls SDL_Quit after this returns
 }
 

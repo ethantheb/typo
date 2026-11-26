@@ -31,6 +31,7 @@ Project :: struct {
 	loading:  u64,             // the read under way (Config_Read_Project.serial); 0 once landed
 	serial:   u64,
 	restored: bool,            // a session was restored this run: the window keeps its size
+	restore_forced: bool,      // restored whatever restore_session says (a restart)
 }
 
 
@@ -78,6 +79,8 @@ project_read :: proc(r: ^Project_Read) {
 	if r.serial != p.loading do return
 
 	p.loading = 0
+	forced := p.restore_forced
+	p.restore_forced = false
 	p.has_dir = r.has_dir
 	p.has_file = !r.settings.missing
 	p.keeps ||= r.has_dir
@@ -97,7 +100,7 @@ project_read :: proc(r: ^Project_Read) {
 	if !has_session do return
 
 	recent_load(&g.recent, session_paths(s.recent_files))
-	if p.keeps && g.settings.restore_session {
+	if p.keeps && (g.settings.restore_session || forced) {
 		session_restore(s, window = !p.restored)
 		p.restored = true
 	}

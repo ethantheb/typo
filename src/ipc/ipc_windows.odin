@@ -13,6 +13,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import win "core:sys/windows"
+import "core:thread"
 
 
 @(private = "file")
@@ -39,6 +40,10 @@ foreign kernel32 {
 	GetNamedPipeServerProcessId :: proc(
 		Pipe: win.HANDLE,
 		ServerProcessId: ^win.ULONG,
+	) -> win.BOOL ---
+	GetNamedPipeClientProcessId :: proc(
+		Pipe: win.HANDLE,
+		ClientProcessId: ^win.ULONG,
 	) -> win.BOOL ---
 }
 
@@ -162,8 +167,8 @@ create_instance :: proc(s: ^Server, first: bool) -> win.HANDLE {
 }
 
 
-// The server's thread: waits for a client, then answers it. The next
-// instance is made before the current one closes, so the name never lapses
+// The server's thread: waits for a client and hands it to a thread of its
+// own. The next instance is made before that, so the name never lapses
 @(private)
 serve :: proc(s: ^Server) {
 	event := win.CreateEventW(nil, true, false, nil)
@@ -172,24 +177,119 @@ serve :: proc(s: ^Server) {
 	for !server_stopping(s) {
 		if !wait_for_client(s, event) do break
 
-		// The next instance, then this client
 		next := create_instance(s, first = false)
-		c := Conn{pipe = s.pipe, event = event, stop = s.stop}
-		replied := serve_connection(s, &c)
-
-		// Disconnecting drops what the client hasn't read: wait for it to close
-		if replied {
-			rest: [1]u8
-			_ = conn_read(&c, rest[:], IO_TIMEOUT_MS)
-		}
-
-		win.DisconnectNamedPipe(s.pipe)
-		win.CloseHandle(s.pipe)
+		pipe := s.pipe
 		s.pipe = next
-		free_all(context.temp_allocator)
+
+		if !connection_begin(s) {
+			win.DisconnectNamedPipe(pipe)
+			win.CloseHandle(pipe)
+		} else {
+			c := new(Connection, s.allocator)
+			c^ = {server = s, pipe = pipe}
+			thread.create_and_start_with_poly_data(c, run_connection, self_cleanup = true)
+		}
 
 		if next == nil do break
 	}
+}
+
+
+// A client being answered on its own thread
+@(private = "file")
+Connection :: struct {
+	server: ^Server,
+	pipe:   win.HANDLE,
+}
+
+
+@(private = "file")
+run_connection :: proc(conn: ^Connection) {
+	s := conn.server
+	context.allocator = s.allocator
+	pipe := conn.pipe
+	free(conn)
+
+	event := win.CreateEventW(nil, true, false, nil)
+	c := Conn{pipe = pipe, event = event, stop = s.stop}
+	replied := event != nil && serve_connection(s, &c)
+
+	// Disconnecting drops what the client hasn't read: wait for it to close
+	if replied {
+		rest: [1]u8
+		_ = conn_read(&c, rest[:], IO_TIMEOUT_MS)
+	}
+
+	win.DisconnectNamedPipe(pipe)
+	win.CloseHandle(pipe)
+	if event != nil do win.CloseHandle(event)
+	free_all(context.temp_allocator)
+	connection_end(s)
+}
+
+
+// The client's process id; 0 if it can't be had
+@(private)
+conn_client_pid :: proc(c: ^Conn) -> int {
+	pid: win.ULONG
+	if !GetNamedPipeClientProcessId(c.pipe, &pid) do return 0
+	return int(pid)
+}
+
+
+// --- Slots -------------------------------------------------------------------------
+
+Slot_OS :: struct {
+	event: win.HANDLE, // set when the slot is filled
+}
+
+
+@(private)
+slot_os_init :: proc(s: ^Slot) {
+	s.event = win.CreateEventW(nil, true, false, nil)
+}
+
+
+@(private)
+slot_os_signal :: proc(s: ^Slot) {
+	win.SetEvent(s.event)
+}
+
+
+@(private)
+slot_os_destroy :: proc(s: ^Slot) {
+	win.CloseHandle(s.event)
+}
+
+
+// Waits until the slot is filled; false (and the slot abandoned) if the client
+// goes away or the server stops first. A read stays pending on the connection
+// meanwhile: a client sends nothing more, so it ends only when it goes
+slot_wait :: proc(call: Control_Call, s: ^Slot) -> bool {
+	c := call.conn
+	ov := win.OVERLAPPED{hEvent = c.event}
+	win.ResetEvent(c.event)
+	b: [1]u8
+	started := win.ReadFile(c.pipe, &b[0], 1, nil, &ov)
+	pending := !started && win.GetLastError() == win.ERROR_IO_PENDING
+
+	// The slot, the client going away, or the server stopping
+	handles := [3]win.HANDLE{s.event, c.event, c.stop}
+	woke := win.WaitForMultipleObjects(pending ? 3 : 1, &handles[0], false, win.INFINITE)
+	if !pending {
+		// The read ended at once: the client went away
+		woke = slot_is_filled(s) ? win.WAIT_OBJECT_0 : win.WAIT_OBJECT_0 + 1
+	}
+
+	if pending {
+		n: win.DWORD
+		win.CancelIoEx(c.pipe, &ov)
+		win.GetOverlappedResult(c.pipe, &ov, &n, true)
+	}
+
+	if woke == win.WAIT_OBJECT_0 do return true
+	slot_abandon(s)
+	return slot_is_filled(s)
 }
 
 

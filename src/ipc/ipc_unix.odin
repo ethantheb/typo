@@ -115,6 +115,36 @@ serve :: proc(s: ^Server) {
 }
 
 
+// The client's process id: not looked up here yet, so control requests are
+// refused (docs/agent_control.md)
+@(private)
+conn_client_pid :: proc(c: ^Conn) -> int {
+	return 0
+}
+
+
+// --- Slots (unused until control requests are taken here) --------------------------
+
+Slot_OS :: struct {}
+
+@(private)
+slot_os_init :: proc(s: ^Slot) {}
+
+@(private)
+slot_os_signal :: proc(s: ^Slot) {}
+
+@(private)
+slot_os_destroy :: proc(s: ^Slot) {}
+
+
+// Waits until the slot is filled: never needed while control requests are
+// refused, so it gives up at once
+slot_wait :: proc(call: Control_Call, s: ^Slot) -> bool {
+	slot_abandon(s)
+	return slot_is_filled(s)
+}
+
+
 @(private)
 wake_server :: proc(s: ^Server) {
 	b := u8(1)

@@ -159,6 +159,18 @@ process_exit_code :: proc(p: ^Process) -> int {
 }
 
 
+// Waits up to `ms` milliseconds for any process `pid` (not one started here)
+// to end; true if it has or there is none
+wait_for_exit :: proc(pid: int, ms: int) -> bool {
+	STEP :: 50
+	for waited := 0; waited < ms; waited += STEP {
+		if posix.kill(posix.pid_t(pid), .NONE) != .OK do return true
+		time.sleep(STEP * time.Millisecond)
+	}
+	return posix.kill(posix.pid_t(pid), .NONE) != .OK
+}
+
+
 // Closes the pipes; the process must have ended and the threads reading its
 // output finished
 process_close :: proc(p: ^Process) {

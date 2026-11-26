@@ -39,7 +39,7 @@ terminals_ended_by :: proc(then: After_Unsaved) -> []^Pane {
 	case Repinning:
 		if terminal_alive(t.pane) do append(&panes, t.pane)
 
-	case Open_Folder, Quit:
+	case Open_Folder, Quit, Restarting:
 		for p in g.panes.open {
 			t, is_terminal := p.content.(^Terminal)
 			if is_terminal && terminal_alive(p) && term.session_is_local(&t.session) {

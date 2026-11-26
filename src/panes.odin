@@ -405,7 +405,6 @@ panes_open_file_beside :: proc(path: string, beside: ^Pane = nil) -> ^Pane {
 
 
 // Where a file opened in a new pane goes (see panes_open_file_beside)
-@(private = "file")
 place_beside :: proc(p, beside: ^Pane) -> Drop {
 	ps := &g.panes
 	if ps.root == nil do return {kind = .Fill}
@@ -553,7 +552,6 @@ pane_show :: proc(p: ^Pane) {
 
 // Where a pane from the shelf goes: a file in place of the editor in use, else
 // above the rest; a terminal beside the terminal in use, else under the rest
-@(private = "file")
 place_for :: proc(p: ^Pane) -> Drop {
 	ps := &g.panes
 	if ps.root == nil do return {kind = .Fill}

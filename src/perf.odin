@@ -59,6 +59,7 @@ Perf :: struct {
 	words_times:      [dynamic]f64,        // word completion work on the UI thread, per frame
 	herdr_times:      [dynamic]f64,        // herdr-core client work on the UI thread, per frame
 	git_times:        [dynamic]f64,        // Git and diff view work on the UI thread, per frame
+	control_times:    [dynamic]f64,        // control requests' work on the UI thread, per frame
 	frame_t0:         time.Tick,           // when the current frame's work began
 	marks:            [Frame_Part]time.Tick,
 	first_present_ns: i64,
@@ -108,6 +109,9 @@ Phase :: struct {
 	// Limit (ms) on the Git work done on the UI thread in any frame (taking the
 	// worker's and the diff loader's results, asking for changes); 0 = not reported
 	git_limit:   f64,
+	// Limit (ms) on control requests' work on the UI thread in any frame
+	// (publishing the terminals, applying and answering requests); 0 = not reported
+	control_limit: f64,
 	idle:        bool, // let the app sleep between frames
 }
 
@@ -211,6 +215,7 @@ PHASES := [?]Phase {
 	{name = "moving panes", step = phase_panes_moving, frame_limit = 8},
 	{name = "pane title bar and mouse buttons", step = phase_pane_header},
 	{name = "typo <file> in the terminal", step = phase_ipc_open},
+	{name = "typo ctl in the terminal", step = phase_control, control_limit = 1}, // perf_control.odin
 	{name = "closing a terminal that runs a program", step = phase_terminal_close},
 	{
 		name        = "persistent terminal (herdr-core)",
@@ -295,6 +300,7 @@ perf_end :: proc() {
 	delete(p.words_times)
 	delete(p.herdr_times)
 	delete(p.git_times)
+	delete(p.control_times)
 	for f in p.failures do delete(f)
 	delete(p.failures)
 	delete(p.read_back)
@@ -346,15 +352,22 @@ perf_frame :: proc() -> (done, ok: bool) {
 		append(&p.words_times, time.duration_milliseconds(words_ui.total))
 		append(&p.herdr_times, time.duration_milliseconds(herdr.ui_share.total))
 		append(&p.git_times, time.duration_milliseconds(git_ui.total))
+		append(&p.control_times, time.duration_milliseconds(control_ui.total))
 	}
 
 	// Each frame's from zero
-	for share in ([]^uitime.Share{&langs.ui_share, &words_ui, &herdr.ui_share, &git_ui}) {
-		uitime.take(share)
-	}
+	shares := []^uitime.Share{&langs.ui_share, &words_ui, &herdr.ui_share, &git_ui, &control_ui}
+	for share in shares do uitime.take(share)
 
-	// This frame's step, moving on to the next phase when one finishes
+	// This frame's step, moving on to the next phase when one finishes. With
+	// TYPO_PERF_PHASES set, only the phases whose names contain it run (a
+	// phase may depend on those before it)
+	only := os.get_env("TYPO_PERF_PHASES", context.temp_allocator)
 	for p.phase < len(PHASES) {
+		if p.frame == 0 && only != "" && !strings.contains(PHASES[p.phase].name, only) {
+			p.phase += 1
+			continue
+		}
 		if p.frame == 0 do start_phase(p)
 		finished := PHASES[p.phase].step(p, p.frame)
 		p.frame += 1
@@ -387,6 +400,7 @@ start_phase :: proc(p: ^Perf) {
 	clear(&p.words_times)
 	clear(&p.herdr_times)
 	clear(&p.git_times)
+	clear(&p.control_times)
 
 	p.clay_errors = g.clay_errors.count
 	p.most_clips = 0
@@ -434,6 +448,10 @@ finish_phase :: proc(p: ^Perf) {
 	if phase.git_limit > 0 {
 		worst := slice.max(p.git_times[:]) if len(p.git_times) > 0 else 0
 		result(p, "Git, UI thread, worst", worst, "ms", phase.git_limit)
+	}
+	if phase.control_limit > 0 {
+		worst := slice.max(p.control_times[:]) if len(p.control_times) > 0 else 0
+		result(p, "control requests, UI thread, worst", worst, "ms", phase.control_limit)
 	}
 
 	limit := phase.frame_limit

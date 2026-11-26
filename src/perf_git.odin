@@ -167,6 +167,9 @@ phase_git_pane :: proc(p: ^Perf, frame: int) -> bool {
 		result(p, "status after opening", ms_since(gp.since), "ms", 3000)
 		check(p, "the branch is known", s.branch == "main" && len(s.head) == git.SHORT_ID)
 		run_command(.Open_Git)
+
+		// A message set before the box was ever laid out (typo ctl git message)
+		if gv := perf_git_view(); gv != nil do text_area_set(&gv.message, "A draft message")
 		p.mark_frame = frame
 		step = 1
 
@@ -185,6 +188,9 @@ phase_git_pane :: proc(p: ^Perf, frame: int) -> bool {
 		_, list := element_rect(clay.ID("GitFiles", gp_pane.id))
 		check(p, "the status bar shows the branch, the pane its files", bar && list)
 		check(p, "nothing to commit without a message", !git_can_commit(""))
+		in_view := gv.message.scroll_x == 0 && gv.message.view.w > 0
+		check(p, "a message set before the box's first layout stays in view", in_view)
+		text_area_clear(&gv.message)
 
 		// A message typed, then the list's keys
 		event: sdl.Event

@@ -76,8 +76,14 @@ text_area_string :: proc(ta: ^Text_Area) -> string {
 
 // Empties it; undo can bring the text back
 text_area_clear :: proc(ta: ^Text_Area) {
+	text_area_set(ta, "")
+}
+
+
+// Replaces the text, as one undo step, the caret at its end
+text_area_set :: proc(ta: ^Text_Area, text: string) {
 	textedit.select_all(ta)
-	textedit.apply(ta, .Other, textedit.selection_ranges(ta), {""})
+	textedit.apply(ta, .Other, textedit.selection_ranges(ta), {text})
 	ta.scroll_x, ta.target_x = 0, 0
 	textedit.scroll_to(ta, 0)
 }
@@ -163,7 +169,10 @@ text_area :: proc(id: clay.ElementId, ta: ^Text_Area, placeholder: string, focus
 		ta.view = {r.x + inset, r.y + pad, max(r.w - 2 * inset, 0), max(r.h - 2 * pad, 0)}
 	}
 	if focused do area_mouse(id, ta)
-	if ta.reveal {
+
+	// Not before the box has a size: an edit made before its first layout
+	// would scroll the text out of a box no wider than nothing
+	if ta.reveal && ta.view.w > 0 {
 		area_reveal(ta)
 		ta.reveal = false
 	}

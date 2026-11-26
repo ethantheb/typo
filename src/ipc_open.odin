@@ -45,9 +45,10 @@ registry: struct {
 
 // --- The window's side -------------------------------------------------------------
 
-// Starts listening for typo started in this window's terminals
+// Starts listening for typo started in this window's terminals: files to open,
+// and control requests (control.odin)
 ipc_init :: proc() {
-	remote.running = ipc.server_start(&remote.server, answer_request, nil)
+	remote.running = ipc.server_start(&remote.server, answer_request, nil, control_answer)
 	if remote.running {
 		// Its own temp allocator
 		ctx := runtime.default_context()
@@ -72,6 +73,7 @@ ipc_destroy :: proc() {
 	registry = {}
 
 	if remote.running do ipc.server_stop(&remote.server)
+	control_destroy()
 
 	for paths in remote.queue do delete_paths(paths)
 	delete(remote.queue)
@@ -179,7 +181,6 @@ answer_request :: proc(req: ipc.Request, userdata: rawptr) -> ipc.Reply {
 
 // Why a path can't open in a pane, or "". A file that doesn't exist opens
 // empty and is created when saved, as on the command line
-@(private = "file")
 open_problem :: proc(path: string) -> string {
 	if os.is_dir(path) do return "is a folder (folders open in a new window)"
 	if !os.is_dir(filepath.dir(path)) do return "no such folder"
@@ -191,6 +192,7 @@ open_problem :: proc(path: string) -> string {
 // waits
 ipc_frame :: proc() {
 	registry_follow()
+	control_frame()
 	if g.pending != nil do return
 
 	sync.guard(&remote.mutex)
@@ -203,6 +205,8 @@ ipc_frame :: proc() {
 
 // Requests are waiting
 ipc_busy :: proc() -> bool {
+	if control_busy() do return true
+
 	sync.guard(&remote.mutex)
 	return len(remote.queue) > 0
 }
