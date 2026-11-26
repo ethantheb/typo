@@ -818,7 +818,9 @@ first_rune_len :: proc(s: string) -> int {
 // --- Carets in a line of text ------------------------------------------------------
 // Where the text engine puts a one-line string's characters when it draws it
 // (text_width is the inked extent, which counts a trailing space short). In
-// logical pixels. Without a text engine each character is half the font size
+// logical pixels. Without a text engine each character is half the font size.
+// The engine's boxes are ink: a character's starts at its ink, a space's where
+// it starts
 
 // The x of the character boundary at byte i
 text_caret_x :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, i: int) -> f32 {
@@ -829,17 +831,23 @@ text_caret_x :: proc(ts: ^Text_System, id: Font_Id, size: u16, s: string, i: int
 		return f32(strings.rune_count(s[:min(i, len(s))])) * f32(size) * 0.5
 	}
 
+	// The end: where one more space would start, as a caret before a space in the
+	// text is. The last character's own box would be its ink, which can reach
+	// past where the next character starts, and for a space its advance rounded
+	// down: a trailing space barely moved the caret
+	if i >= len(s) {
+		padded := strings.concatenate({s, " "}, context.temp_allocator)
+		return text_caret_x(ts, id, size, padded, len(s))
+	}
+
 	font := text_get_font(ts, id, size)
 	if font == nil do return 0
 	text := text_get(ts, font, s)
 	if text == nil do return 0
 
-	// The start of the character at i, or the end of the last one
+	// The start of the character at i (a space's is where it starts, as it has
+	// no ink)
 	sub: ttf.SubString
-	if i >= len(s) {
-		_ = ttf.GetTextSubString(text, i32(len(s)), &sub)
-		return f32(sub.rect.x + sub.rect.w) / scale
-	}
 	_ = ttf.GetTextSubString(text, i32(i), &sub)
 	return f32(sub.rect.x) / scale
 }

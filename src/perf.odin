@@ -4243,10 +4243,19 @@ phase_text_fields :: proc(p: ^Perf, frame: int) -> bool {
 		check(p, "Ctrl+A in the find field leaves the editor's selection", alone)
 		press(sdl.K_HOME)
 
-		// A space moves the caret, even last (the text's inked extent doesn't grow)
+		// A space typed last moves the caret as far as a space in the text spans (the
+		// inked extent doesn't grow, and the last letter's ink can reach past it)
 		after_quick := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY, 9)
-		after_space := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY[:10], 10)
-		check(p, "a caret after a space is right of it", after_space > after_quick + 1)
+		quick_last := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY[:9], 9)
+		space_last := field_x(field, 6, FONT_SIZE_SMALL, PERF_FIND_QUERY[:10], 10)
+		check(p, "a caret after a space is right of it", space_last > after_quick + 1)
+
+		// From where the first of two spaces starts to where the second does
+		spaces := strings.concatenate({PERF_FIND_QUERY[:9], "  "}, context.temp_allocator)
+		first := field_x(field, 6, FONT_SIZE_SMALL, spaces, 9)
+		space := field_x(field, 6, FONT_SIZE_SMALL, spaces, 10) - first
+		moved := space_last - quick_last
+		check(p, "a space typed last moves the caret a space", moved >= space - 0.25)
 		next_step(p, &step, frame)
 
 	case 2: // a press after "quick", once the text scrolled back
