@@ -17,6 +17,7 @@ package editor
 import "core:fmt"
 import "core:math"
 import "core:path/filepath"
+import "core:slice"
 import "core:strings"
 import "core:time"
 
@@ -72,6 +73,8 @@ Diff_View :: struct {
 	path:        string, // owned; the file's full path
 	rel:         string, // owned; relative to the work tree, once it is known
 	area:        git.Area,
+	commit:      Maybe(git.Oid), // a commit's change to the file instead (its parent | it)
+	from:        string,         // owned; a commit's renamed file: where it was (work tree)
 
 	// What is shown, from the loader
 	status:      Diff_Status,
@@ -105,7 +108,16 @@ Diff_View :: struct {
 	char_w:      f32,
 	areas:       [Diff_Pane_Side]gfx.Rect, // each side's, from the last layout
 	scroll_drag: [gfx.Axis]Maybe(f32),
+
+	// The divider between the sides, dragged by the strip of hunk buttons
+	split:       f32,         // the left side's share of the sides' width; 0 for half
+	split_drag:  Maybe(f32),  // while dragged: where in the strip it was taken
+	divider_hot: bool,        // the pointer is on the strip where it drags
 }
+
+// The least width (logical pixels) the divider leaves each side
+@(private = "file")
+DIFF_SIDE_MIN :: 80
 
 @(private = "file")
 next_view_id: u64
@@ -131,10 +143,21 @@ diff_view_open :: proc(dv: ^Diff_View, path: string, area: git.Area) {
 }
 
 
+// Shows what a commit changed in a file (its full path): the file in the
+// commit's parent (at `from`, relative to the work tree, when the commit
+// renamed it) beside it in the commit. Nothing in it can be staged or reverted
+diff_view_open_commit :: proc(dv: ^Diff_View, path: string, id: git.Oid, from := "") {
+	diff_view_open(dv, path, .Changes)
+	dv.commit = id
+	dv.from = strings.clone(from)
+}
+
+
 // Frees what the view shows; it can be opened again
 diff_view_close :: proc(dv: ^Diff_View) {
 	delete(dv.rel)
 	delete(dv.path)
+	delete(dv.from)
 	delete(dv.problem)
 	drop_shown(dv)
 
@@ -163,12 +186,23 @@ drop_shown :: proc(dv: ^Diff_View) {
 
 // Whether a view shows this file (full path) of this area
 diff_view_is :: proc(dv: ^Diff_View, path: string, area: git.Area) -> bool {
-	return same_path(dv.path, path) && dv.area == area
+	return same_path(dv.path, path) && dv.area == area && dv.commit == nil
+}
+
+
+// Whether a view shows what this commit changed in this file
+diff_view_is_commit :: proc(dv: ^Diff_View, path: string, id: git.Oid) -> bool {
+	shown, is_commit := dv.commit.?
+	return is_commit && shown == id && same_path(dv.path, path)
 }
 
 
 // The pane's title: the file's name and what it compares
 diff_view_title :: proc(dv: ^Diff_View) -> string {
+	if id, is_commit := dv.commit.?; is_commit {
+		short := git.short_id(id, context.temp_allocator)
+		return fmt.tprintf("%s (%s)", filepath.base(dv.path), short)
+	}
 	return fmt.tprintf("%s (%s)", filepath.base(dv.path), DIFF_AREA_NAMES[dv.area])
 }
 
@@ -249,8 +283,10 @@ diff_views_busy :: proc() -> bool {
 		if !ok do continue
 
 		// Loading, or loaded and not laid out yet (its scroll bars and gutter
-		// follow the sides' bounds)
-		waiting := dv.status == .Loading || dv.status == .Ready && dv.areas[.Right].w == 0
+		// follow the sides' bounds), if it is drawn at all: one a maximized pane
+		// covers isn't laid out until it shows
+		unplaced := dv.status == .Ready && dv.areas[.Right].w == 0 && p.visible
+		waiting := dv.status == .Loading || unplaced
 		if waiting || dv.edited_at != {} || dv.scroll_y != dv.target_y {
 			return true
 		}
@@ -275,7 +311,7 @@ diff_view_with_id :: proc(id: u64) -> ^Diff_View {
 // editor opening or closing) loads it again once edits rest
 @(private = "file")
 follow_editor :: proc(dv: ^Diff_View) {
-	if dv.area == .Staged do return
+	if dv.area == .Staged || dv.commit != nil do return
 
 	e := editor_with_path(dv.path)
 	open := e != nil && e.status == .Text
@@ -321,11 +357,13 @@ post_load :: proc(dv: ^Diff_View) {
 		rel     = strings.clone(dv.rel),
 		path    = strings.clone(dv.path),
 		area    = dv.area,
+		commit  = dv.commit,
+		from    = strings.clone(dv.from),
 	}
 
-	// The open editor's text, unless the diff is of staged changes
+	// The open editor's text, unless the diff is of staged changes or a commit
 	e := editor_with_path(dv.path)
-	if e != nil && e.status == .Text && dv.area != .Staged {
+	if e != nil && e.status == .Text && dv.area != .Staged && dv.commit == nil {
 		job.editor = buffer.snapshot(&e.buf)
 		dv.seen = e.buf.version
 	}
@@ -379,9 +417,17 @@ result_landed :: proc(dv: ^Diff_View, r: ^Diff_Result) {
 
 // --- Hunks -------------------------------------------------------------------------
 
+// What a hunk's buttons do in a view (perf)
+hunk_actions_of :: proc(dv: ^Diff_View) -> (revert, stage: bool) {
+	return hunk_actions(dv)
+}
+
+
 // What a hunk's buttons do in this view, if anything: revert, stage or unstage
 @(private = "file")
 hunk_actions :: proc(dv: ^Diff_View) -> (revert, stage: bool) {
+	if dv.commit != nil do return false, false
+
 	both := dv.left.exists && dv.right.exists
 	switch dv.area {
 	case .Changes: return both, both
@@ -485,7 +531,7 @@ revert_hunk :: proc(dv: ^Diff_View, lo, hi: int, text: string) {
 			io_result_destroy(r)
 		}
 
-	case .None, .Head, .Index:
+	case .None, .Head, .Index, .Before, .Commit:
 	}
 }
 
@@ -570,17 +616,25 @@ diff_view_frame :: proc(dv: ^Diff_View, left, right: clay.ElementId, interactive
 		if placed do dv.areas[side] = r
 	}
 	dv.char_w = editor_char_width(textedit.zoom_factor(dv.zoom))
+	dv.divider_hot = false
 	if dv.status != .Ready do return
 
-	if interactive do diff_mouse(dv)
+	// The mouse; a divider drag goes on wherever the pointer goes
+	if interactive {
+		diff_mouse(dv)
+	} else if dv.split_drag != nil {
+		divider_mouse(dv)
+	}
 	clamp_diff_scroll(dv)
 	animate_diff_scroll(dv)
 }
 
 
-// The wheel scrolls (sideways with Shift), and the scroll bars drag
+// The wheel scrolls (sideways with Shift), the scroll bars and the divider drag
 @(private = "file")
 diff_mouse :: proc(dv: ^Diff_View) {
+	divider_mouse(dv)
+
 	over := gfx.rect_contains(dv.areas[.Left], g.mouse_pos) ||
 	        gfx.rect_contains(dv.areas[.Right], g.mouse_pos)
 	if over && g.wheel != {} {
@@ -610,6 +664,72 @@ diff_mouse :: proc(dv: ^Diff_View) {
 }
 
 
+// The divider: a press on the strip between the sides (not on a hunk's
+// buttons) takes it, dragging moves it, a double press puts it back halfway
+@(private = "file")
+divider_mouse :: proc(dv: ^Diff_View) {
+	left, right := dv.areas[.Left], dv.areas[.Right]
+	strip := gfx.Rect{left.x + left.w, left.y, right.x - (left.x + left.w), left.h}
+	on_strip := gfx.rect_contains(strip, g.mouse_pos) && !on_hunk_buttons(dv, g.mouse_pos)
+	dv.divider_hot = on_strip || dv.split_drag != nil
+
+	if on_strip && g.mouse_pressed && dv.split_drag == nil {
+		if g.mouse_clicks == 2 {
+			dv.split = 0
+		} else {
+			dv.split_drag = g.mouse_pos.x - strip.x
+		}
+	}
+
+	grab, dragging := dv.split_drag.?
+	if !dragging do return
+	if !g.mouse_down {
+		dv.split_drag = nil
+		return
+	}
+
+	// The left side's share, leaving each side some room
+	sides := left.w + right.w
+	if sides <= 2 * DIFF_SIDE_MIN do return
+	least := DIFF_SIDE_MIN / sides
+	dv.split = clamp((g.mouse_pos.x - grab - left.x) / sides, least, 1 - least)
+}
+
+
+// Whether a point on the strip between the sides is on a hunk's buttons, which
+// take presses there rather than the divider
+@(private = "file")
+on_hunk_buttons :: proc(dv: ^Diff_View, at: [2]f32) -> bool {
+	revert, stage := hunk_actions(dv)
+	if !revert && !stage do return false
+
+	lh := f64(diff_line_height(dv))
+	row := int((f64(at.y - dv.areas[.Right].y) + dv.scroll_y) / lh)
+	_, found := slice.binary_search(dv.rows.starts, row)
+	return found
+}
+
+
+// Whether the pointer is on a diff's divider, or dragging it (the mouse cursor)
+diff_divider_hot :: proc() -> bool {
+	for p in g.panes.open {
+		dv, is_diff := p.content.(^Diff_View)
+		if is_diff && pane_shown(p) && dv.divider_hot do return true
+	}
+	return false
+}
+
+
+// The left side's width, once the divider was moved (leaving each side some
+// room, the pane may have narrowed since); 0 while it is halfway
+@(private = "file")
+left_width :: proc(dv: ^Diff_View) -> f32 {
+	sides := dv.areas[.Left].w + dv.areas[.Right].w
+	if dv.split == 0 || sides <= 2 * DIFF_SIDE_MIN do return 0
+	return clamp(math.round(sides * dv.split), DIFF_SIDE_MIN, sides - DIFF_SIDE_MIN)
+}
+
+
 // The last row can scroll to the top
 @(private = "file")
 diff_max_scroll_y :: proc(dv: ^Diff_View) -> f64 {
@@ -617,10 +737,12 @@ diff_max_scroll_y :: proc(dv: ^Diff_View) -> f64 {
 }
 
 
-// As far as the widest line shown, with a little room after it
+// As far as the widest line shown, with a little room after it, in the
+// narrower side (both scroll together; the divider may make either narrower)
 @(private = "file")
 diff_max_scroll_x :: proc(dv: ^Diff_View) -> f32 {
-	text_w := dv.areas[.Right].w - side_gutter(dv) - DIFF_TEXT_MARGIN - 2 * dv.char_w
+	side_w := min(dv.areas[.Left].w, dv.areas[.Right].w)
+	text_w := side_w - side_gutter(dv) - DIFF_TEXT_MARGIN - 2 * dv.char_w
 	return max(f32(dv.widest) * dv.char_w - text_w, 0)
 }
 
@@ -720,10 +842,20 @@ diff_view_ui :: proc(p: ^Pane, dv: ^Diff_View, left, right: clay.ElementId) {
 		layout = {sizing = {clay.SizingGrow(), clay.SizingGrow()}},
 		border = {color = gfx.theme.border, width = {top = 1}},
 	}) {
-		custom_element(left, Diff_Draw{dv, .Left})
+		if clay.UI()({layout = {sizing = {left_sizing(dv), clay.SizingGrow()}}}) {
+			custom_element(left, Diff_Draw{dv, .Left})
+		}
 		hunk_gutter(p, dv)
 		custom_element(right, Diff_Draw{dv, .Right})
 	}
+}
+
+
+// The left side's width: half the sides', or where the divider was moved
+@(private = "file")
+left_sizing :: proc(dv: ^Diff_View) -> clay.SizingAxis {
+	w := left_width(dv)
+	return w > 0 ? clay.SizingFixed(w) : clay.SizingGrow()
 }
 
 
@@ -739,10 +871,10 @@ diff_toolbar :: proc(p: ^Pane, dv: ^Diff_View) {
 			childAlignment = {y = .Center},
 		},
 	}) {
-		// The old side
+		// The old side, as wide as its rows
 		if clay.UI()({
 			layout = {
-				sizing = {clay.SizingGrow(), clay.SizingGrow()},
+				sizing = {left_sizing(dv), clay.SizingGrow()},
 				padding = {left = 12},
 				childGap = 8,
 				childAlignment = {y = .Center},
@@ -801,7 +933,7 @@ diff_toolbar_buttons :: proc(p: ^Pane, dv: ^Diff_View) {
 		// The whole file in or out of the index, once it is known in the repository
 		entry := git.Entry{path = dv.rel, area = dv.area}
 		switch {
-		case dv.rel == "":
+		case dv.rel == "", dv.commit != nil:
 		case dv.area == .Staged:
 			if icon_button(clay.ID("DiffUnstage", p.id), .Minus, 22, 14, "Unstage file") {
 				git_unstage({entry})
@@ -823,6 +955,11 @@ diff_toolbar_buttons :: proc(p: ^Pane, dv: ^Diff_View) {
 // What each side is
 @(private = "file")
 side_names :: proc(dv: ^Diff_View) -> (left, right: string) {
+	if id, is_commit := dv.commit.?; is_commit {
+		short := git.short_id(id, context.temp_allocator)
+		return fmt.tprintf("Before %s", short), short
+	}
+
 	switch dv.area {
 	case .Changes:   return "Staged", "Working tree"
 	case .Staged:    return "HEAD", "Staged"
@@ -1128,9 +1265,12 @@ draw_line_numbers :: proc(
 }
 
 
-// The scroll bars' thumbs, each brighter while hovered or dragged
+// The scroll bars' thumbs, each brighter while hovered or dragged, over the
+// hunks' marks
 @(private = "file")
 draw_diff_scrollbars :: proc(dv: ^Diff_View, scale: f32) {
+	draw_hunk_marks(dv, scale)
+
 	for axis in gfx.Axis {
 		track, thumb, ok := diff_scrollbar(dv, axis)
 		if !ok do continue
@@ -1143,3 +1283,30 @@ draw_diff_scrollbars :: proc(dv: ^Diff_View, scale: f32) {
 		gfx.fill_rounded_rect(b, {radius, radius, radius, radius}, c)
 	}
 }
+
+
+// Where the hunks are, along the vertical scroll bar's track: added lines
+// green, removed red, changed yellow, as the Git pane colors files, so the
+// changes can be found at a glance in a long file
+@(private = "file")
+draw_hunk_marks :: proc(dv: ^Diff_View, scale: f32) {
+	track, _, ok := diff_scrollbar(dv, .Vertical)
+	if !ok || dv.rows.count == 0 do return
+
+	per_row := track.h / f32(dv.rows.count)
+	for h, k in dv.rows.hunks {
+		y := track.y + f32(dv.rows.starts[k]) * per_row
+		height := max(f32(diff.hunk_rows(h)) * per_row, HUNK_MARK_MIN)
+
+		color := gfx.theme.git_modified
+		if h.old_lo == h.old_hi do color = gfx.theme.git_added
+		if h.new_lo == h.new_hi do color = gfx.theme.git_deleted
+
+		mark := gfx.Rect{track.x + 1, y, track.w - 2, height}
+		gfx.fill_rect(mark.x * scale, mark.y * scale, mark.w * scale, mark.h * scale, color)
+	}
+}
+
+// The least height (logical pixels) of a hunk's mark, so one line shows
+@(private = "file")
+HUNK_MARK_MIN :: 2

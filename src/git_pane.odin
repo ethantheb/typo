@@ -16,6 +16,7 @@ import "core:fmt"
 import "core:hash"
 import "core:slice"
 import "core:strings"
+import "core:time"
 
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
@@ -39,6 +40,11 @@ SECTION_GAP :: 4
 FILE_INSET :: 18
 @(private = "file")
 FILE_GAP :: 6
+// History: commits with a small chevron, their files indented under them
+@(private = "file")
+COMMIT_INSET :: 14
+@(private = "file")
+COMMIT_FILE_INSET :: 34
 
 Git_View :: struct {
 	message:   Text_Area,
@@ -46,14 +52,31 @@ Git_View :: struct {
 	selected:  Git_Row_Key,    // owned path; the row the keys act on
 	reveal:    bool,           // scroll the selected row into view when next laid out
 	collapsed: bit_set[git.Area],
+	history_collapsed: bool,
 	list_drag: Maybe(f32),
 	chosen:    Maybe(Git_Row_Key), // owned path; a row clicked, its diff opened next frame
+	toggled:   Maybe(git.Oid),     // a commit clicked, opened or closed next frame (its
+	                               // files' rows were declared with the open one's strings)
 }
 
-// A row of the file list: an area's header (path "") or a file in it
+// What a row of the list is
+Git_Row_Kind :: enum u8 {
+	None,        // past the end
+	Section,     // an area's header
+	File,        // a file in an area
+	History,     // the history's header
+	Commit,      // a commit in the history
+	Commit_File, // a file the open commit changed
+	Loading,     // the open commit's files, still being read
+}
+
+// A row of the list, as selected: its kind, and the area and path or the
+// commit and path it is about
 Git_Row_Key :: struct {
-	area: git.Area,
-	path: string,
+	kind:   Git_Row_Kind,
+	area:   git.Area,
+	path:   string,
+	commit: git.Oid,
 }
 
 // The sections, top to bottom
@@ -128,9 +151,15 @@ git_pane_committed :: proc() {
 // Before layout: last frame's clicked row opens its diff; the message box
 // loses the keys to a press elsewhere or another pane
 git_view_frame :: proc(p: ^Pane, gv: ^Git_View) {
+	git_history_follow()
+
+	if id, ok := gv.toggled.?; ok {
+		gv.toggled = nil
+		git_commit_toggle(id)
+	}
 	if chosen, ok := gv.chosen.?; ok {
 		gv.chosen = nil
-		git_open_diff(chosen.path, chosen.area, focus = false)
+		open_row_diff(chosen)
 		delete(chosen.path)
 	}
 
@@ -168,6 +197,48 @@ git_open_diff :: proc(rel: string, area: git.Area, focus: bool) {
 }
 
 
+// Opens what a commit changed in a file, where git_open_diff opens diffs; a
+// file the open commit renamed is compared with where it was
+git_open_commit_diff :: proc(rel: string, id: git.Oid, focus: bool) {
+	uitime.timed(&git_ui)
+	path := git_full_path(rel)
+
+	from := ""
+	if g.git.detail.id == id {
+		for f in g.git.detail.files {
+			if f.path == rel do from = f.old_path
+		}
+	}
+
+	for p in g.panes.open {
+		dv, ok := p.content.(^Diff_View)
+		if !ok || !pane_shown(p) {
+			continue
+		}
+
+		if !diff_view_is_commit(dv, path, id) do diff_view_open_commit(dv, path, id, from)
+		if focus do pane_focus(p)
+		return
+	}
+
+	dv := new(Diff_View)
+	diff_view_open_commit(dv, path, id, from)
+	p := panes_add_diff(dv)
+	pane_move(p, place_for_diff(p))
+	if focus do pane_focus(p)
+}
+
+
+// Opens a file row's diff: an area's, or the open commit's
+@(private = "file")
+open_row_diff :: proc(key: Git_Row_Key) {
+	#partial switch key.kind {
+	case .File:        git_open_diff(key.path, key.area, focus = false)
+	case .Commit_File: git_open_commit_diff(key.path, key.commit, focus = false)
+	}
+}
+
+
 // --- Keys --------------------------------------------------------------------------
 
 // Keys while the Git pane is focused: the message box's while it has them,
@@ -187,15 +258,18 @@ git_view_handle_event :: proc(p: ^Pane, gv: ^Git_View, event: ^sdl.Event) -> boo
 	case sdl.K_DOWN:
 		select_row(gv, min(at + 1, count - 1))
 	case sdl.K_RETURN, sdl.K_KP_ENTER:
-		switch {
-		case at < 0:
-		case row.entry == nil: toggle_section(gv, row.area)
-		case:                  git_open_diff(row.entry.path, row.area, focus = false)
+		if at < 0 do break
+		switch row.kind {
+		case .Section:            toggle_section(gv, row.area)
+		case .File, .Commit_File: open_row_diff(row_key(row))
+		case .History:            gv.history_collapsed = !gv.history_collapsed
+		case .Commit:             git_commit_toggle(row.commit.id)
+		case .Loading, .None:
 		}
 	case sdl.K_SPACE:
-		if at >= 0 do stage_or_unstage(row)
+		if at >= 0 && row_changes(row) do stage_or_unstage(row)
 	case sdl.K_DELETE, sdl.K_BACKSPACE:
-		if at >= 0 do discard_row(row)
+		if at >= 0 && row_changes(row) do discard_row(row)
 	case sdl.K_TAB:
 		gv.typing = true
 	case:
@@ -240,18 +314,23 @@ commit_message :: proc(gv: ^Git_View) {
 
 // --- The list ----------------------------------------------------------------------
 
-// A row of the file list: a section's header, or one of its files. The list's
-// rows aren't stored: a row is found from the sections' sizes, so a status of
-// any size costs only the rows in view
+// A row of the list: a section's header or one of its files, then the
+// history's header, its commits and the open commit's files. The list's rows
+// aren't stored: a row is found from the sections' sizes and the open commit's
+// place in the log, so a status or a history of any size costs only the rows
+// in view
 @(private = "file")
 Git_Row :: struct {
-	area:  git.Area,
-	entry: ^git.Entry, // the status's; nil for the header
+	kind:   Git_Row_Kind,
+	area:   git.Area,
+	entry:  ^git.Entry,       // a File's, the status's
+	commit: ^git.Commit_Info, // a Commit's (or the open commit's, for its files), the log's
+	file:   ^git.Commit_File, // a Commit_File's, the open commit's
 }
 
 
 // How many rows the list has: each section with files, its header, then its
-// files unless collapsed
+// files unless collapsed; then the history's
 @(private = "file")
 row_count :: proc(gv: ^Git_View) -> (n: int) {
 	s := &g.git.status
@@ -262,7 +341,26 @@ row_count :: proc(gv: ^Git_View) -> (n: int) {
 		n += 1
 		if area not_in gv.collapsed do n += files
 	}
-	return
+	return n + history_rows(gv)
+}
+
+
+// The history's rows: its header, then (unless collapsed) each commit and,
+// under the open one, its files (or a row saying they're being read)
+@(private = "file")
+history_rows :: proc(gv: ^Git_View) -> int {
+	commits := len(g.git.log.commits)
+	if commits == 0 do return 0
+	if gv.history_collapsed do return 1
+	return 1 + commits + open_commit_rows()
+}
+
+
+// The rows under the open commit
+@(private = "file")
+open_commit_rows :: proc() -> int {
+	if g.git.detail_at < 0 do return 0
+	return git_commit_loaded() ? len(g.git.detail.files) : 1
 }
 
 
@@ -274,21 +372,63 @@ row_at :: proc(gv: ^Git_View, i: int) -> Git_Row {
 		entries := git.entries_in(s, area)
 		if len(entries) == 0 do continue
 
-		if i == 0 do return {area, nil}
+		if i == 0 do return {kind = .Section, area = area}
 		i -= 1
 		if area in gv.collapsed do continue
 
-		if i < len(entries) do return {area, &entries[i]}
+		if i < len(entries) do return {kind = .File, area = area, entry = &entries[i]}
 		i -= len(entries)
 	}
-	return {}
+	return history_row_at(gv, i)
+}
+
+
+// The history's row `i` (0 is its header): commits down to the open one, its
+// files, then the commits after it
+@(private = "file")
+history_row_at :: proc(gv: ^Git_View, i: int) -> Git_Row {
+	gs := &g.git
+	commits := gs.log.commits
+	if i == 0 do return {kind = .History}
+	if gv.history_collapsed do return {}
+	i := i - 1
+
+	at := gs.detail_at
+	if at < 0 || i <= at {
+		return i < len(commits) ? {kind = .Commit, commit = &commits[i]} : {}
+	}
+
+	// Under the open commit
+	open := &commits[at]
+	under := i - at - 1
+	if !git_commit_loaded() {
+		if under == 0 do return {kind = .Loading, commit = open}
+	} else if under < len(gs.detail.files) {
+		return {kind = .Commit_File, commit = open, file = &gs.detail.files[under]}
+	}
+
+	// After it
+	next := i - open_commit_rows()
+	return next < len(commits) ? {kind = .Commit, commit = &commits[next]} : {}
 }
 
 
 // The key a row is selected by
 @(private = "file")
 row_key :: proc(row: Git_Row) -> Git_Row_Key {
-	return {row.area, row.entry != nil ? row.entry.path : ""}
+	key := Git_Row_Key{kind = row.kind, area = row.area}
+	if row.entry != nil do key.path = row.entry.path
+	if row.commit != nil do key.commit = row.commit.id
+	if row.file != nil do key.path = row.file.path
+	return key
+}
+
+
+// Whether a row is about the work tree's changes (a section or a file), which
+// stage, unstage and discard
+@(private = "file")
+row_changes :: proc(row: Git_Row) -> bool {
+	return row.kind == .Section || row.kind == .File
 }
 
 
@@ -309,9 +449,7 @@ select_row :: proc(gv: ^Git_View, i: int) {
 		return
 	}
 
-	key := row_key(row_at(gv, i))
-	gv.selected.area = key.area
-	set_string(&gv.selected.path, key.path)
+	set_selected(gv, row_key(row_at(gv, i)))
 	gv.reveal = true
 }
 
@@ -556,11 +694,11 @@ remote_button :: proc(
 @(private = "file")
 note_line :: proc() {
 	note := &g.git.note
-	if note.text == "" do return
+	text := git_note_shown()
+	if text == "" do return
 
-	text := note.text
 	seconds := git_remote_seconds()
-	if seconds > 0 do text = fmt.tprintf("%s %d s", note.text, seconds)
+	if seconds > 0 do text = fmt.tprintf("%s %d s", text, seconds)
 
 	if clay.UI()({
 		layout = {
@@ -625,10 +763,14 @@ file_list :: proc(p: ^Pane, gv: ^Git_View) {
 		list_spacer(first)
 		for i in first ..< last {
 			row := row_at(gv, i)
-			if row.entry == nil {
-				section_row(p, gv, row, list)
-			} else {
-				file_row(p, gv, row, list)
+			switch row.kind {
+			case .None:
+			case .Section:     section_row(p, gv, row, list)
+			case .File:        file_row(p, gv, row, list)
+			case .History:     history_row(p, gv, row, list)
+			case .Commit:      commit_row(p, gv, row, list)
+			case .Commit_File: commit_file_row(p, gv, row, list)
+			case .Loading:     loading_row(p, row)
 			}
 		}
 		list_spacer(count - last)
@@ -682,7 +824,9 @@ section_row :: proc(p: ^Pane, gv: ^Git_View, row: Git_Row, list: clay.ElementId)
 // Selects a row by its key (a click)
 @(private = "file")
 set_selected :: proc(gv: ^Git_View, key: Git_Row_Key) {
+	gv.selected.kind = key.kind
 	gv.selected.area = key.area
+	gv.selected.commit = key.commit
 	set_string(&gv.selected.path, key.path)
 }
 
@@ -731,12 +875,152 @@ file_row :: proc(p: ^Pane, gv: ^Git_View, row: Git_Row, list: clay.ElementId) {
 	}
 	tooltip(id, e.path)
 
-	if clicked(id, list) && !on_row_button(p, key) {
+	if clicked(id, list) && !on_row_button(p, key) do choose_row(gv, key)
+}
+
+
+// A file row clicked: selected, and its diff opened next frame
+@(private = "file")
+choose_row :: proc(gv: ^Git_View, key: Git_Row_Key) {
+	set_selected(gv, key)
+	if gv.chosen == nil {
+		chosen := key
+		chosen.path = strings.clone(key.path)
+		gv.chosen = chosen
+	}
+}
+
+
+// --- History -----------------------------------------------------------------------
+
+// The history's header: a chevron, its name and how many commits it lists
+@(private = "file")
+history_row :: proc(p: ^Pane, gv: ^Git_View, row: Git_Row, list: clay.ElementId) {
+	key := row_key(row)
+	id := clay.ID("GitHistory", p.id)
+	selected := g.panes.focused == p && !gv.typing && same_row(gv.selected, key)
+
+	if list_row(id, selected, GIT_ROW_HEIGHT, SECTION_INSET, SECTION_GAP) {
+		icon(gv.history_collapsed ? .Chevron_Right : .Chevron_Down, gfx.theme.text_dim, 13)
+		label("HISTORY", gfx.theme.text_dim, FONT_SIZE_SMALL, .Bold)
+		n := len(g.git.log.commits)
+		more := n >= git.LOG_LIMIT ? "+" : ""
+		label(fmt.tprintf("%d%s", n, more), gfx.theme.text_faint, FONT_SIZE_SMALL)
+	}
+
+	if clicked(id, list) {
+		gv.history_collapsed = !gv.history_collapsed
 		set_selected(gv, key)
-		if gv.chosen == nil {
-			gv.chosen = Git_Row_Key{key.area, strings.clone(key.path)}
+	}
+}
+
+
+// A commit: a chevron (open or not), its summary, its short id and how long
+// ago it was made; its id, author and summary in the tooltip. A click opens or
+// closes it
+@(private = "file")
+commit_row :: proc(p: ^Pane, gv: ^Git_View, row: Git_Row, list: clay.ElementId) {
+	c := row.commit
+	key := row_key(row)
+	id := clay.ID("GitLogCommit", row_hash(p, key))
+	selected := g.panes.focused == p && !gv.typing && same_row(gv.selected, key)
+	open, has_open := g.git.detail_id.?
+	is_open := has_open && open == c.id
+
+	if list_row(id, selected, GIT_ROW_HEIGHT, COMMIT_INSET, FILE_GAP) {
+		icon(is_open ? .Chevron_Down : .Chevron_Right, gfx.theme.text_faint, 11)
+
+		// The summary, ending in "…" where the room its box had last frame ends
+		summary_id := clay.ID("GitLogSummary", row_hash(p, key))
+		room, _ := element_rect(summary_id)
+		if clay.UI(summary_id)({
+			layout = {sizing = {width = clay.SizingGrow()}},
+			clip = row_clip(),
+		}) {
+			summary := fitted_text(c.summary, room.w, FONT_SIZE_SIDEBAR)
+			label(summary, gfx.theme.text, FONT_SIZE_SIDEBAR)
+		}
+		label(c.short, gfx.theme.text_faint, FONT_SIZE_SMALL)
+		label(ago(c.time), gfx.theme.text_faint, FONT_SIZE_SMALL)
+	}
+	if pointer_in(id) {
+		tooltip(id, fmt.tprintf("%s · %s · %s\n\n%s", c.short, c.author, ago(c.time), c.message))
+	}
+
+	if clicked(id, list) {
+		set_selected(gv, key)
+		gv.toggled = c.id
+	}
+}
+
+
+// A file the open commit changed: as a changed file's row, indented under it.
+// A click opens what the commit changed in it
+@(private = "file")
+commit_file_row :: proc(p: ^Pane, gv: ^Git_View, row: Git_Row, list: clay.ElementId) {
+	f := row.file
+	key := row_key(row)
+	id := clay.ID("GitCommitFile", row_hash(p, key))
+	selected := same_row(gv.selected, key)
+	focused := g.panes.focused == p && !gv.typing
+
+	if list_row(id, selected && focused, GIT_ROW_HEIGHT, COMMIT_FILE_INSET, FILE_GAP) {
+		name_color := f.kind == .Deleted ? gfx.theme.text_dim : gfx.theme.text
+		icon(file_icon(f.path), selected ? gfx.theme.accent : gfx.theme.text_dim, 14)
+
+		if clay.UI()({
+			layout = {
+				sizing = {width = clay.SizingGrow()},
+				childGap = 6,
+				childAlignment = {y = .Center},
+			},
+			clip = row_clip(),
+		}) {
+			label(git_file_name(f.path), name_color, FONT_SIZE_SIDEBAR)
+			folder := git_file_folder(f.path)
+			if f.old_path != "" do folder = fmt.tprintf("from %s", f.old_path)
+			if folder != "" do label(folder, gfx.theme.text_faint, FONT_SIZE_SMALL)
+		}
+
+		if clay.UI()({
+			layout = {
+				sizing = {clay.SizingFixed(16), clay.SizingGrow()},
+				childAlignment = {x = .Center, y = .Center},
+			},
+		}) {
+			label(git.kind_letter(f.kind), git_kind_color(f.kind), FONT_SIZE_SMALL, .Bold)
 		}
 	}
+	tooltip(id, f.path)
+
+	if clicked(id, list) do choose_row(gv, key)
+}
+
+
+// The open commit's files, while they're read
+@(private = "file")
+loading_row :: proc(p: ^Pane, row: Git_Row) {
+	id := clay.ID("GitCommitLoading", p.id)
+	if list_row(id, false, GIT_ROW_HEIGHT, COMMIT_FILE_INSET, FILE_GAP) {
+		label("Reading…", gfx.theme.text_faint, FONT_SIZE_SMALL)
+	}
+}
+
+
+// How long ago a time (seconds since the epoch) was, shortly: "now", "5m",
+// "3h", "2d", "6w", "4mo", "2y" (temp)
+@(private = "file")
+ago :: proc(at: i64) -> string {
+	seconds := time.to_unix_seconds(time.now()) - at
+	switch {
+	case seconds < 60:           return "now"
+	case seconds < 3600:         return fmt.tprintf("%dm", seconds / 60)
+	case seconds < 86400:        return fmt.tprintf("%dh", seconds / 3600)
+	case seconds < 7 * 86400:    return fmt.tprintf("%dd", seconds / 86400)
+	case seconds < 60 * 86400:   return fmt.tprintf("%dw", seconds / (7 * 86400))
+	case seconds < 365 * 86400:  return fmt.tprintf("%dmo", seconds / (30 * 86400))
+	}
+	return fmt.tprintf("%dy", seconds / (365 * 86400))
 }
 
 
@@ -783,17 +1067,19 @@ on_row_button :: proc(p: ^Pane, key: Git_Row_Key) -> bool {
 }
 
 
-// A row's id: its pane, area and path, so a press matched against last
-// frame's layout finds the same file after the list changed
+// A row's id: its pane, kind, area, commit and path, so a press matched against
+// last frame's layout finds the same row after the list changed
 @(private = "file")
 row_hash :: proc(p: ^Pane, key: Git_Row_Key) -> u32 {
-	seed := [2]u32{p.id, u32(key.area)}
+	seed := [3]u32{p.id, u32(key.area), u32(key.kind)}
 	h := hash.fnv32a(([^]u8)(&seed)[:size_of(seed)])
+	commit := key.commit
+	h = hash.fnv32a(commit.id[:], h)
 	return hash.fnv32a(transmute([]u8)key.path, h)
 }
 
 
 @(private = "file")
 same_row :: proc(a, b: Git_Row_Key) -> bool {
-	return a.area == b.area && a.path == b.path
+	return a.kind == b.kind && a.area == b.area && a.commit == b.commit && a.path == b.path
 }

@@ -10,6 +10,7 @@ import "core:strings"
 import "core:time"
 
 import sdl "../vendor/sdl3"
+import "git"
 import "mdview"
 import "textedit"
 
@@ -47,6 +48,8 @@ Session_Pane :: struct {
 	file:       string, // a file, or a diff's file; "" for a terminal or the Git pane
 	git:        bool,   // the Git pane
 	diff:       string, // a diff's area, as DIFF_AREA_NAMES calls it; "" for a file
+	commit:     string, // a commit diff's commit (40 hex digits); "" for an area's
+	from:       string, // a commit diff's renamed file: where it was (work tree)
 	name:       string, // a terminal's given name
 	herdr:      string, // a persistent terminal's herdr-core address
 	herdr_core: string, // the core that address is on
@@ -339,6 +342,10 @@ session_pane :: proc(p: ^Pane) -> (sp: Session_Pane, kept: bool) {
 
 	case ^Diff_View:
 		sp = {file = c.path, diff = DIFF_AREA_NAMES[c.area]}
+		if id, is_commit := c.commit.?; is_commit {
+			sp.commit = git.oid_hex(id, context.temp_allocator)
+			sp.from = c.from
+		}
 	}
 
 	if step, ok := pane_zoom(p); ok {
@@ -441,6 +448,9 @@ restore_panes :: proc(saved: []Session_Pane) -> []^Pane {
 		if area, is_diff := diff_area_named(sp.diff); is_diff {
 			dv := new(Diff_View)
 			diff_view_open(dv, sp.file, area)
+			if id, is_commit := git.oid_from_hex(sp.commit); is_commit {
+				diff_view_open_commit(dv, sp.file, id, sp.from)
+			}
 			dv.zoom = zoom
 			panes[i] = panes_add_diff(dv)
 			continue

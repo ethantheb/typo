@@ -223,6 +223,8 @@ update_mouse_cursor :: proc() {
 		want = .MOVE
 	case divider != nil:
 		want = divider.axis == .Row ? .EW_RESIZE : .NS_RESIZE
+	case diff_divider_hot():
+		want = .EW_RESIZE
 	case:
 		want = editor_cursor()
 	}

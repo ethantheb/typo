@@ -38,7 +38,8 @@ Control_Args :: struct {
 	out:     string,   // screenshot: the PNG to write (absolute)
 	keys:    []string, // keys: chords, as settings.toml writes them
 	text:    string,   // type
-	target:  string,   // click: an element id ("Name" or "Name:index") or "x,y"
+	target:  string,   // click, drag: an element id ("Name" or "Name:index") or "x,y"
+	to:      string,   // drag: where the button comes up, likewise
 	right:   bool,     // click
 	double:  bool,     // click
 	timeout: f64,      // wait: seconds (0 for the default)
@@ -77,7 +78,8 @@ Control_Job :: struct {
 	step:  int,
 	frame: u64,       // the frame it was applied in
 	start: time.Tick, // when it was applied
-	pos:   [2]f32,    // click: where
+	pos:   [2]f32,    // click: where; drag: from
+	to:    [2]f32,    // drag: to
 }
 
 // The terminals whose shells may control the window, by their shell's process
@@ -198,7 +200,7 @@ caller_pane :: proc(pid: int) -> (pane: u32, mine: bool) {
 @(private = "file")
 job_prepare :: proc(job: ^Control_Job) -> string {
 	switch job.args.cmd {
-	case "ls", "keys", "type", "click", "wait", "ui", "log":
+	case "ls", "keys", "type", "click", "drag", "hover", "wait", "ui", "log":
 		return ""
 
 	case "do", "open", "terminal", "move", "focus", "maximize", "close", "rename", "diff",
@@ -266,9 +268,11 @@ control_frame :: proc() {
 		keys_apply(job)
 	case "type":
 		type_apply(job)
+	case "hover":
+		hover_apply(job)
 	case "ui":
 		job_reply(job, .Ok, ui_json(job.args.ids))
-	case "click", "wait", "screenshot":
+	case "click", "drag", "wait", "screenshot":
 		jobs.active = job
 		active_frame()
 	case:

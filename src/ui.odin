@@ -2,6 +2,7 @@ package editor
 
 import "core:fmt"
 import "core:math"
+import "core:strings"
 
 import clay "../vendor/clay-odin"
 import sdl "../vendor/sdl3"
@@ -112,6 +113,20 @@ label :: proc(
 	font := gfx.Font_Id.Body,
 ) {
 	clay.TextDynamic(s, text_config(color, size, font))
+}
+
+
+// Text cut to fit `max_w` (logical pixels), ending in "…" where it was cut;
+// all of it while the width isn't known (0) or it fits (temp)
+fitted_text :: proc(s: string, max_w: f32, size: u16, font := gfx.Font_Id.Body) -> string {
+	ts := &gfx.text_system
+	if max_w <= 0 || gfx.text_fit(ts, font, size, s, max_w) >= len(s) {
+		return s
+	}
+
+	room := max_w - gfx.text_width(ts, font, size, "…")
+	n := gfx.text_fit(ts, font, size, s, room)
+	return strings.concatenate({strings.trim_right_space(s[:n]), "…"}, context.temp_allocator)
 }
 
 
@@ -433,6 +448,7 @@ TOOLTIP_DELAY :: 500_000_000 // ns
 TOOLTIP_PAD_X  :: 8
 TOOLTIP_PAD_Y  :: 4
 TOOLTIP_GAP    :: 10 // between the text and the shortcut
+TOOLTIP_MAX_WIDTH :: 460 // longer text (a commit's message) wraps
 TOOLTIP_BELOW  :: 20 // from the pointer down to a tip below it, clear of the arrow
 TOOLTIP_ABOVE  :: 6  // from the pointer up to a tip above it
 TOOLTIP_MARGIN :: 4  // from the window's edges
@@ -485,6 +501,7 @@ tooltip :: proc(id: clay.ElementId, text: string, shortcut := "") {
 
 	if clay.UI(tip)({
 		layout = {
+			sizing = {width = clay.SizingFit({max = TOOLTIP_MAX_WIDTH})},
 			padding = {
 				left = TOOLTIP_PAD_X,
 				right = TOOLTIP_PAD_X,

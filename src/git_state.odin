@@ -30,13 +30,25 @@ Git_State :: struct {
 	since:   u64,           // when it started (SDL ticks, ns)
 	ticker:  sdl.TimerID,   // wakes the loop each second while it runs, for its time
 	note:    Git_Note,      // how the last command went, shown in the pane
+
+	// History (the Git pane's HISTORY section)
+	log:       git.Log,           // the branch's commits, as of `log_head`
+	log_head:  string,            // owned; the HEAD the log was last asked for at
+	detail:    git.Commit_Detail, // the open commit's message and files, once read
+	detail_id: Maybe(git.Oid),    // the commit open in the section
+	detail_at: int,               // where it is in the log; -1 for none
 }
 
-// A line the Git pane shows under its buttons
+// A line the Git pane shows under its buttons; one saying a command went
+// through goes after GIT_NOTE_SHOW
 Git_Note :: struct {
 	text:  string, // owned
 	error: bool,
+	at:    u64,    // when it was set (SDL ticks, ns)
 }
+
+// How long a note that a command went through shows
+GIT_NOTE_SHOW :: 6 * 1_000_000_000 // ns
 
 // Git's share of the UI thread, which the perf suite limits
 @(thread_local)
@@ -50,6 +62,7 @@ GIT_OUTPUT_LINES :: 12
 git_init :: proc() {
 	git.worker_start(&g.git.worker, wake_main_loop, nil)
 	g.git.running = true
+	g.git.detail_at = -1
 }
 
 
@@ -59,9 +72,23 @@ git_destroy :: proc() {
 	remote_ended()
 	git.repo_info_destroy(&gs.info)
 	git.status_destroy(&gs.status)
+	history_forget()
 	delete(gs.problem)
 	delete(gs.note.text)
 	gs^ = {}
+}
+
+
+// Drops the history and the open commit (another repository, or quitting)
+@(private = "file")
+history_forget :: proc() {
+	gs := &g.git
+	git.log_destroy(&gs.log)
+	git.commit_detail_destroy(&gs.detail)
+	delete(gs.log_head)
+	gs.log_head = ""
+	gs.detail_id = nil
+	gs.detail_at = -1
 }
 
 
@@ -72,6 +99,7 @@ git_open_folder :: proc(folder: string) {
 
 	git.repo_info_destroy(&gs.info)
 	git.status_destroy(&gs.status)
+	history_forget()
 	gs.loaded = false
 	git_set_note("", false)
 	git.worker_set_folder(&gs.worker, folder)
@@ -143,16 +171,123 @@ git_frame :: proc() {
 
 		case git.Remote_Done:
 			remote_done(&x)
+
+		case git.Log_Ready:
+			git.log_destroy(&gs.log)
+			gs.log = x.log
+			x.log = {}
+
+			// The open commit's place, or closed if HEAD moved off it (an amend,
+			// a reset, a rebase)
+			if id, open := gs.detail_id.?; open {
+				gs.detail_at = log_index(id)
+				if gs.detail_at < 0 do commit_close()
+			}
+
+		case git.Commit_Ready:
+			// Only the commit still open; one that couldn't be read closes
+			id, open := gs.detail_id.?
+			switch {
+			case !open || id != x.detail.id:
+			case x.detail.failed:
+				commit_close()
+			case:
+				git.commit_detail_destroy(&gs.detail)
+				gs.detail = x.detail
+				x.detail = {}
+			}
 		}
 		git.event_destroy(&e)
 	}
 }
 
 
-// Sets the line under the Git pane's buttons ("" for none)
+// Sets the line under the Git pane's buttons ("" for none). One that isn't an
+// error goes after GIT_NOTE_SHOW: a timer wakes the loop then
 git_set_note :: proc(text: string, error: bool) {
 	set_string(&g.git.note.text, text)
 	g.git.note.error = error
+	g.git.note.at = sdl.GetTicksNS()
+	if text != "" && !error {
+		_ = sdl.AddTimer(GIT_NOTE_SHOW / 1_000_000 + 50, note_expired, nil)
+	}
+}
+
+
+// The note to show under the buttons, or "" once a success's has had its time
+// (a command's stays while it runs)
+git_note_shown :: proc() -> string {
+	n := &g.git.note
+	finished := !n.error && g.git.remote == nil
+	if finished && sdl.GetTicksNS() - n.at > GIT_NOTE_SHOW do return ""
+	return n.text
+}
+
+
+@(private = "file")
+note_expired :: proc "c" (userdata: rawptr, id: sdl.TimerID, interval: u32) -> u32 {
+	wake_main_loop(nil)
+	return 0
+}
+
+
+// --- History -----------------------------------------------------------------------
+
+// The Git pane shows its history: the log is asked for again whenever HEAD
+// moved since it was last asked for (a commit, a checkout, a pull)
+git_history_follow :: proc() {
+	uitime.timed(&git_ui)
+	gs := &g.git
+	if !gs.running || !gs.loaded || gs.status.unborn {
+		return
+	}
+	if gs.log_head == gs.status.head do return
+
+	set_string(&gs.log_head, gs.status.head)
+	git.worker_post(&gs.worker, git.Read_Log{git.LOG_LIMIT})
+}
+
+
+// Opens a commit in the history (its message and files are read), or closes
+// it if it is the one open
+git_commit_toggle :: proc(id: git.Oid) {
+	uitime.timed(&git_ui)
+	gs := &g.git
+	open, is_open := gs.detail_id.?
+	commit_close()
+	if is_open && open == id do return
+
+	gs.detail_at = log_index(id)
+	if gs.detail_at < 0 do return
+	gs.detail_id = id
+	git.worker_post(&gs.worker, git.Read_Commit{id})
+}
+
+
+// Closes the open commit, freeing its files (not while a frame declares them)
+@(private = "file")
+commit_close :: proc() {
+	gs := &g.git
+	git.commit_detail_destroy(&gs.detail)
+	gs.detail_id = nil
+	gs.detail_at = -1
+}
+
+
+// Where a commit is in the log, or -1
+@(private = "file")
+log_index :: proc(id: git.Oid) -> int {
+	for c, i in g.git.log.commits {
+		if c.id == id do return i
+	}
+	return -1
+}
+
+
+// Whether the open commit's files are in (else they are being read)
+git_commit_loaded :: proc() -> bool {
+	id, open := g.git.detail_id.?
+	return open && g.git.detail.id == id
 }
 
 

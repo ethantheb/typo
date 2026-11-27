@@ -69,12 +69,22 @@ Splice_Index :: struct {
 	text:   []u8,
 }
 
+// Reads, which change nothing: the history, a commit's files
+Read_Log :: struct {
+	limit: int,
+}
+Read_Commit :: struct {
+	id: lg.Oid,
+}
+
 Request :: union {
 	Stage,
 	Unstage,
 	Discard,
 	Delete_Untracked,
 	Splice_Index,
+	Read_Log,
+	Read_Commit,
 }
 
 // What the worker hands over. The UI thread owns each event it takes
@@ -99,12 +109,21 @@ Remote_Done :: struct {
 	cancelled: bool,   // ended by worker_cancel
 }
 
+Log_Ready :: struct {
+	log: Log,
+}
+Commit_Ready :: struct {
+	detail: Commit_Detail,
+}
+
 Event :: union {
 	Repo_Opened,
 	Repo_None,
 	Status_Ready,
 	Op_Failed,
 	Remote_Done,
+	Log_Ready,
+	Commit_Ready,
 }
 
 
@@ -231,6 +250,8 @@ event_destroy :: proc(e: ^Event) {
 	case Remote_Done:
 		delete(x.output)
 		delete(x.line)
+	case Log_Ready:    log_destroy(&x.log)
+	case Commit_Ready: commit_detail_destroy(&x.detail)
 	}
 	e^ = nil
 }
@@ -245,6 +266,7 @@ request_destroy :: proc(r: ^Request) {
 	case Splice_Index:
 		delete(x.path)
 		delete(x.text)
+	case Read_Log, Read_Commit:
 	}
 	r^ = nil
 }
@@ -316,9 +338,12 @@ worker_proc :: proc(w: ^Worker) {
 			refresh = work.opened
 		}
 
-		// The requests, in order; each changes the repository
+		// The requests, in order; each but a read changes the repository
 		for &r in requests {
-			if work.opened {
+			switch {
+			case !work.opened:
+			case do_read(w, &work, r):
+			case:
 				problem := do_request(&work.repo, r)
 				if problem != "" do hand_over(w, &work, Op_Failed{strings.clone(problem)})
 				refresh = true
@@ -399,7 +424,7 @@ open_folder :: proc(w: ^Worker, work: ^Work, folder: string) {
 
 @(private = "file")
 do_request :: proc(r: ^Repo, req: Request) -> string {
-	switch x in req {
+	#partial switch x in req {
 	case Stage:            return stage(r, x.paths)
 	case Unstage:          return unstage(r, x.paths)
 	case Discard:          return discard(r, x.paths)
@@ -407,6 +432,35 @@ do_request :: proc(r: ^Repo, req: Request) -> string {
 	case Splice_Index:     return splice_index(r, x.path, x.base, x.lo, x.hi, x.text)
 	}
 	return ""
+}
+
+
+// Does a read and hands over what it found; false if the request isn't one
+@(private = "file")
+do_read :: proc(w: ^Worker, work: ^Work, req: Request) -> bool {
+	#partial switch x in req {
+	case Read_Log:
+		log, problem := read_log(&work.repo, x.limit)
+		if problem != "" {
+			log_destroy(&log)
+			hand_over(w, work, Op_Failed{strings.clone(problem)})
+		} else {
+			hand_over(w, work, Log_Ready{log})
+		}
+		return true
+
+	case Read_Commit:
+		// One that can't be read still comes back (failed), so it closes
+		detail, problem := read_commit(&work.repo, x.id)
+		if problem != "" {
+			commit_detail_destroy(&detail)
+			detail = {id = x.id, failed = true}
+			hand_over(w, work, Op_Failed{strings.clone(problem)})
+		}
+		hand_over(w, work, Commit_Ready{detail})
+		return true
+	}
+	return false
 }
 
 

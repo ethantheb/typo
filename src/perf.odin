@@ -185,6 +185,7 @@ PHASES := [?]Phase {
 	},
 	{name = "reverting and staging hunks", step = phase_git_hunks, git_limit = 1},
 	{name = "narrow Git and diff panes", step = phase_git_narrow, git_limit = 1},
+	{name = "Git history and a diff's divider", step = phase_git_history, git_limit = 1},
 	{name = "theme list (every theme)", step = phase_theme_picker, frame_limit = 8},
 	{name = "font list", step = phase_font_picker, frame_limit = 25},
 	{name = "scrolling with letter spacing", step = phase_letter_spacing, frame_limit = 8},

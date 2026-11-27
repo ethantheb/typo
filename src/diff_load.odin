@@ -36,6 +36,8 @@ Diff_Source :: enum u8 {
 	Index,
 	Work_Tree, // the file on disk
 	Editor,    // the open editor's text
+	Before,    // the file in a commit's parent
+	Commit,    // the file in a commit
 }
 
 // What a diff view shows, to tell whether a new load would change it
@@ -70,6 +72,8 @@ Diff_Job :: struct {
 	rel:     string, // owned; the file, relative to the work tree
 	path:    string, // owned; its full path
 	area:    git.Area,
+	commit:  Maybe(git.Oid),         // a commit's change instead of the area's
+	from:    string,                 // owned; where the commit's parent has it, if renamed
 	editor:  Maybe(buffer.Snapshot), // owned; the open editor's text
 	known:   Maybe(Diff_Signature),  // what the view shows now
 }
@@ -209,6 +213,7 @@ diff_job_destroy :: proc(job: ^Diff_Job) {
 	delete(job.workdir)
 	delete(job.rel)
 	delete(job.path)
+	delete(job.from)
 	if snap, ok := &job.editor.?; ok {
 		buffer.snapshot_release(snap)
 	}
@@ -355,9 +360,12 @@ load_diff :: proc(job: ^Diff_Job, cached: ^git.Repo = nil) -> (r: Diff_Result) {
 // Where a diff view's sides come from: the staged version beside the work
 // tree's (an open editor's text, if any) for changes, HEAD's beside the staged
 // version for staged changes, nothing beside the file for an untracked one,
-// and HEAD's beside the file with its conflict markers for a conflict
+// and HEAD's beside the file with its conflict markers for a conflict; a
+// commit's: its parent's beside its own
 @(private = "file")
 sources :: proc(job: ^Diff_Job) -> (left, right: Diff_Source) {
+	if job.commit != nil do return .Before, .Commit
+
 	work: Diff_Source = job.editor != nil ? .Editor : .Work_Tree
 	switch job.area {
 	case .Changes:   return .Index, work
@@ -377,9 +385,13 @@ signature :: proc(repo: ^git.Repo, job: ^Diff_Job, left, right: Diff_Source) -> 
 	#partial switch left {
 	case .Head:  s.left_id, s.left_found = git.version_id(repo, job.rel, .Head)
 	case .Index: s.left_id, s.left_found = git.version_id(repo, job.rel, .Index)
+	case .Before:
+		s.left_id, s.left_found = git.commit_version_id(repo, before_path(job), job.commit.?, true)
 	}
 
 	#partial switch right {
+	case .Commit:
+		s.right_id, s.right_found = git.commit_version_id(repo, job.rel, job.commit.?, false)
 	case .Index:
 		s.right_id, s.right_found = git.version_id(repo, job.rel, .Index)
 	case .Work_Tree:
@@ -415,8 +427,21 @@ read_side :: proc(repo: ^git.Repo, job: ^Diff_Job, source: Diff_Source) -> ([]u8
 	case .Editor:
 		snap := &job.editor.?
 		return buffer.snapshot_read_alloc(snap, 0, snap.length, context.allocator), ""
+
+	case .Before, .Commit:
+		parent := source == .Before
+		rel := parent ? before_path(job) : job.rel
+		text, _, _, problem := git.read_commit_version(repo, rel, job.commit.?, parent)
+		return text, problem
 	}
 	return nil, ""
+}
+
+
+// Where a commit's parent has the file: where it was, if the commit renamed it
+@(private = "file")
+before_path :: proc(job: ^Diff_Job) -> string {
+	return job.from != "" ? job.from : job.rel
 }
 
 

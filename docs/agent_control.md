@@ -53,6 +53,8 @@ Testing (see Testing below):
 typo ctl wait idle [--timeout S]     until nothing animates, loads or waits
 typo ctl screenshot [P] --out <file.png>
 typo ctl click (<element id> | <x>,<y>) [--right | --double]
+typo ctl drag <from> <to>            press, move over frames, release
+typo ctl hover <element id | x,y>    the pointer rests there (tooltips)
 typo ctl keys <chord>...             key chords, as settings.toml writes them
 typo ctl type <text>                 text input
 typo ctl ui <element id>...          where the last layout put them

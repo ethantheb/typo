@@ -30,6 +30,73 @@ test_libgit2_struct_sizes :: proc(t: ^testing.T) {
 	testing.expect_value(t, size_of(lg.Buf), 24)
 	testing.expect_value(t, size_of(lg.Blob_Filter_Options), 40)
 	testing.expect_value(t, size_of(lg.Checkout_Options), 144)
+	testing.expect_value(t, size_of(lg.Time), 16)
+	testing.expect_value(t, size_of(lg.Signature), 32)
+}
+
+
+// The log lists commits newest first with their messages; a commit's files
+// and its versions of a file (and its parent's) read back; ids round-trip as hex
+@(test)
+test_history :: proc(t: ^testing.T) {
+	library_init()
+	defer library_shutdown()
+	dir, ok := temp_repo(t, "history")
+	if !ok do return
+	defer os.remove_all(dir)
+
+	// A second commit: a.txt changed, b.txt added
+	write(dir, "a.txt", "one\nTWO\nthree\n")
+	write(dir, "b.txt", "b\n")
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-q", "-m", "Second\n\nWith a body")
+
+	r := open_test_repo(t, dir)
+	defer repo_close(&r)
+	log, problem := read_log(&r, LOG_LIMIT)
+	defer log_destroy(&log)
+	testing.expect_value(t, problem, "")
+	testing.expect_value(t, len(log.commits), 2)
+	if len(log.commits) != 2 do return
+
+	newest, first := log.commits[0], log.commits[1]
+	testing.expect_value(t, newest.summary, "Second")
+	testing.expect_value(t, newest.message, "Second\n\nWith a body")
+	testing.expect_value(t, newest.author, "Typo Test")
+	testing.expect_value(t, first.summary, "first")
+	testing.expect_value(t, len(newest.short), SHORT_ID)
+
+	// What the second commit changed
+	detail, detail_problem := read_commit(&r, newest.id)
+	defer commit_detail_destroy(&detail)
+	testing.expect_value(t, detail_problem, "")
+	testing.expect_value(t, len(detail.files), 2)
+	for f in detail.files {
+		switch f.path {
+		case "a.txt": testing.expect_value(t, f.kind, Kind.Modified)
+		case "b.txt": testing.expect_value(t, f.kind, Kind.Added)
+		case:         testing.expectf(t, false, "unexpected file %s", f.path)
+		}
+	}
+
+	// a.txt in the commit and in its parent; the first commit has no parent
+	temp := context.temp_allocator
+	after, _, in_commit, _ := read_commit_version(&r, "a.txt", newest.id, false, temp)
+	before, _, in_parent, _ := read_commit_version(&r, "a.txt", newest.id, true, temp)
+	testing.expect(t, in_commit && in_parent)
+	testing.expect_value(t, string(after), "one\nTWO\nthree\n")
+	testing.expect_value(t, string(before), "one\ntwo\nthree\n")
+	_, b_before := commit_version_id(&r, "b.txt", newest.id, true)
+	_, orphan := commit_version_id(&r, "a.txt", first.id, true)
+	testing.expect(t, !b_before, "b.txt is new in the commit")
+	testing.expect(t, !orphan, "the first commit has no parent")
+
+	// Ids as hex
+	hex := oid_hex(newest.id, context.temp_allocator)
+	back, parsed := oid_from_hex(hex)
+	testing.expect(t, parsed && back == newest.id)
+	_, bad := oid_from_hex("xyz")
+	testing.expect(t, !bad)
 }
 
 

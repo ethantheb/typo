@@ -43,6 +43,9 @@ Object      :: struct {}
 Tree        :: struct {}
 Tree_Entry  :: struct {}
 Blob        :: struct {}
+Revwalk     :: struct {}
+Commit      :: struct {}
+Diff        :: struct {}
 
 
 // --- Values ------------------------------------------------------------------------
@@ -143,6 +146,31 @@ Diff_File :: struct {
 	mode:      u16,
 	id_abbrev: u16,
 }
+
+// git_time: seconds since the epoch, the time zone's offset in minutes
+Time :: struct {
+	time:   i64,
+	offset: c.int,
+	sign:   c.char,
+}
+
+Signature :: struct {
+	name:  cstring,
+	email: cstring,
+	at:    Time, // `when`
+}
+
+// git_sort_t
+SORT_TOPOLOGICAL :: 1 << 0
+SORT_TIME        :: 1 << 1
+
+// git_delta_t, a Diff_Delta's status
+DELTA_ADDED      :: 1
+DELTA_DELETED    :: 2
+DELTA_MODIFIED   :: 3
+DELTA_RENAMED    :: 4
+DELTA_COPIED     :: 5
+DELTA_TYPECHANGE :: 8
 
 Diff_Delta :: struct {
 	status:     c.int,
@@ -343,4 +371,33 @@ foreign lib {
 		index: ^Index,
 		opts: ^Checkout_Options,
 	) -> c.int ---
+
+	revwalk_new       :: proc(out: ^^Revwalk, repo: ^Repository) -> c.int ---
+	revwalk_sorting   :: proc(walk: ^Revwalk, sort_mode: c.uint) -> c.int ---
+	revwalk_push_head :: proc(walk: ^Revwalk) -> c.int ---
+	revwalk_next      :: proc(out: ^Oid, walk: ^Revwalk) -> c.int ---
+	revwalk_free      :: proc(walk: ^Revwalk) ---
+
+	commit_lookup      :: proc(out: ^^Commit, repo: ^Repository, id: ^Oid) -> c.int ---
+	commit_free        :: proc(commit: ^Commit) ---
+	commit_summary     :: proc(commit: ^Commit) -> cstring ---
+	commit_message     :: proc(commit: ^Commit) -> cstring ---
+	commit_author      :: proc(commit: ^Commit) -> ^Signature ---
+	commit_time        :: proc(commit: ^Commit) -> i64 ---
+	commit_parentcount :: proc(commit: ^Commit) -> c.uint ---
+	commit_parent      :: proc(out: ^^Commit, commit: ^Commit, n: c.uint) -> c.int ---
+	commit_tree        :: proc(out: ^^Tree, commit: ^Commit) -> c.int ---
+	tree_free          :: proc(tree: ^Tree) ---
+
+	diff_tree_to_tree :: proc(
+		diff: ^^Diff,
+		repo: ^Repository,
+		old_tree: ^Tree,
+		new_tree: ^Tree,
+		opts: rawptr,
+	) -> c.int ---
+	diff_find_similar :: proc(diff: ^Diff, options: rawptr) -> c.int ---
+	diff_num_deltas   :: proc(diff: ^Diff) -> c.size_t ---
+	diff_get_delta    :: proc(diff: ^Diff, idx: c.size_t) -> ^Diff_Delta ---
+	diff_free         :: proc(diff: ^Diff) ---
 }

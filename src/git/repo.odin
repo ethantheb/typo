@@ -346,7 +346,7 @@ version_id :: proc(r: ^Repo, rel: string, version: Version) -> (id: lg.Oid, foun
 
 
 // A blob's text as checked out to `path`
-@(private = "file")
+@(private)
 blob_text :: proc(
 	r: ^Repo,
 	id: ^lg.Oid,

@@ -88,6 +88,43 @@ Version :: enum u8 {
 }
 
 
+// An id as 40 hex digits
+oid_hex :: proc(id: Oid, allocator := context.allocator) -> string {
+	digits := "0123456789abcdef"
+	out := make([]u8, 2 * len(id.id), allocator)
+	for b, i in id.id {
+		out[2 * i] = digits[b >> 4]
+		out[2 * i + 1] = digits[b & 0xf]
+	}
+	return string(out)
+}
+
+
+// An id from its 40 hex digits; false if `s` isn't one
+oid_from_hex :: proc(s: string) -> (id: Oid, ok: bool) {
+	if len(s) != 2 * len(id.id) do return {}, false
+
+	for &b, i in id.id {
+		hi, hi_ok := hex_digit(s[2 * i])
+		lo, lo_ok := hex_digit(s[2 * i + 1])
+		if !hi_ok || !lo_ok do return {}, false
+		b = hi << 4 | lo
+	}
+	return id, true
+}
+
+
+@(private = "file")
+hex_digit :: proc(c: u8) -> (u8, bool) {
+	switch c {
+	case '0' ..= '9': return c - '0', true
+	case 'a' ..= 'f': return c - 'a' + 10, true
+	case 'A' ..= 'F': return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+
 // Frees a status and everything in it
 status_destroy :: proc(s: ^Status) {
 	delete(s.entries)

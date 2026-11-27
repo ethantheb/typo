@@ -412,6 +412,125 @@ phase_git_narrow :: proc(p: ^Perf, frame: int) -> bool {
 
 	case 4:
 		check(p, "nothing of the diff pane shows beside it", read_back_clean(p))
+		return true
+	}
+	return false
+}
+
+
+// The history: the branch's commits listed, the newest opened to its files,
+// one file's commit diff opened (nothing in it stages or reverts), the diff's
+// divider dragged left; another commit clicked while one is open (its rows
+// were declared with the open one's strings); the open commit amended away,
+// which closes it. The workspace of before comes back at the end
+phase_git_history :: proc(p: ^Perf, frame: int) -> bool {
+	@(static) step: int
+	@(static) left_before: f32
+	gs := &g.git
+	_, dv := perf_diff_view()
+
+	if frame == 0 {
+		step = 0
+		git_perf.since = time.tick_now()
+
+		// A second commit (what the Git pane's phase staged); the panes wide again
+		perf_git(git_perf.repo, "commit", "-q", "-m", "second")
+		if t := tile_find(g.panes.root, git_pane()); t != nil && t.parent != nil {
+			t.parent.ratio = 0.4
+		}
+		return false
+	}
+
+	switch step {
+	case 0: // the log, read once the pane shows
+		listed := len(gs.log.commits) == 2
+		if git_waiting(listed) do return false
+
+		check(p, "the history lists the branch's commits", listed)
+		if !listed {
+			git_perf_end()
+			return true
+		}
+		summaries := gs.log.commits[0].summary == "second" && gs.log.commits[1].summary == "first"
+		check(p, "newest first, with each one's summary", summaries)
+		git_commit_toggle(gs.log.commits[0].id)
+		git_perf.since = time.tick_now()
+		step = 1
+
+	case 1: // its files, then one's commit diff
+		if git_waiting(git_commit_loaded()) do return false
+
+		files := len(gs.detail.files)
+		check(p, "a commit opens to the files it changed", files > 0)
+		if files == 0 {
+			git_perf_end()
+			return true
+		}
+		git_open_commit_diff(gs.detail.files[0].path, gs.detail.id, focus = false)
+		git_perf.since = time.tick_now()
+		step = 2
+
+	case 2: // the commit diff, laid out; its divider taken
+		_, dv = perf_diff_view()
+		ready := dv != nil && dv.commit != nil && dv.status == .Ready && dv.areas[.Left].w > 0
+		if git_waiting(ready && !g.animating) do return false
+
+		check(p, "a file of it opens as the commit's diff", ready)
+		if !ready {
+			git_perf_end()
+			return true
+		}
+		revert, stage := hunk_actions_of(dv)
+		check(p, "nothing in a commit's diff stages or reverts", !revert && !stage)
+
+		left, right := dv.areas[.Left], dv.areas[.Right]
+		left_before = left.w
+		g.mouse_pos = {(left.x + left.w + right.x) / 2, left.y + left.h - 20}
+		g.mouse_down, g.mouse_pressed, g.mouse_clicks = true, true, 1
+		step = 3
+
+	case 3: // dragged left
+		g.mouse_pos.x -= 120
+		step = 4
+
+	case 4: // let go
+		g.mouse_down = false
+		p.mark_frame = frame
+		step = 5
+
+	case 5: // the divider moved; then a press on the older commit, under the open
+		// one's file rows
+		if frame < p.mark_frame + 2 do return false
+		moved := dv != nil && dv.split > 0 && dv.areas[.Left].w < left_before - 80
+		check(p, "the divider between a diff's sides drags", moved)
+
+		header, found := element_rect(clay.ID("GitHistory", git_pane().id))
+		rows := 1 + len(gs.detail.files) // the newest commit and its files, under the header
+		older_y := header.y + f32(1 + rows) * GIT_ROW_HEIGHT + GIT_ROW_HEIGHT / 2
+		check(p, "the history is laid out", found)
+		g.mouse_pos = {header.x + 60, older_y}
+		g.mouse_pressed, g.mouse_clicks = true, 1
+		git_perf.since = time.tick_now()
+		step = 6
+
+	case 6: // the older commit open (and nothing freed under the frame)
+		older := gs.log.commits[1].id
+		open, has_open := gs.detail_id.?
+		switched := has_open && open == older && git_commit_loaded()
+		if git_waiting(switched) do return false
+		check(p, "clicking another commit opens it instead", switched)
+
+		// The newest open again, then amended away
+		git_commit_toggle(gs.log.commits[0].id)
+		perf_git(git_perf.repo, "commit", "-q", "--amend", "-m", "second, amended")
+		git_perf.since = time.tick_now()
+		step = 7
+
+	case 7: // the log read again without it: it closes, and no rows are left over
+		amended := len(gs.log.commits) == 2 && gs.log.commits[0].summary == "second, amended"
+		closed := gs.detail_id == nil && gs.detail_at == -1
+		if git_waiting(amended && closed) do return false
+		check(p, "a commit HEAD moved off closes", amended && closed)
 		git_perf_end()
 		return true
 	}

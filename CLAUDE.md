@@ -425,8 +425,8 @@ imports `process` and `uitime`; `term` imports `herdr`; `words` imports `buffer`
   docs/agent_control.md): `typo ctl <command>` from a program in one of the window's
   terminals controls that window: `ls`, pane commands (control_panes.odin: `do`,
   `open`, `terminal`, `move`, `focus`, `maximize`, `close`, `rename`, `diff`, `git`),
-  testing commands (control_input.odin: `wait idle`, `screenshot`, `click`, `keys`,
-  `type`, `ui`, `log`) and `restart`. Requests are `typo-ipc/2`
+  testing commands (control_input.odin: `wait idle`, `screenshot`, `click`, `drag`,
+  `hover`, `keys`, `type`, `ui`, `log`) and `restart`. Requests are `typo-ipc/2`
   frames (a JSON object each way) on the same endpoint as `typo <file>`; the server
   answers each connection on its own thread. A request is refused (`not_mine`)
   unless the client's process (`GetNamedPipeClientProcessId`) runs under one of the
@@ -497,7 +497,9 @@ imports `process` and `uitime`; `term` imports `herdr`; `words` imports `buffer`
 - **Git** (git/, git_state.odin): libgit2 does reads and the index in-process
   (git/repo.odin: status by `git.Area`, branch, upstream and ahead/behind, file versions
   as checked out, staging, unstaging, discarding, untracked files to the trash,
-  `splice_index` for a hunk); the git command line commits (`--file=-`, so hooks and
+  `splice_index` for a hunk; git/history.odin: the log, a commit's files and a file's
+  versions in a commit and its parent, read as `Read_Log`/`Read_Commit` requests that
+  change nothing); the git command line commits (`--file=-`, so hooks and
   signing work), pushes, pulls and fetches (git/cli.odin: no console window,
   `GIT_TERMINAL_PROMPT=0`). `git.Worker` owns the repository for writes on its thread,
   takes requests in order, follows each change with a fresh status and hands events
@@ -512,13 +514,22 @@ imports `process` and `uitime`; `term` imports `herdr`; `words` imports `buffer`
   under way beside its title (`git_title_note`); a commit message box (Ctrl+Enter
   commits), Commit (its key in the tooltip) and push, pull and fetch; the files in
   collapsible sections with stage/unstage/discard buttons on hover (discard asks
-  first). Rows aren't stored: `row_at` finds one from the sections' sizes. Keys:
-  Up/Down, Enter (diff or collapse), Space (stage or unstage), Delete (discard),
-  Tab/Esc into and out of the box. Ctrl+Shift+G or the status bar's branch item opens
-  it left of the editor in use.
+  first); then HISTORY: the branch's commits (`g.git.log`, read again whenever HEAD
+  moves, `git_history_follow`), summaries cut with "…" (`fitted_text`), the full
+  message in the tooltip; a click opens one to its files (`git_commit_toggle`,
+  `g.git.detail`, applied next frame: the open commit's rows use its strings), a
+  file's click opens its commit diff (a rename against where it was). Rows aren't
+  stored: `row_at` finds one (a `Git_Row_Kind`) from the sections' sizes and the open
+  commit's place in the log (`detail_at`). Keys: Up/Down, Enter (diff,
+  collapse or open), Space (stage or unstage), Delete (discard), Tab/Esc into and out
+  of the box. Ctrl+Shift+G or the status bar's branch item opens it left of the
+  editor in use. A note that a command went through goes after `GIT_NOTE_SHOW`.
 - **Diff view** (diff_view.odin, diff_load.odin, diff/rows.odin): a file's versions side
   by side: changes (index | work tree), staged (HEAD | index), untracked, conflict (HEAD
-  | work tree); the work tree side is the open editor's text when open. The loader
+  | work tree), or a commit's (its parent | it; `Diff_View.commit`, nothing to stage or
+  revert); the work tree side is the open editor's text when open. The strip between
+  the sides drags the divider (`Diff_View.split`; a double press puts it back), and
+  the vertical scroll bar's track marks each hunk (`draw_hunk_marks`). The loader
   thread reads both, diffs by lines (line endings don't count), finds changed words and
   builds each side's buffer and highlighter; a job that would change nothing
   (`Diff_Signature`) costs nothing. Rows aren't stored (`diff.row_at`). Each hunk's

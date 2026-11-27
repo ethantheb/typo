@@ -90,6 +90,19 @@ type_apply :: proc(job: ^Control_Job) {
 }
 
 
+// Moves the pointer there and leaves it (a tooltip shows after its delay)
+hover_apply :: proc(job: ^Control_Job) {
+	pos, ok := click_target(job.args.target)
+	if !ok {
+		problem := fmt.tprintf("no element %q was laid out", job.args.target)
+		job_reply(job, .Error, ipc.error_json(problem))
+		return
+	}
+	g.mouse_pos = pos
+	job_reply(job, .Ok, fmt.tprintf(`{{"hovering":[%.1f,%.1f]}}`, pos.x, pos.y))
+}
+
+
 // --- Requests that take frames -----------------------------------------------------
 
 // A frame of the request under way: a click's steps, a wait's check, a
@@ -104,6 +117,8 @@ active_frame :: proc() {
 	switch job.args.cmd {
 	case "click":
 		click_step(job)
+	case "drag":
+		drag_step(job)
 	case "wait", "screenshot":
 		// At the end of the frame: control_capture, control_frame_end
 	}
@@ -148,6 +163,49 @@ click_step :: proc(job: ^Control_Job) {
 	}
 	job.step += 1
 }
+
+
+// A drag over frames: the pointer moves to the start, the button goes down,
+// the pointer moves to the end in DRAG_STEPS frames, then the button comes up
+@(private = "file")
+drag_step :: proc(job: ^Control_Job) {
+	if job.step == 0 {
+		from, from_ok := click_target(job.args.target)
+		to, to_ok := click_target(job.args.to)
+		if !from_ok || !to_ok {
+			missing := from_ok ? job.args.to : job.args.target
+			problem := fmt.tprintf("no element %q was laid out", missing)
+			job_reply(job, .Error, ipc.error_json(problem))
+			return
+		}
+		job.pos = from
+		job.to = to
+	}
+
+	switch {
+	case job.step == 0:
+		g.mouse_pos = job.pos
+	case job.step == 1:
+		g.mouse_pos = job.pos
+		g.mouse_down = true
+		g.mouse_pressed = true
+		g.mouse_clicks = 1
+	case job.step <= DRAG_STEPS + 1:
+		t := f32(job.step - 1) / DRAG_STEPS
+		g.mouse_pos = job.pos + (job.to - job.pos) * t
+	case:
+		g.mouse_pos = job.to
+		g.mouse_down = false
+		json := fmt.tprintf(`{{"dragged":[%.1f,%.1f]}}`, job.to.x, job.to.y)
+		job_reply(job, .Ok, json)
+		return
+	}
+	job.step += 1
+}
+
+// The frames a drag's move takes
+@(private = "file")
+DRAG_STEPS :: 6
 
 
 // Where a click goes: an element's center, or "x,y" in the layout's units

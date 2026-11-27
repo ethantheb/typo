@@ -69,6 +69,8 @@ yourself.
   typo ctl wait idle [--timeout S]    until nothing animates, loads or waits
   typo ctl screenshot [P] --out <file.png>   what typo drew, all or one pane
   typo ctl click (<element id> | <x>,<y>) [--right | --double]
+  typo ctl drag <from> <to>           press, move, release (ids or x,y)
+  typo ctl hover <element id | x,y>   the pointer rests there (tooltips)
   typo ctl keys <chord>...            pressed as typed, e.g. Ctrl+S Enter Escape
   typo ctl type <text>                typed as text into what has the keys
   typo ctl ui <element id>...         where the last layout put elements
@@ -228,6 +230,15 @@ control_parse :: proc(args: []string) -> (request: Control_Args, problem: string
 			}
 		}
 		if request.target == "" do return {}, "click needs an element id or x,y"
+
+	case "hover":
+		if len(rest) != 1 do return {}, "hover needs an element id or x,y"
+		request.target = rest[0]
+
+	case "drag":
+		if len(rest) != 2 do return {}, "drag needs where from and where to"
+		request.target = rest[0]
+		request.to = rest[1]
 
 	case "wait":
 		if len(rest) == 0 || rest[0] != "idle" do return {}, "wait takes idle"
